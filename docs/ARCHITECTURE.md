@@ -1295,12 +1295,15 @@ jobs          (job_id PK, user_id, question, idempotency_key UNIQUE, status, qua
                revision_count, llm_calls_used, report_json, exported_at,
                created_at, completed_at)
 
-findings      (finding_id PK, job_id FK, subtopic, claim, evidence,
-               url, title, retrieved_at, content_hash, truncated)
+findings      (job_id FK, finding_id, subtopic, claim, evidence,
+               url, title, retrieved_at, content_hash, truncated,
+               PRIMARY KEY (job_id, finding_id))
 
 claims        (claim_id PK, job_id FK, section, text, supported, verdict_note)
 
-claim_sources (claim_id FK, finding_id FK, PRIMARY KEY (claim_id, finding_id))
+claim_sources (claim_id FK, job_id, finding_id,
+               FOREIGN KEY (job_id, finding_id) REFERENCES findings,
+               PRIMARY KEY (claim_id, finding_id))
 
 audit_events  (event_id PK, job_id FK, actor, action, detail JSONB, created_at)
 ```
@@ -1351,16 +1354,27 @@ the worker — by the time a message exists, the job row already won or lost the
 
 | Field | Notes |
 |---|---|
-| `finding_id` | **PK** |
-| `job_id` | **FK → jobs**, cascade with retention |
+| `job_id` | **FK → jobs**, cascade with retention. Also the first half of the PK |
+| `finding_id` | `f1`, `f2`, … — a **per-job sequence**, unique within a job and not beyond it ([ADR 0003](adr/0003-finding-ids-are-a-per-job-sequence.md)) |
 | `subtopic` | Which planned subtopic produced it |
 | `claim`, `evidence` | `evidence` is the **verbatim quote**, not a summary |
 | `url`, `title` | The citation |
 | `retrieved_at`, `content_hash` | Reproducibility (gl §9) |
 | `truncated` | The page was cut at `MAX_PAGE_CHARS` |
 
-**Indexes:** PK; `(job_id)`; `(job_id, url)` supports per-job URL dedupe verification and is the
-natural lookup when reflection excludes failing URLs.
+**Key:** composite `PRIMARY KEY (job_id, finding_id)`. It was `finding_id PK` while the Researcher
+minted a `uuid4().hex`; ADR 0003 made the id a short per-job counter so that the Synthesizer can
+transcribe it into `Claim.finding_ids` without dropping a character, which means every job now has an
+`f1` and a global PK on the column alone would collide on the second job inserted. The composite key
+is the natural one either way — the relationship note below already said a finding belongs to exactly
+one job.
+
+`claim_sources` therefore carries `job_id` as part of its foreign key. A claim belongs to one job, so
+`(claim_id, finding_id)` is still unique and stays the primary key.
+
+**Indexes:** PK `(job_id, finding_id)`, whose leading column already serves the per-job lookup;
+`(job_id, url)` supports per-job URL dedupe verification and is the natural lookup when reflection
+excludes failing URLs.
 
 **Relationship:** one job → many findings. A finding belongs to exactly one job — evidence is never
 shared between jobs, because `retrieved_at` and `content_hash` are per-retrieval facts.

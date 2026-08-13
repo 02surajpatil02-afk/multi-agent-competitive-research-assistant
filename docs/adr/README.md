@@ -16,3 +16,4 @@ wrong. [ADR 0002](0002-concurrent-page-extraction-in-the-researcher.md) carries 
 |---|---|---|---|
 | [0001](0001-supervisor-llm-routing-is-advisory.md) | The Supervisor's LLM routing call is advisory; `allowed_target(state)` is authoritative | Accepted | 2026-08-12 |
 | [0002](0002-concurrent-page-extraction-in-the-researcher.md) | A subtopic's page extractions run concurrently; choosing and fetching sources stays sequential | Accepted | 2026-08-13 |
+| [0003](0003-finding-ids-are-a-per-job-sequence.md) | Finding ids are a short per-job sequence (`f1`, `f2`, …), assigned after the extraction pool joins | Accepted | 2026-08-14 |

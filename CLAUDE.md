@@ -381,6 +381,21 @@ row. Until then the gate is real control flow with nothing outside the process a
   `docs/ARCHITECTURE.md` §12 and recorded as low-stakes-open in its §22.
 - **The reflection rubric is uncalibrated.** Until the hand-scoring pass in Phase 4 runs, the pass
   threshold is a reasonable heuristic, not a measured one.
+- **`wrap_openai` is applied once per job, to the same client.** `scripts/measure_jobs.py` builds one
+  `OpenAI` client and reuses it, while constructing a new `LLMClient` per job — and `LLMClient.__init__`
+  wraps whatever client it is handed. `wrap_openai` patches in place, so job *N* runs under *N* layers
+  and emits *N* nested spans per request, the outermost reporting a running token total. Job 3 of a
+  6-job run traced 1,597,176 prompt tokens against a real 266,196. **Behaviour is unaffected** — httpx
+  logged one POST per counted call, so no extra spend, rate pressure, or retries — but any token figure
+  read from a multi-job trace is wrong unless it is taken from the leaf spans. Wrap once, or refuse to
+  re-wrap.
+- **A reflection Researcher retry can be a guaranteed no-op.** Reflection routes a thin subtopic back
+  to the Researcher, which re-issues the same `search_query`; that search is a **cache hit**, so it
+  returns the identical URLs, and sources that were unusable stay unusable. In the 6-job run one job
+  spent three revision cycles this way — its four reflection-triggered Researcher visits produced 0, 0,
+  0 and 0 findings, and the Synthesizer rewrote byte-identical input three times. The cheapest guard is
+  to treat a visit that yielded nothing as a reported gap rather than a retryable failure; the subtopic
+  is already `unresearched` and reflection can already score that and route to the gate.
 
 ---
 
