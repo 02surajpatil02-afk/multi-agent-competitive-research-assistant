@@ -322,6 +322,78 @@ def test_findings_from_one_page_get_distinct_ids(monkeypatch: pytest.MonkeyPatch
     assert len({finding.finding_id for finding in findings}) == 2
 
 
+def test_finding_ids_are_short_and_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The id is short because the Synthesizer has to copy it by hand into every claim.
+
+    A real job failed `report_cites_unknown_findings` citing `087accf6f9a94fb38418d17b58883fb`
+    - 31 characters, one short of a uuid4 hex, dropped while transcribing one of 45 such
+    strings. So the format is the assertion here, not merely that the ids differ: distinct
+    32-character ids would pass the test above and fail the job.
+    """
+    _tools(monkeypatch, "https://example.com/a")
+    llm, _ = _llm(
+        _extraction(
+            ("Cloud revenue was $1.2bn.", _QUOTE),
+            ("It added 400 clients.", "The company added 400 new clients."),
+        )
+    )
+
+    findings = research_subtopic(_state(), config=_config(), llm=llm)["findings"]
+
+    assert [finding.finding_id for finding in findings] == ["f1", "f2"]
+
+
+def test_finding_ids_continue_from_the_findings_the_job_already_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-job sequence, not a per-visit one.
+
+    Findings accumulate through the operator.add reducer, so a second Researcher visit that
+    restarted at f1 would mint an id a different finding already answers to - and a claim
+    citing it would reach the wrong source with the audit trail still looking intact.
+    """
+    _tools(monkeypatch, "https://example.com/b")
+    llm, _ = _llm(_extraction(("Infosys cloud revenue was $0.9bn.", _QUOTE)))
+    state = _state(
+        findings=[_finding("https://example.com/a"), _finding("https://example.com/c")],
+        subtopic_status={"s1": "done", "s2": "pending", "s3": "pending"},
+    )
+
+    (finding,) = research_subtopic(state, config=_config(), llm=llm)["findings"]
+
+    assert finding.finding_id == "f3"
+
+
+def test_concurrent_extractions_never_share_a_finding_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Numbering happens after the pool joins, so overlapping pages cannot collide.
+
+    The ids also follow page order rather than completion order, for the same reason the
+    findings themselves do: which request the endpoint answered first is not something a
+    citation list should depend on.
+    """
+    _tools(monkeypatch, "https://example.com/a", "https://example.com/b")
+    llm, _ = _llm(
+        answer=_by_page(
+            a=_extraction(
+                ("Cloud revenue was $1.2bn.", _QUOTE),
+                ("It added 400 clients.", "The company added 400 new clients."),
+            ),
+            b=_extraction(("Revenue reached $1.2bn.", _QUOTE)),
+        )
+    )
+
+    findings = research_subtopic(_state(), config=_config(), llm=llm)["findings"]
+
+    assert [finding.finding_id for finding in findings] == ["f1", "f2", "f3"]
+    assert [str(finding.url) for finding in findings] == [
+        "https://example.com/a",
+        "https://example.com/a",
+        "https://example.com/b",
+    ]
+
+
 def test_the_first_pending_subtopic_in_plan_order_is_the_one_researched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

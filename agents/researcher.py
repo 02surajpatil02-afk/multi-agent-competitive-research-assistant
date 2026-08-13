@@ -44,7 +44,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 from typing import TypedDict
-from uuid import uuid4
 
 from langsmith.run_helpers import get_current_run_tree, tracing_context
 from pydantic import BaseModel
@@ -143,7 +142,17 @@ def research_subtopic(
     budget = CallBudget(limit=config.max_llm_calls_per_job, used=state["llm_calls_used"])
 
     pages = _pages_to_read(subtopic, state, config=config, cache=cache, deadline=deadline)
-    findings, fatal = _extract(pages, subtopic, config=config, llm=llm, budget=budget)
+    findings, fatal = _extract(
+        pages,
+        subtopic,
+        config=config,
+        llm=llm,
+        budget=budget,
+        # Findings accumulate across Researcher visits through the operator.add reducer, so
+        # numbering has to continue from what the job already holds or the second subtopic
+        # restarts at f1 and two different findings answer to the same id.
+        first_number=len(state["findings"]) + 1,
+    )
 
     if fatal is not None:
         # The evidence the other pages produced is already paid for, so it is returned
@@ -217,6 +226,7 @@ def _extract(
     config: Config,
     llm: LLMClient,
     budget: CallBudget,
+    first_number: int,
 ) -> tuple[list[Finding], LLMFailureReason | None]:
     """One extraction call per page, up to `RESEARCHER_CONCURRENCY` of them at once.
 
@@ -224,6 +234,12 @@ def _extract(
     Page order rather than completion order: the citation list a reader sees should not
     depend on which request the endpoint happened to answer first, and a test that asserts
     which source produced which finding should not be a race.
+
+    **This is also where a finding gets its id**, numbered from `first_number`. It cannot
+    happen in `_findings_from`: that runs on the pool, and two threads numbering from a
+    shared counter is a race whose prize is two findings sharing an id - which the audit
+    trail would carry all the way to a claim citing the wrong source. Here the pool has
+    joined, so the numbering is single-threaded and follows page order like everything else.
 
     The two failure shapes are unchanged by running in parallel. A node-level failure -
     `invalid_output`, `llm_call_failed` - costs that one source and the subtopic carries on
@@ -259,7 +275,10 @@ def _extract(
     fatal: LLMFailureReason | None = None
     for page, task in zip(pages, submitted, strict=True):
         try:
-            findings.extend(task.result())
+            for finding in task.result():
+                findings.append(
+                    finding.model_copy(update={"finding_id": f"f{first_number + len(findings)}"})
+                )
         except LLMCallFailed as error:
             if error.reason in JOB_FATAL_REASONS:
                 logger.error("researcher stopping the job (%s): %s", error.reason, error)
@@ -357,7 +376,10 @@ def _findings_from(
             continue
         findings.append(
             Finding(
-                finding_id=uuid4().hex,
+                # Left empty deliberately. Identity is attached by `_extract` once the pool
+                # has joined, because it is a per-job sequence and this runs concurrently.
+                # `_extract` is the only caller and numbers everything it collects.
+                finding_id="",
                 subtopic_id=subtopic.id,
                 claim=extracted.claim,
                 evidence=extracted.evidence,
