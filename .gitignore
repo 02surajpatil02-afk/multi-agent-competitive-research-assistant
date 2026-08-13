@@ -1,0 +1,26 @@
+# Secrets. .env.example is the committed template; a filled-in .env never is.
+.env
+
+# Virtual environment and build artifacts
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Real-job measurements (scripts/measure_jobs.py). jobs.jsonl carries fetched third-party
+# page text and report bodies, and run.log carries every query and URL the tools logged at
+# INFO. Only the summary table is published, and it goes into the docs.
+measurements/
+
+# Private working documents. Not published: both carry personal interview-preparation
+# material rather than project documentation - interview-prep.md maps résumé claims to what
+# is actually built (including the claims that must not be made), and the guidelines embed
+# the same "say this, do not say that" interview wording alongside the engineering standards.
+# The local files stay; they are simply not tracked.
+docs/interview-prep.md
+docs/engineering-guidelines.md

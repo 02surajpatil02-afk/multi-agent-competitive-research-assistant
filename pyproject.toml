@@ -1,0 +1,100 @@
+[project]
+name = "competitive-research"
+version = "0.1.0"
+description = "Multi-Agent Competitive Research Assistant"
+requires-python = ">=3.13"
+
+# Every pin names the requirement it serves (engineering-guidelines.md §20).
+# A dependency whose comment cannot name a requirement gets removed.
+dependencies = [
+    # Typed agent boundaries. Every agent output is a validated schema and no agent
+    # parses another agent's prose (engineering-guidelines.md §3, ARCHITECTURE.md §4).
+    "pydantic==2.13.4",
+    # The one OpenAI-compatible client. NIM in development and the production endpoint are
+    # both OpenAI-compatible, so this SDK covers both and there is no provider class
+    # (ARCHITECTURE.md §20 row 4). Its own retry is switched off in llm_client.py, because
+    # the backoff schedules in guidelines §17 are the only ones allowed to run.
+    "openai==2.54.0",
+    # Reads .env into the environment for local development. Windows has no
+    # `export $(cat .env)` idiom, so without this every local command needs the whole
+    # variable table set by hand. It never overrides a variable that is already set, so
+    # the ECS task definition still wins in production (guidelines §16).
+    "python-dotenv==1.2.2",
+    # Web search that returns cleaned page content AND the URL together, which is what the
+    # claim-to-source audit trail needs (guidelines §7, §9). Named in guidelines §20.
+    "tavily-python==0.7.27",
+    # The HTTP client behind `fetch`. Needed rather than the standard library because the
+    # SSRF rule is "re-check after every redirect", which requires following redirects by
+    # hand, and because MAX_FETCH_BYTES has to hold against a streaming body rather than
+    # against a Content-Length header (guidelines §16, §7). Already present transitively
+    # under openai; pinned here because tools/fetch.py imports it directly.
+    "httpx==0.28.1",
+    # PDF text extraction in `fetch`. Added on measurement, not on principle: three step-12
+    # smoke jobs rejected `infosys-ar-26.pdf` and `ir-presentation.pdf` as wrong_content_type
+    # - the annual report and the investor presentation, which are the best primary sources a
+    # competitive-research question has. The standard library cannot parse PDF, and pypdf is
+    # pure Python with no native build step, so it does not complicate the container image.
+    "pypdf==6.15.0",
+    # Stateful orchestration with checkpointing (CLAUDE.md stack table). Two things need it
+    # rather than a hand-rolled loop: the human gate is an interrupt() that can hold a job
+    # for days, and resuming from a checkpoint is what stops an approval from re-billing
+    # every LLM call already spent (guidelines §4, §10). graph/build.py imports it.
+    "langgraph==1.2.11",
+]
+
+# Deliberately absent until something imports them:
+#   fastapi, sqlalchemy, alembic, boto3, redis - Phase 2 and Phase 3.
+#
+# langchain-core arrives transitively under langgraph and is imported directly in exactly
+# one place, for the RunnableConfig type that graph/build.run_config() returns. It is not
+# pinned here because nothing chooses its version: langgraph does.
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1", # the application test suite (CLAUDE.md commands, guidelines §18)
+    "ruff==0.16.2",  # lint stage of the CI pipeline (guidelines §19)
+    "mypy==2.3.0",   # type stage of the CI pipeline (guidelines §19)
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+# The repository root is the import root: `uvicorn app:app`, `python -m worker`, and
+# `python -m eval.run` all run from here (CLAUDE.md commands). Listed explicitly because
+# the layout is flat, so setuptools cannot auto-discover it.
+[tool.setuptools]
+py-modules = ["config", "schemas", "llm_client"]
+packages = ["agents", "graph", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# The documentation is authoritative and its Python blocks are illustrative sketches, not
+# code. Formatting them rewrites the specification, so ruff stays out of *.md entirely.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", # pycodestyle errors
+    "F", # pyflakes
+    "I", # import order
+    "B", # bugbear - real bug patterns, not style
+    "UP", # outdated syntax for the pinned Python
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+# tavily-python ships no py.typed marker, so mypy cannot see inside it. Silencing the
+# import is the narrowest available fix: the alternative is a `# type: ignore` on every
+# line that touches the SDK. tools/search.py converts its response to SearchResult
+# immediately, so the untyped surface stops at that one function.
+[[tool.mypy.overrides]]
+module = "tavily.*"
+ignore_missing_imports = true
