@@ -433,7 +433,8 @@ def test_a_researcher_route_invalidates_the_draft() -> None:
 
 
 def test_a_researcher_route_returns_only_the_thin_subtopics() -> None:
-    # Only the subtopics that scored thin - not all of them.
+    # Only the subtopics that scored thin - not all of them. s3 is thinner still and is left
+    # alone anyway: `unresearched` is exhausted, not thin (ADR 0004, and its own tests below).
     llm, _ = _llm(_failing("research_completeness"))
     state = _state(
         findings=[
@@ -447,7 +448,7 @@ def test_a_researcher_route_returns_only_the_thin_subtopics() -> None:
 
     update = reflect(state, config=_config(), llm=llm).update
 
-    assert update["subtopic_status"] == {"s1": "done", "s2": "pending", "s3": "pending"}
+    assert update["subtopic_status"] == {"s1": "done", "s2": "pending", "s3": "unresearched"}
 
 
 def test_a_subtopic_with_two_sources_is_not_thin() -> None:
@@ -501,6 +502,143 @@ def test_a_non_researcher_route_leaves_the_draft_alone(dimension: str) -> None:
 
     assert "report" not in update
     assert "subtopic_status" not in update
+
+
+# --- Nothing left to research (ADR 0004) --------------------------------------------------
+
+
+def _exhausted(**overrides: object) -> ResearchState:
+    """Every subtopic attempted and left `unresearched` - nothing new for a retry to find.
+
+    The six findings from `_state` are kept deliberately. `unresearched` means the *last*
+    visit produced nothing, not that the subtopic never produced anything, and the guard is
+    keyed on that status rather than on a finding count.
+    """
+    return _state(subtopic_status=dict.fromkeys(("s1", "s2", "s3"), "unresearched"), **overrides)
+
+
+def _research_only_failure() -> str:
+    """A rubric where the only failing dimensions are the two that route to the Researcher.
+
+    Coverage sits at 5 so its hard gate does not fire, and the other two clear the threshold,
+    which leaves 2.70 weighted - failing, with nothing but research to blame.
+    """
+    return _rubric(
+        research_completeness=1, source_correctness=1, factual_consistency=4, report_quality=4
+    )
+
+
+def test_an_exhausted_subtopic_is_not_sent_back_for_an_identical_retry() -> None:
+    # The measured no-op. Reflection returned an `unresearched` subtopic to `pending`, the
+    # Researcher re-issued the same planned query, the search cache answered with the same
+    # URLs, the same sources were still unusable, and it produced nothing - three cycles
+    # running, on the same subtopic, for 19 LLM calls.
+    llm, _ = _llm(_failing("research_completeness"))
+
+    route, update = reflect(_exhausted(), config=_config(), llm=llm)
+
+    assert route != "researcher"
+    assert "subtopic_status" not in update  # nothing was returned to pending
+    assert "report" not in update  # and the draft is not invalidated for a retry that cannot run
+
+
+def test_another_failing_dimension_is_acted_on_when_research_is_exhausted() -> None:
+    # Skipping the Researcher does not skip the revision. The lowest dimension a specialist
+    # can still act on is the one acted on, and the research failure stays on the record.
+    llm, _ = _llm(_failing("research_completeness"))
+
+    route, update = reflect(_exhausted(), config=_config(), llm=llm)
+
+    assert update["failed_dimensions"] == list(REFLECTION_DIMENSIONS)
+    assert route == "synthesizer"  # citation_coverage, the lowest still-actionable dimension
+    assert update["revision_count"] == 1  # a real cycle was started, so it is counted
+
+
+def test_the_gate_is_the_last_resort_when_only_research_could_have_helped() -> None:
+    llm, _ = _llm(_research_only_failure())
+
+    route, update = reflect(_exhausted(), config=_config(), llm=llm)
+
+    assert update["reflection_scores"][0].weighted_score == 2.7
+    assert update["failed_dimensions"] == ["research_completeness", "source_correctness"]
+    assert route == "human_gate"
+    assert update["quality_flag"] == "below_threshold"
+
+
+def test_reaching_the_gate_with_nothing_left_to_research_is_not_a_pass() -> None:
+    # None means the rubric ran and the report passed. This one did not: the evidence gap it
+    # was marked down for is still there, so the reviewer is told, exactly as at the cap.
+    llm, _ = _llm(_research_only_failure())
+
+    _route, update = reflect(_exhausted(), config=_config(), llm=llm)
+
+    assert update["quality_flag"] is not None
+    assert update["quality_flag"] == "below_threshold"
+    assert update["reflection_scores"][0].weighted_score < _config().reflection_pass_threshold
+
+
+def test_no_cycle_is_started_when_no_cycle_could_change_anything() -> None:
+    # A revision is one improvement cycle. Nothing was sent anywhere to improve, so the job
+    # reaches the gate with its remaining cycles unspent rather than burned.
+    llm, _ = _llm(_research_only_failure())
+
+    update = reflect(_exhausted(revision_count=0), config=_config(), llm=llm).update
+
+    assert "revision_count" not in update
+
+
+def test_the_findings_the_draft_and_the_verdicts_all_survive_the_guard() -> None:
+    # The gap is preserved and reported, never cleaned up. Reflection writes none of these.
+    llm, _ = _llm(_research_only_failure())
+    state = _exhausted()
+
+    update = reflect(state, config=_config(), llm=llm).update
+
+    assert not {"findings", "verdicts", "report", "subtopic_status"} & set(update)
+    assert len(state["findings"]) == 6
+    assert state["report"] is not None
+    assert state["subtopic_status"] == dict.fromkeys(("s1", "s2", "s3"), "unresearched")
+
+
+def test_a_subtopic_that_still_has_somewhere_to_look_is_retried() -> None:
+    # The guard is for the exhausted case only. A subtopic that produced findings last time
+    # has its URLs in the per-job `seen` set, so the next visit reaches past them for new
+    # sources - which is what the productive retries in the measured runs actually did.
+    llm, _ = _llm(_failing("research_completeness"))
+    state = _state(
+        findings=[_finding("f1", "s1", _A), _finding("f2", "s2", _A), _finding("f3", "s3", _A)],
+        subtopic_status={"s1": "done", "s2": "unresearched", "s3": "unresearched"},
+    )
+
+    route, update = reflect(state, config=_config(), llm=llm)
+
+    assert route == "researcher"
+    assert update["report"] is None
+    assert update["subtopic_status"] == {
+        "s1": "pending",
+        "s2": "unresearched",
+        "s3": "unresearched",
+    }
+
+
+def test_the_fewest_sources_fallback_never_reaches_for_an_exhausted_subtopic() -> None:
+    # When every eligible subtopic clears the two-source bar, the thinnest of them is still a
+    # target. An exhausted subtopic is thinner than all of them and is still not one.
+    llm, _ = _llm(_failing("research_completeness"))
+    state = _state(
+        findings=[
+            _finding("f1", "s1", _A),
+            _finding("f2", "s1", _B),
+            _finding("f3", "s2", _A),
+            _finding("f4", "s2", _B),
+            _finding("f5", "s2", "https://example.com/c"),
+        ],
+        subtopic_status={"s1": "done", "s2": "done", "s3": "unresearched"},
+    )
+
+    update = reflect(state, config=_config(), llm=llm).update
+
+    assert update["subtopic_status"] == {"s1": "pending", "s2": "done", "s3": "unresearched"}
 
 
 # --- Revisions and the cap ---------------------------------------------------------------

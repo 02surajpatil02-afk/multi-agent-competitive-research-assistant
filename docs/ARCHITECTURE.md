@@ -323,13 +323,28 @@ makes it impossible to tell which fix helped.
 | Factual consistency | `fact_checker` | Re-verify the disputed claims | Unchanged |
 | Report quality | `synthesizer` | Rewrite from the same findings — no new research | Rewritten |
 
+**Neither Researcher row fires when no subtopic has a source left to read**
+([ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)). A subtopic already
+marked `unresearched` is not a target: its last visit produced nothing, so it added no URL to the
+per-job `seen` set, and the next visit would re-issue the same planned query against the same cached
+results with no unread source to reach. Both research dimensions drop out together — whether a
+target exists is a property of the subtopics, not of which dimension scored lowest — and the lowest
+remaining failing dimension is acted on instead. With none left the route is `human_gate` with
+`quality_flag = "below_threshold"`, and **no revision is counted**, because no cycle was started.
+
+**This is a revision-budget heuristic, not a proof.** Extraction is a fresh LLM call over the same
+pages, so a retry against an exhausted subtopic *can* find what the last one missed — measured, 2 of
+6 did. The cycle is simply better spent where a source is still unread, and ADR 0004 records both the
+measurement and the trade.
+
 #### New findings never bypass synthesis
 
 When reflection routes to the Researcher it makes two state changes before the edge is taken:
 
 1. **`report = None`** — the existing draft is invalidated. It was written without the evidence that
    is about to be gathered, so it is stale by definition.
-2. **`subtopic_status[targeted] = "pending"`** — for the specific subtopics that scored thin.
+2. **`subtopic_status[targeted] = "pending"`** — for the specific subtopics that scored thin, and
+   never for one already `unresearched` (ADR 0004).
 
 The gl §5 transition table then carries the job the rest of the way with no new rule:
 
@@ -658,7 +673,7 @@ state, and the Supervisor decides who runs next (CLAUDE.md invariant 5).
 | `reflection_scores` | `list[ReflectionScore]` | Reflection node | **Append-only** (one per pass) | The history is what makes "did it improve?" answerable |
 | `failed_dimensions` | `list[str]` | Reflection node | **Current** (overwritten each pass) | The dimensions failing *right now*. The gate payload and the targeted retry both read it without recomputing from scores and weights |
 | `revision_count` | `int` | Reflection node | Current (counter) | Improvement cycles, not passes. Compared against `MAX_REVISIONS` with `>=` |
-| `quality_flag` | `str \| None` | Reflection node | Current (overwritten) | `None`, `"below_threshold"`, or `"unscored"`. Carries the cap and scoring-failure outcomes to the gate, the API, and `jobs.quality_flag` |
+| `quality_flag` | `str \| None` | Reflection node | Current (overwritten) | `None`, `"below_threshold"`, or `"unscored"`. Carries the outcomes no automatic cycle can fix - the cap, an exhausted research target (ADR 0004), and a scoring failure - to the gate, the API, and `jobs.quality_flag` |
 | `hop_count` | `int` | Supervisor | Current (counter) | Compared against `MAX_SUPERVISOR_HOPS` |
 | `llm_calls_used` | `int` | Every LLM caller | Current (counter) | Compared against `MAX_LLM_CALLS_PER_JOB` |
 | `reviewer_edit_text` | `str \| None` | Approval endpoint sets, Synthesizer clears | Current (**set once, consumed once**) | The `edit` decision's text. It must reach the Synthesizer, and it must not be re-applied on a later pass |
@@ -684,7 +699,7 @@ state that already exists.
 |---|---|
 | **Owner** | The reflection node. Nothing else writes it |
 | **Lifecycle** | `None` while the job runs → set on the last reflection pass → read at the gate and by `GET /jobs/{id}` → persisted to `jobs.quality_flag` by `finalize` |
-| **Values** | `None` (scored and passed) · `"below_threshold"` (revision cap hit with a failing score) · `"unscored"` (the scoring call failed and the report was kept) |
+| **Values** | `None` (scored and passed) · `"below_threshold"` (a failing score no automatic cycle can fix: the revision cap, or nothing left to research — ADR 0004) · `"unscored"` (the scoring call failed and the report was kept) |
 | **Why in state** | It has to survive the interrupt and travel from the reflection node to the gate payload and the API. Recomputing it from `reflection_scores` would not work for `"unscored"`, where there is no score to recompute from |
 
 **`"unscored"` is not `None`.** A `None` flag means the rubric ran and the report passed. `"unscored"`
@@ -825,9 +840,17 @@ returning subtopics to `pending` makes the *existing* rows fire in the right ord
 of choosing invalidation over adding a sixth row: the router stays as simple as it was.
 
 **"Resolved" means not `pending`.** `done` and `unresearched` are both terminal — `unresearched` means
-the subtopic was attempted and produced nothing, so it is finished and only reflection can return it
-to `pending` (§6.2). Always true of the code; not said out loud until ADR 0001, and a real job routed
-on the other reading.
+the subtopic was attempted and produced nothing, so it is finished. Always true of the code; not said
+out loud until ADR 0001, and a real job routed on the other reading.
+
+*(Changed by [ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md).)* This
+sentence used to end "…and **only reflection** can return it to `pending` (§6.2)". That carve-out was
+the one place `unresearched` was not terminal, and one measured job spent three revision cycles in
+it, re-reading the same sources for zero findings each time. Reflection no longer reactivates it, so
+`unresearched` is now terminal without exception — which is what this paragraph, the Supervisor's own
+prompt, and ADR 0001 point 6 all already said. ADR 0004 records what that costs: 2 of 6 measured
+retries against an `unresearched` subtopic did find evidence, so this is a budget choice rather than
+a claim that the retry was futile.
 
 **Invalid routing behaviour.** *(changed by [ADR 0001](adr/0001-supervisor-llm-routing-is-advisory.md)
 at step 12.)* `allowed_target(state)` is the sole authority for the route. A proposal outside the
@@ -938,7 +961,13 @@ This is the complete list. A control-flow node with a longer list would be an ag
 | `researcher` | **`report = None`**, `subtopic_status[targeted] = "pending"` |
 | `synthesizer` | nothing extra — the Synthesizer overwrites the draft itself |
 | `fact_checker` | nothing extra |
-| `human_gate` | `quality_flag` when the cap was hit or scoring failed |
+| `human_gate` | `quality_flag` when the cap was hit, scoring failed, or nothing is left to research |
+
+The `researcher` row is the one that can be **declined**. When every subtopic is exhausted there is
+no target, so neither field is written and the route becomes `human_gate` instead
+([ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)). Declining writes
+nothing at all — the findings, the verdicts, the draft and the subtopic statuses are all left exactly
+as they were, and the gap travels to the reviewer intact.
 
 It never writes `findings`, `verdicts`, claim text, or `status`.
 
@@ -956,6 +985,13 @@ through). When `revision_count >= MAX_REVISIONS` and the score is still failing 
 **One exception that is not reviewer-overridable:** if citation coverage is still failing at the cap,
 export is blocked regardless of what the reviewer says. That is the gl §9 invariant, enforced at the
 export node.
+
+**The cap is not the only way to reach the gate on a failing score.** A job whose only failing
+dimensions route to the Researcher, with every subtopic already `unresearched`, has nothing an
+automatic cycle could do — so it takes the same path with cycles still unspent
+([ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)). Everything above holds
+identically: `below_threshold`, the breakdown at the gate, the reviewer deciding, and coverage still
+blocking export.
 
 #### When the scoring call itself fails
 
@@ -1295,12 +1331,15 @@ jobs          (job_id PK, user_id, question, idempotency_key UNIQUE, status, qua
                revision_count, llm_calls_used, report_json, exported_at,
                created_at, completed_at)
 
-findings      (finding_id PK, job_id FK, subtopic, claim, evidence,
-               url, title, retrieved_at, content_hash, truncated)
+findings      (job_id FK, finding_id, subtopic, claim, evidence,
+               url, title, retrieved_at, content_hash, truncated,
+               PRIMARY KEY (job_id, finding_id))
 
 claims        (claim_id PK, job_id FK, section, text, supported, verdict_note)
 
-claim_sources (claim_id FK, finding_id FK, PRIMARY KEY (claim_id, finding_id))
+claim_sources (claim_id FK, job_id, finding_id,
+               FOREIGN KEY (job_id, finding_id) REFERENCES findings,
+               PRIMARY KEY (claim_id, finding_id))
 
 audit_events  (event_id PK, job_id FK, actor, action, detail JSONB, created_at)
 ```
@@ -1314,7 +1353,7 @@ audit_events  (event_id PK, job_id FK, actor, action, detail JSONB, created_at)
 | `question` | The original text, validated and length-capped at the API |
 | `idempotency_key` | **UNIQUE, NOT NULL.** `sha256(user_id + question + date)`, derived server-side. See below |
 | `status` | Lifecycle: `running` → `awaiting_approval` → `approved` / `rejected` / `failed` |
-| `quality_flag` | `NULL`, `below_threshold` (revision cap hit with a failing score), or `unscored` (the scoring call failed and the report was kept) |
+| `quality_flag` | `NULL`, `below_threshold` (a failing score no automatic cycle can fix: the revision cap, or nothing left to research — ADR 0004), or `unscored` (the scoring call failed and the report was kept) |
 | `revision_count`, `llm_calls_used` | Persisted so budget behaviour is auditable after the job ends |
 | `report_json` | **JSONB, nullable.** The approved `Report` body, written by the export node **only after the gate passes**. `NULL` means nothing was ever exported. This is what makes the report retrievable in Phase 2, before S3 exists (§8) |
 | `exported_at` | Nullable. Set alongside `report_json`. `NULL` here and `status=approved` means the export did not complete |
@@ -1351,16 +1390,27 @@ the worker — by the time a message exists, the job row already won or lost the
 
 | Field | Notes |
 |---|---|
-| `finding_id` | **PK** |
-| `job_id` | **FK → jobs**, cascade with retention |
+| `job_id` | **FK → jobs**, cascade with retention. Also the first half of the PK |
+| `finding_id` | `f1`, `f2`, … — a **per-job sequence**, unique within a job and not beyond it ([ADR 0003](adr/0003-finding-ids-are-a-per-job-sequence.md)) |
 | `subtopic` | Which planned subtopic produced it |
 | `claim`, `evidence` | `evidence` is the **verbatim quote**, not a summary |
 | `url`, `title` | The citation |
 | `retrieved_at`, `content_hash` | Reproducibility (gl §9) |
 | `truncated` | The page was cut at `MAX_PAGE_CHARS` |
 
-**Indexes:** PK; `(job_id)`; `(job_id, url)` supports per-job URL dedupe verification and is the
-natural lookup when reflection excludes failing URLs.
+**Key:** composite `PRIMARY KEY (job_id, finding_id)`. It was `finding_id PK` while the Researcher
+minted a `uuid4().hex`; ADR 0003 made the id a short per-job counter so that the Synthesizer can
+transcribe it into `Claim.finding_ids` without dropping a character, which means every job now has an
+`f1` and a global PK on the column alone would collide on the second job inserted. The composite key
+is the natural one either way — the relationship note below already said a finding belongs to exactly
+one job.
+
+`claim_sources` therefore carries `job_id` as part of its foreign key. A claim belongs to one job, so
+`(claim_id, finding_id)` is still unique and stays the primary key.
+
+**Indexes:** PK `(job_id, finding_id)`, whose leading column already serves the per-job lookup;
+`(job_id, url)` supports per-job URL dedupe verification and is the natural lookup when reflection
+excludes failing URLs.
 
 **Relationship:** one job → many findings. A finding belongs to exactly one job — evidence is never
 shared between jobs, because `retrieved_at` and `content_hash` are per-retrieval facts.
@@ -1686,7 +1736,7 @@ The two `quality_flag` values say different things and the payload must not blur
 
 | `quality_flag` | What the reviewer is being told |
 |---|---|
-| `"below_threshold"` | The rubric ran, the report failed it, and both improvement cycles are spent. `failed_dimensions` says which dimensions |
+| `"below_threshold"` | The rubric ran and the report failed it, and no automatic cycle can fix it — either both improvement cycles are spent, or the only failing dimensions needed research this job has exhausted (ADR 0004). `failed_dimensions` says which dimensions; the subtopic statuses say which of the two it was |
 | `"unscored"` | **The rubric never ran.** The report is complete and fact-checked, but nothing scored it. `failed_dimensions` is empty because it is *unknown*, not because it is clean. You are the only quality judgement on this job |
 | `None` | The rubric ran and the report passed |
 
@@ -2433,8 +2483,10 @@ recorded in §20 and applied in the sections they affect; where a decision made 
 to drift.
 
 **No open question blocks implementation.** One item remains open — exposed by the export-failure
-decision, and needed before Phase 3 — with a second low-stakes reading marked as such. **Nothing has
-been silently resolved.**
+decision, and needed before Phase 3 — with a second low-stakes reading marked as such. Two further
+items are listed below as **deferred**: one whose design is settled and whose code ships with
+Phase 2, and one raised by [ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)
+whose design is not settled at all. **Nothing has been silently resolved.**
 
 ### Decided at architecture review
 
@@ -2498,6 +2550,48 @@ this question has to be answered before that work lands, not after.
 Synthesizer applies it and clears it in the same pass; the code does neither. This is deferred rather
 than open — the *design* is settled — but it is listed here so it is not mistaken for finished work.
 It ships with §21 step 17, alongside the endpoint that produces the text.
+
+#### 4. Future enhancement: adaptive Researcher query rewriting after evidence exhaustion
+
+**Not implemented in the current production-hardening change**, and unlike question 3 the design is
+**not** settled — this is genuinely open.
+
+[ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md) stops reflection retrying
+a subtopic whose last visit produced nothing, because the retry re-issues the same planned query
+against the same cached results with no unread source to reach. That spends the revision budget
+better; it does not fill the evidence gap, which is reported to the reviewer instead — and it gives
+up the retries that would have found something anyway (2 of 6, measured).
+
+The enhancement that would actually fill it:
+
+```text
+Researcher  ->  no new evidence  ->  generate a bounded alternative query
+            ->  new search       ->  is the evidence genuinely new and better?
+```
+
+Open questions, none of which have an answer yet:
+
+- **How is the query rewritten, and by what?** An LLM call is the obvious answer, and it costs one
+  more call against the per-job budget and the 40 RPM tier.
+- **How many rewrites per subtopic, and per job?** Unbounded rewriting is the same loop with a
+  longer period. gl §7 requires a bound and a stated give-up.
+- **How different must a rewrite be to count?** A query differing by one word returns the same
+  results and burns a call proving it.
+- **Does it bypass the search cache?** If not, a near-identical rewrite is a cache hit and changes
+  nothing. If so, the per-job cache-hit rate gl §14 publishes has to be re-read.
+- **What does the extra Tavily traffic cost?** One search per rewrite, per subtopic, per cycle.
+- **How do we judge the new evidence is better?** The reflection rubric is the only judge available
+  and it is uncalibrated until the Phase 4 hand-scoring pass (§6). "More findings" is not "better
+  evidence".
+- **What is the injection risk?** The load-bearing one. **A query rewritten from anything the
+  fetched pages said would let a third party influence a tool argument**, which CLAUDE.md
+  invariant 4 forbids — queries come from the plan today and that is not an accident (§7, §13). A
+  rewrite would have to derive from the plan and the subtopic question only, and the boundary test
+  would have to prove it.
+
+*Not blocking:* the loop it would replace is already bounded and its gap is already visible at the
+gate. Revisit after the Phase 4 calibration, which is what would make "is this evidence better?"
+answerable.
 
 ---
 

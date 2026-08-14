@@ -18,11 +18,11 @@ WHY THIS FILE EXISTS
     The caller is identified by the JSON Schema `llm_client` puts in the system prompt, so
     each queue reads as that one agent's sequence.
 
-    **An answer may be computed from the request it is answering.** Finding ids are minted at
-    run time with uuid4 and claim ids are the Synthesizer's own, so a static script cannot
-    cite them. A callable answer reads them out of the prompt it was given - which is what a
-    real model does - and that is also what makes "the Synthesizer was actually shown these
-    finding ids" assertable.
+    **An answer may be computed from the request it is answering.** Finding ids are numbered at
+    run time (`f1`, `f2`, … - ADR 0003) and claim ids are the Synthesizer's own, so a static
+    script cannot cite them. A callable answer reads them out of the prompt it was given - which
+    is what a real model does - and that is also what makes "the Synthesizer was actually shown
+    these finding ids" assertable.
 
     Recorded pages are served through the *real* tools. `RecordedWeb` replaces Tavily's
     client and httpx's transport and nothing else, so tools/search.py still normalises the

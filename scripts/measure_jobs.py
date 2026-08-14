@@ -14,11 +14,17 @@ WHY THIS FILE EXISTS
         for "is this job searching or fetching right now?" without a line of production
         code emitting progress events.
 
-    Three decisions worth reading before the code.
+    Four decisions worth reading before the code.
 
     **Jobs run one at a time.** gl §13: a single job can consume a full minute of the 40
     RPM development tier, so two concurrent jobs saturate it. Concurrency here would
     measure the rate limiter rather than the system.
+
+    **One `LLMClient` for the whole run**, built in `main()` and handed to every job. It
+    holds no job state, and `LLMClient.__init__` applies `wrap_openai` when tracing is on -
+    a wrapper that patches the client in place and does not refuse to do it twice. Building
+    one per job therefore stacked a layer per job and inflated the traced token totals; the
+    note at the construction site carries the detail.
 
     **The human gate is auto-approved.** That is a measurement-harness decision, taken so
     the export path is measured too. It is emphatically **not** a production bypass: the
@@ -70,7 +76,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from langgraph.types import Command
-from openai import OpenAI
 
 from config import Config, load_config
 from graph.build import ResearchGraph, build_graph, run_config
@@ -320,11 +325,15 @@ def run_job(
     question: str,
     *,
     config: Config,
-    client: OpenAI,
+    llm: LLMClient,
 ) -> _JobResult:
-    """Run one job end to end and return its row. Never raises: a crash is a row too."""
+    """Run one job end to end and return its row. Never raises: a crash is a row too.
+
+    The client is built once by `main()` and shared by every job. It holds no job state, and
+    building one per job is what nested the LangSmith spans - see the note there.
+    """
     cache = _MeasuringCache()
-    compiled = build_graph(config=config, llm=LLMClient(config, client=client), cache=cache)
+    compiled = build_graph(config=config, llm=llm, cache=cache)
     job_id = f"measure-{index:02d}"
     settings = run_config(job_id)
     progress = _Progress(index, total, config.max_llm_calls_per_job)
@@ -690,10 +699,20 @@ def main() -> int:
     _MEASUREMENTS_DIR.mkdir(exist_ok=True)
     _configure_logging()
 
-    # max_retries=0 for the same reason llm_client.py sets it on the client it builds: the
-    # SDK's own retry would multiply every schedule in gl §17, and this run has to measure
-    # the retry behaviour that ships, not a different one.
-    client = OpenAI(base_url=config.llm_base_url, api_key=config.llm_api_key, max_retries=0)
+    # One client for the whole run, built here rather than per job. `LLMClient.__init__`
+    # applies `wrap_openai` when tracing is on, and that wrapper patches the OpenAI object in
+    # place with no idempotency guard - so a client built per job wrapped the same underlying
+    # object again each time, and job N emitted N nested spans per request whose outermost
+    # carried a running token total. Behaviour was never affected (one HTTP request per
+    # counted call, and CallBudget counts requests), but a token figure read from a multi-job
+    # trace was inflated by the job's ordinal. It holds no job state, so sharing it is also
+    # what `LLMClient` says it is for: "one instance per process is enough".
+    #
+    # It builds its own OpenAI client with max_retries=0, which is the setting this run needs
+    # anyway: the SDK's own retry would multiply every schedule in gl §17 and the measurement
+    # has to see the retry behaviour that ships. Handing in a client built here would only be
+    # a second place to get that wrong.
+    llm = LLMClient(config)
 
     recorded = {str(row.get("question", "")) for row in _load_results()}
     total = len(MEASUREMENT_QUESTIONS)
@@ -716,7 +735,7 @@ def main() -> int:
             continue
         if args.limit is not None and ran >= args.limit:
             break
-        result = run_job(index, total, shape, question, config=config, client=client)
+        result = run_job(index, total, shape, question, config=config, llm=llm)
         _append(result)
         ran += 1
         if result.status != "approved":
