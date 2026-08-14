@@ -86,9 +86,18 @@ The important design point: **route back by which dimension failed**, not a blin
 
 | Failing dimension | Route back to |
 |---|---|
-| Thin or missing coverage | Researcher, for the specific subtopic |
+| Thin or missing coverage | Researcher, for the specific subtopic — unless that subtopic is already `unresearched` ([ADR 0004](docs/adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)) |
 | Weak structure or writing | Synthesizer |
 | Unverified or unsupported claims | Fact-Checker |
+
+**A Researcher route is only taken when some subtopic still has a source left to read.** A subtopic
+that already produced nothing would be re-researched from the same planned query and the same cached
+search results, with no unread source to reach, so it is not a target. With no target left, reflection
+acts on the next failing dimension, or reaches the human gate with `quality_flag="below_threshold"` —
+the evidence gap travels to the reviewer, and is never turned into a pass. **This is a revision-budget
+heuristic, not a proof:** extraction is a fresh LLM call, so such a retry can still find something —
+2 of 6 measured ones did — and [ADR 0004](docs/adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)
+records the trade.
 
 It scores five dimensions, 1–5: **Research completeness · Source correctness · Citation coverage ·
 Factual consistency · Report quality.** These are the same five dimensions the offline evaluation
@@ -97,7 +106,8 @@ uses, deliberately — one vocabulary, used inline as a gate and offline as a me
 A **revision** is one automatic improvement cycle triggered by reflection *after* the initial report.
 Bounded by `MAX_REVISIONS` (default 2, so two improvement cycles and at most 3 passes). A reviewer
 `edit` is not a revision. Hitting the cap is invariant 2 below — a visible outcome, never a silent
-pass. A Researcher route invalidates the draft, so new findings always re-enter through the
+pass. A cycle that could not change anything is not started at all, so a job can reach the gate with
+cycles unspent. A Researcher route invalidates the draft, so new findings always re-enter through the
 Synthesizer.
 
 Full rubric, weights, thresholds, and what exactly happens at the cap:
@@ -124,7 +134,7 @@ flowchart TD
     REFL -->|"coverage weak"| RES
     REFL -->|"writing weak"| SYN
     REFL -->|"claims unverified"| FC
-    REFL -->|"pass, or revision cap hit"| GATE["Human gate<br/>interrupt - awaits approval"]
+    REFL -->|"pass, revision cap hit,<br/>or nothing left to research"| GATE["Human gate<br/>interrupt - awaits approval"]
 
     GATE -->|"approve"| EXPORT["Export gate<br/>every claim has a source URL?"]
     GATE -->|"reject"| REJECTED(["job closed, not exported"])
@@ -381,21 +391,29 @@ row. Until then the gate is real control flow with nothing outside the process a
   `docs/ARCHITECTURE.md` §12 and recorded as low-stakes-open in its §22.
 - **The reflection rubric is uncalibrated.** Until the hand-scoring pass in Phase 4 runs, the pass
   threshold is a reasonable heuristic, not a measured one.
-- **`wrap_openai` is applied once per job, to the same client.** `scripts/measure_jobs.py` builds one
-  `OpenAI` client and reuses it, while constructing a new `LLMClient` per job — and `LLMClient.__init__`
-  wraps whatever client it is handed. `wrap_openai` patches in place, so job *N* runs under *N* layers
-  and emits *N* nested spans per request, the outermost reporting a running token total. Job 3 of a
-  6-job run traced 1,597,176 prompt tokens against a real 266,196. **Behaviour is unaffected** — httpx
-  logged one POST per counted call, so no extra spend, rate pressure, or retries — but any token figure
-  read from a multi-job trace is wrong unless it is taken from the leaf spans. Wrap once, or refuse to
-  re-wrap.
-- **A reflection Researcher retry can be a guaranteed no-op.** Reflection routes a thin subtopic back
-  to the Researcher, which re-issues the same `search_query`; that search is a **cache hit**, so it
-  returns the identical URLs, and sources that were unusable stay unusable. In the 6-job run one job
-  spent three revision cycles this way — its four reflection-triggered Researcher visits produced 0, 0,
-  0 and 0 findings, and the Synthesizer rewrote byte-identical input three times. The cheapest guard is
-  to treat a visit that yielded nothing as a reported gap rather than a retryable failure; the subtopic
-  is already `unresearched` and reflection can already score that and route to the gate.
+- **Traces recorded before 2026-08-14 carry inflated token totals.** `scripts/measure_jobs.py` built
+  one `OpenAI` client and a new `LLMClient` per job, and `LLMClient.__init__` applies `wrap_openai` to
+  whatever client it is handed. That wrapper patches in place with no idempotency guard, so job *N*
+  ran under *N* layers and emitted *N* nested spans per request, the outermost reporting a running
+  total — job 3 of a 6-job run traced 1,597,176 prompt tokens against a real 266,196. **Behaviour was
+  never affected:** httpx logged one POST per counted call, so no extra spend, rate pressure, or
+  retries. **Fixed on 2026-08-14** — the harness now builds one `LLMClient` in `main()` and shares it,
+  which `tests/test_measure_jobs.py` pins. The old traces still have to be read off their leaf spans.
+
+**Future enhancement: adaptive Researcher query rewriting after evidence exhaustion.**
+
+[ADR 0004](docs/adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md) stops reflection
+retrying a subtopic that produced nothing, because the retry re-issues the same planned query against
+the same cached results with no unread source to reach. That spends the revision budget better; it
+does not fill the evidence gap, which is reported to the reviewer instead. A future change might have the
+Researcher generate a **bounded** alternative query, search again, and judge whether the new evidence
+is genuinely better.
+
+**Not implemented in the current production-hardening change.** The open questions — how the rewrite
+is generated, how many are allowed, how different one has to be, whether it bypasses the search cache,
+what the extra search costs, how "better evidence" is judged against an uncalibrated rubric, and above
+all the injection risk if fetched page text could influence a search query (invariant 4) — are written
+out in `docs/ARCHITECTURE.md` §22 item 4 and in ADR 0004's own future-work section.
 
 ---
 

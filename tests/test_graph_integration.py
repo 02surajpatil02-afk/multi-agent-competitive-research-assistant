@@ -8,7 +8,7 @@ WHY THIS FILE EXISTS
     That is a different question from the one tests/test_graph_build.py asks. Step 10's tests
     stub the four heavy agents, because what was under test was where an agent's answer goes.
     Here nothing is stubbed, so what is under test is whether the agents' contracts actually
-    compose: whether a uuid4 finding id minted in the Researcher survives into a Claim, a
+    compose: whether a finding id minted in the Researcher survives into a Claim, a
     Verdict, the export gate's arithmetic, and a checkpoint - and whether the documented
     routes are the ones a real run takes.
 
@@ -318,6 +318,55 @@ def test_a_completeness_failure_re_researches_only_the_thin_subtopic(web: Record
     assert len({verdict.claim_id for verdict in paused["verdicts"]}) == 11
     current = {claim.claim_id for claim in paused["report"].claims}
     assert current <= {verdict.claim_id for verdict in paused["verdicts"]}
+    assert compiled.get_state(settings).next == ("human_gate",)
+    assert fake.unused() == {}
+
+
+def test_a_retry_that_finds_nothing_does_not_start_another_identical_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ADR 0004, end to end. The third subtopic yields nothing on its first visit, and the
+    # retry sent to the other two re-reaches only URLs their own findings already carry, so
+    # they yield nothing either. All three are now `unresearched`, and the second reflection
+    # pass has nowhere left to send the Researcher - the loop stops at the gate with a cycle
+    # still in hand, rather than re-issuing the same query against the same cached results.
+    recorded = RecordedWeb()
+    for index, question in enumerate(_SUBTOPICS, 1):
+        recorded.index(question, _page(f"{index}a"), _page(f"{index}b"))
+    recorded.install(monkeypatch)
+    research_only = rubric(
+        research_completeness=1, source_correctness=1, factual_consistency=4, report_quality=4
+    )
+    fake = FakeLLM(
+        supervisor=[
+            *_ROUTE_TO_THE_GATE,
+            decision("researcher"),
+            decision("synthesizer"),
+            decision("fact_checker"),
+        ],
+        planner=[plan(*_SUBTOPICS)],
+        # Two usable sources each for the first two subtopics, nothing for the third. Neither
+        # retry visit makes a call at all: every URL it would read is already in `seen`.
+        researcher=[*[quote_the_page()] * 4, *[extraction()] * 2],
+        synthesizer=[draft(1), draft(2)],
+        fact_checker=[verdict_batch(quote=_sentence("1a"))] * 2,
+        reflection=[research_only] * 2,
+    )
+    compiled = _graph(fake)
+    settings = run_config("job-1")
+
+    paused = compiled.invoke(_start(), settings)
+
+    # One search per subtopic, plus the two legitimate retries. There is no sixth.
+    assert recorded.queries == [*_SUBTOPICS, _SUBTOPICS[0], _SUBTOPICS[1]]
+    assert paused["subtopic_status"] == dict.fromkeys(("s1", "s2", "s3"), "unresearched")
+    assert fake.roles.count("reflection") == 2
+    # The cap did not stop this - MAX_REVISIONS is 2 and only one cycle was spent. The second
+    # reflection pass declined to start one because no cycle could have changed anything.
+    assert paused["revision_count"] == 1
+    assert paused["quality_flag"] == "below_threshold"  # the gap is reported, not passed
+    assert paused["failed_dimensions"] == ["research_completeness", "source_correctness"]
+    assert len(paused["findings"]) == 4  # nothing was lost on the way to the gate
     assert compiled.get_state(settings).next == ("human_gate",)
     assert fake.unused() == {}
 

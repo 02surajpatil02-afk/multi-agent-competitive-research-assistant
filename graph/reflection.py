@@ -22,6 +22,12 @@ WHY THIS FILE EXISTS
     can buy is a wasted revision - MAX_REVISIONS caps the loop, the export gate still runs,
     and a human still reads the report.
 
+    One thing the code decides that the rubric cannot: **where a Researcher cycle is worth
+    spending.** A subtopic whose last visit produced nothing has no unread source left to reach,
+    so reflection stops choosing it and acts on another failing dimension - or takes the job to
+    the gate with the gap still on it. It never converts the gap into a pass. That is a
+    revision-budget heuristic, not a proof about what a retry would find (ADR 0004).
+
     Two failure shapes, and they are deliberately different (ARCHITECTURE.md §15):
 
       * The scorer broke and a report exists  -> keep the report, quality_flag="unscored",
@@ -175,7 +181,8 @@ def reflect(state: ResearchState, *, config: Config, llm: LLMClient) -> Reflecti
 
     Returns state updates and a route. It never calls an agent, never edits the report, and
     never carries out the fix itself: on a Researcher route it invalidates the draft and
-    returns the targeted subtopics to `pending`, and the graph edge does the rest.
+    returns the targeted subtopics to `pending`, and the graph edge does the rest. That route
+    is taken only when a subtopic is still worth researching (ADR 0004).
     """
     report = state["report"]
     if report is None:
@@ -230,9 +237,7 @@ def _scored(
     # A failing report always has a failing dimension: the weighted score is a convex
     # combination of the five, so all five clearing the bar puts the total over it too, and
     # a coverage gate that bit means coverage itself is below 5.
-    route: ReflectionRoute = (
-        "human_gate" if passed or capped else _ROUTE_BY_DIMENSION[_lowest(scores, failed)]
-    )
+    route: ReflectionRoute = "human_gate" if passed or capped else _route_for(state, scores, failed)
 
     score = ReflectionScore(
         research_completeness=rubric.research_completeness,
@@ -258,7 +263,7 @@ def _scored(
         logger.info(
             "reflection scored %.2f (%s) and routed to the human gate",
             weighted,
-            "passed" if passed else "revision cap reached",
+            _gate_reason(passed=passed, capped=capped),
         )
         return ReflectionOutcome(route, update)
 
@@ -341,13 +346,59 @@ def _lowest(scores: dict[str, int], failed: list[str]) -> str:
     return min(failed, key=lambda name: (scores[name], REFLECTION_DIMENSIONS.index(name)))
 
 
+def _route_for(state: ResearchState, scores: dict[str, int], failed: list[str]) -> ReflectionRoute:
+    """The specialist that can fix the lowest failing dimension, skipping a Researcher route
+    that has nothing left to research (ADR 0004).
+
+    Both research dimensions send work to the Researcher, and both stop being actionable at
+    the same moment: whether a target exists is a property of the subtopics, not of which
+    dimension happened to score lowest. So they are dropped together and the next failing
+    dimension is acted on instead.
+
+    When nothing is left to act on the job goes to the gate - and the caller writes
+    `below_threshold` there, because the evidence gap is still unfixed. This is a reported
+    failure, never a pass.
+    """
+    actionable = (
+        failed
+        if _thin_subtopics(state)
+        else [name for name in failed if _ROUTE_BY_DIMENSION[name] != "researcher"]
+    )
+    if not actionable:
+        return "human_gate"
+    return _ROUTE_BY_DIMENSION[_lowest(scores, actionable)]
+
+
+def _gate_reason(*, passed: bool, capped: bool) -> str:
+    """Why a job reached the gate, for the log line that records it going there."""
+    if passed:
+        return "passed"
+    if capped:
+        return "revision cap reached"
+    return "no failing dimension left to act on"
+
+
 def _thin_subtopics(state: ResearchState) -> list[str]:
     """The subtopics a Researcher route sends back - the thin ones, not all five.
 
     Thin is read from the rubric's own description of a 5 for research completeness: every
     planned subtopic has findings from more than one source. A subtopic below that bar is
-    what fell short. When every subtopic clears it, the ones with the fewest sources are the
-    thinnest there are, so the retry still has a target.
+    what fell short. When every eligible subtopic clears it, the ones with the fewest sources
+    are the thinnest there are, so the retry still has a target.
+
+    **A subtopic already marked `unresearched` is not eligible** (ADR 0004). That status means
+    its last Researcher visit produced nothing - and a visit that produced nothing added no URL
+    to the per-job `seen` set, so the next one re-issues the same planned query, hits the same
+    cached results, and has no unread source to reach. **That is a statement about the inputs,
+    not a guarantee about the outcome**: extraction is a fresh LLM call over the same pages and
+    can find what the last one missed - measured, 2 of 6 such retries did. The exclusion is a
+    revision-budget choice, because a cycle costs the Researcher, the Synthesizer, the
+    Fact-Checker and a reflection pass, and a subtopic with a source left to read is the better
+    place to spend one. `unresearched` is terminal everywhere else in the system anyway.
+
+    An empty list therefore means "no subtopic has a source left to read", not "everything is
+    fine". `_route_for` acts on another failing dimension instead, or takes the job to the gate
+    carrying the gap.
 
     The failing URLs need no separate exclusion list: the Researcher already skips any URL
     this job's findings already carry, so a re-researched subtopic reaches for new sources
@@ -357,7 +408,15 @@ def _thin_subtopics(state: ResearchState) -> list[str]:
     if plan is None:  # unreachable while a report exists, and harmless if it ever is not
         return []
 
-    sources: dict[str, set[str]] = {subtopic.id: set() for subtopic in plan.subtopics}
+    statuses = state["subtopic_status"]
+    sources: dict[str, set[str]] = {
+        subtopic.id: set()
+        for subtopic in plan.subtopics
+        if statuses.get(subtopic.id) != "unresearched"
+    }
+    if not sources:
+        return []
+
     for finding in state["findings"]:
         if finding.subtopic_id in sources:
             sources[finding.subtopic_id].add(str(finding.url))
