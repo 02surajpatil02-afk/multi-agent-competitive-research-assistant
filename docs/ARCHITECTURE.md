@@ -2442,8 +2442,26 @@ step before, so a step cannot be started early by accident.
 
 ### Phase 1 — the graph runs locally, in memory
 
-**Phase 1 is complete. All twelve steps are done**, step 12 on 2026-08-13. The next work is Phase 2,
-starting at step 13.
+**Phase 1 is complete. All twelve steps are done**, step 12 on 2026-08-13.
+
+**A production-hardening pass then ran on top of those twelve steps, and closed on 2026-08-15.** It
+is not a thirteenth step — the steps below are unchanged and none was reopened — but Phase 1 is not
+finished at step 12 either, and a reader who stops there will miss four changes that altered measured
+behaviour:
+
+| Change | Record | Verified by |
+|---|---|---|
+| Concurrent page extraction in the Researcher | [ADR 0002](adr/0002-concurrent-page-extraction-in-the-researcher.md) | Controlled A/B/A on one subtopic, then the n=20 run — Researcher share 45.2% → 33.1% |
+| Finding ids are a per-job sequence | [ADR 0003](adr/0003-finding-ids-are-a-per-job-sequence.md) | `measure-04` re-run to `approved`, then **zero `report_cites_unknown_findings` across all 20 jobs** of 2026-08-14 |
+| Reflection does not retry an exhausted subtopic | [ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md) | n=20 — 8 re-research decisions, 12 targets, 0 of them `unresearched` |
+| Shared `LLMClient` so `wrap_openai` applies once | gl §14 | Offline test, then **0 nested `llm` spans across 590 leaf spans** |
+
+It also produced the **post-hardening n=20 run of 2026-08-14** and the **LangSmith token
+reconciliation** that made its token figures publishable. That run **supplements** the 2026-08-13
+reference baseline and never replaces it; gl §13–§14 maintains both, with the DNS-outage,
+p95-contamination, derived-cost and measurement-override caveats attached.
+
+The next work is Phase 2, starting at step 13.
 
 | # | Step | Depends on | Status · why here |
 |---|---|---|---|

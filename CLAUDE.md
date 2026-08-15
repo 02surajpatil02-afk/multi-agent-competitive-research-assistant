@@ -7,17 +7,31 @@ strategy"* — and five agents plan the research, search the web, write a report
 claim against its sources. A human approves the report before it is exported. Every claim in the
 exported report traces back to a URL.
 
-> **Status: Phase 1 is complete, and measured.** The graph runs locally, end to end, in memory — five
-> agents, the reflection node, the tool boundary, the LLM client, in-memory checkpointing, and a test
-> suite that makes no network calls. **Two n=20 runs against the real endpoint and the real web, both
-> reaching 16 `approved`**: the **reference baseline of 2026-08-12/13**, and the **post-hardening run
-> of 2026-08-14**, the same 20 questions re-run with ADR 0002's concurrency and ADR 0004's guard in
-> place. The second **supplements** the first rather than replacing it, and the two are never merged
-> into one number. Latency, calls, node shares, revisions and cache come from the post-hardening run;
-> its tokens were **recovered from LangSmith** (the per-job rows carry none) and are published with
-> the reconciliation behind them. Both runs are maintained in `docs/engineering-guidelines.md`
-> §13–§14, and both are measurements rather than estimates. **Phase 2 onwards is not built:** no API,
-> no database, no worker, no Redis, no S3, no AWS, no tracing, no eval set.
+> **Status: Phase 1 is complete — core on 2026-08-13, production-hardening pass on 2026-08-15.** The
+> graph runs locally, end to end, in memory — five agents, the reflection node, the tool boundary, the
+> LLM client, in-memory checkpointing, and a test suite that makes no network calls.
+>
+> **The hardening pass is closed. Four changes, each implemented, tested offline, and verified against
+> real jobs:**
+>
+> | Change | Verified by |
+> |---|---|
+> | [ADR 0002](docs/adr/0002-concurrent-page-extraction-in-the-researcher.md) — concurrent page extraction in the Researcher | A controlled A/B/A on one subtopic (141.9s → 43.7s → 111.1s), then the n=20 run: Researcher share **45.2% → 33.1%** |
+> | [ADR 0003](docs/adr/0003-finding-ids-are-a-per-job-sequence.md) — finding ids are a per-job sequence | `measure-04` re-run to `approved`, then **zero `report_cites_unknown_findings` across all 20 jobs** of 2026-08-14 (585 claims over 969 findings) |
+> | [ADR 0004](docs/adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md) — reflection does not retry an exhausted subtopic | n=20: 8 re-research decisions naming 12 targets, **0 of them `unresearched`**; substitution fired 4 times |
+> | Shared `LLMClient` / `wrap_openai` lifecycle fix | `tests/test_measure_jobs.py` offline, then **0 nested `llm` spans across 590 leaf spans** in the n=20 traces |
+>
+> **Two n=20 runs against the real endpoint and the real web, both reaching 16 `approved`**: the
+> **reference baseline of 2026-08-12/13**, and the **post-hardening run of 2026-08-14**, the same 20
+> questions re-run with the four changes above in place. The second **supplements** the first rather
+> than replacing it, and the two are never merged into one number. Latency, calls, node shares,
+> revisions and cache come from the post-hardening run; its tokens were **recovered from LangSmith**
+> (the per-job rows carry none) and published only after a reconciliation that matched 544 successful
+> calls to 544 token-bearing spans. Both runs are maintained in `docs/engineering-guidelines.md`
+> §13–§14, and both are measurements rather than estimates.
+>
+> **Phase 2 onwards is not built:** no API, no database, no worker, no Redis, no S3, no AWS, no eval
+> set. **Tracing is the one partial exception** — see the stack table below.
 >
 > **Neither baseline is a production-default benchmark.** Both runs used the NIM development overrides
 > in `.env` — `MAX_REVISIONS=3`, `MAX_SUPERVISOR_HOPS=30`, `LLM_MAIN_TIMEOUT_S=180`,
@@ -179,7 +193,7 @@ A row that cannot name the requirement it serves gets deleted.
 | Containers | Docker + ECR | Packaging |
 | Compute | ECS Fargate | Deployment |
 | API entry | API Gateway | Exposure and rate limiting |
-| AI observability | LangSmith | Agent and LLM tracing |
+| AI observability | LangSmith | Agent and LLM tracing. **Partially built** — see below |
 | Infra observability | CloudWatch | AWS logs, metrics, alarms |
 | Evaluation | LangSmith Evaluation | Research quality |
 | Testing | pytest | Application tests |
@@ -187,8 +201,22 @@ A row that cannot name the requirement it serves gets deleted.
 | Migrations | Alembic | Tracks which migrations ran, and in what order |
 | CI/CD | GitHub Actions | Enforces the eval gate that §15 asks for |
 
-**Built so far:** the LLM row, the agent framework row, the web-search row, and the testing row.
-Everything else in the table is Phase 2 or later and has no code behind it yet.
+**Built so far:** the LLM row, the agent framework row, the web-search row, and the testing row — plus
+**part of the AI-observability row**, which is the one entry that is neither fully built nor untouched.
+Every other row is Phase 2 or later and has no code behind it yet.
+
+**What "partially built" means for tracing, stated precisely, because the two halves ship in different
+phases.**
+
+| | Status |
+|---|---|
+| **Client and graph tracing** | **Built and verified.** `llm_client.py` applies `wrap_openai` when `LANGSMITH_TRACING` is on, LangGraph emits a run tree per job, and `thread_id` carries the job id. `config.py` validates the credentials, and `tests/test_config.py` and `tests/test_measure_jobs.py` cover it offline. The 2026-08-14 reconciliation read 590 leaf spans back out of the project |
+| **The standardized metadata contract** | **Not built.** Nothing sets `job_id`, `agent`, `model`, or `revision` under those names — what a query gets is whatever LangGraph and `wrap_openai` happen to record (`docs/engineering-guidelines.md` §14 has the mapping). `revision_count` reaches no run at all |
+| **Evaluation and the release gate** | **Not built.** No eval dataset, no calibrated rubric, no CI gate. Phase 4 |
+
+So tracing is **usable for debugging and was load-bearing for the token reconciliation**, and it is
+**not** the production observability contract Phase 4 specifies. Do not describe LangSmith as done, and
+do not describe it as absent.
 
 **The tool-protocol row is the one to read carefully.** `tools/` is one boundary with one place for
 argument validation, timeouts, size limits, and the injection wrapper — which is the property MCP was
@@ -376,7 +404,7 @@ These are the non-negotiables. If a change breaks one, the change is wrong.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Documentation — this file, engineering guidelines, architecture | **Done** |
-| 1 | Local graph: 5 agents + the reflection node, tool boundary, LLM client, in-memory state, no persistence | **Done** — plus the human-gate and export nodes, the test suite, and the 20-job measured baseline (2026-08-13) |
+| 1 | Local graph: 5 agents + the reflection node, tool boundary, LLM client, in-memory state, no persistence | **Done.** Core on **2026-08-13** — twelve steps, plus the human-gate and export nodes, the test suite, and the 20-job reference baseline. **Production-hardening pass on 2026-08-15** — ADR 0002, ADR 0003, ADR 0004, the shared-`LLMClient` fix, the post-hardening n=20 run of 2026-08-14, and the LangSmith token reconciliation. Both are in the status block above |
 | 2 | Postgres checkpointer, Alembic migrations, audit tables, the gate's **API side** — `POST /jobs/{id}/approve`, the reviewer payload, expiry — FastAPI routes, **API-key auth on every route except `/health`** | Planned |
 | 3 | Docker Compose (Postgres 16, Redis 7, LocalStack for SQS + S3), async worker, **CI: lint, types, tests, image build** | Planned |
 | 4 | LangSmith tracing, eval dataset of 30–50 questions, eval as a release gate | Planned |
@@ -410,7 +438,17 @@ row. Until then the gate is real control flow with nothing outside the process a
   total — job 3 of a 6-job run traced 1,597,176 prompt tokens against a real 266,196. **Behaviour was
   never affected:** httpx logged one POST per counted call, so no extra spend, rate pressure, or
   retries. **Fixed on 2026-08-14** — the harness now builds one `LLMClient` in `main()` and shares it,
-  which `tests/test_measure_jobs.py` pins. The old traces still have to be read off their leaf spans.
+  which `tests/test_measure_jobs.py` pins, and the n=20 traces then showed **0 nested `llm` spans
+  across 590 leaf spans**. The old traces still have to be read off their leaf spans.
+- **Some published evidence exists only as LangSmith traces, and nothing in this repository can
+  reproduce it.** Two sets: the **2026-08-14 token and derived-cost figures** — `measurements/jobs.jsonl`
+  carries `null` in both token columns, so §13–§14's token rows were recovered from the traces — and
+  the **`smoke-e2e-*` cases** behind `docs/ARCHITECTURE.md` §22 items 5 and 6, which were driven
+  interactively and wrote no measurement row or log line at all. Both were confirmed present on
+  2026-08-15. **If those traces age out of the LangSmith project, the figures become unverifiable from
+  the repo alone** — the retention window that applies has not been checked, so treat the risk as real
+  and undated. The durable fix is to capture what still matters into the Phase 4 eval set rather than
+  to keep citing traces; until then, re-run the question rather than reconstructing a number from prose.
 
 **Future enhancement: adaptive Researcher query rewriting after evidence exhaustion.**
 
