@@ -323,14 +323,19 @@ makes it impossible to tell which fix helped.
 | Factual consistency | `fact_checker` | Re-verify the disputed claims | Unchanged |
 | Report quality | `synthesizer` | Rewrite from the same findings — no new research | Rewritten |
 
-**Neither Researcher row fires when no subtopic has a source left to read**
-([ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)). A subtopic already
-marked `unresearched` is not a target: its last visit produced nothing, so it added no URL to the
-per-job `seen` set, and the next visit would re-issue the same planned query against the same cached
-results with no unread source to reach. Both research dimensions drop out together — whether a
-target exists is a property of the subtopics, not of which dimension scored lowest — and the lowest
-remaining failing dimension is acted on instead. With none left the route is `human_gate` with
-`quality_flag = "below_threshold"`, and **no revision is counted**, because no cycle was started.
+**A subtopic already marked `unresearched` is not a target — both Researcher rows fire against an
+eligible subtopic instead** ([ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)).
+Its last visit produced nothing, so it added no URL to the per-job `seen` set, and the next visit
+would re-issue the same planned query against the same cached results with no unread source to reach.
+
+**The rows stop firing only when *every* subtopic is `unresearched`.** The eligible subtopics with the
+fewest sources are the fallback target, so a target exists while one eligible subtopic remains — the
+usual effect of the guard is to change *which* subtopic is retried, not *whether* the retry happens.
+Only when the exclusion empties the candidate list do both research dimensions drop out together —
+whether a target exists is a property of the subtopics, not of which dimension scored lowest — and the
+lowest remaining failing dimension is acted on instead. With none left the route is `human_gate` with
+`quality_flag = "below_threshold"`, and **no revision is counted**, because no cycle was started. That
+path did not occur once across the 20 measured jobs of 2026-08-14.
 
 **This is a revision-budget heuristic, not a proof.** Extraction is a fresh LLM call over the same
 pages, so a retry against an exhausted subtopic *can* find what the last one missed — measured, 2 of
@@ -673,7 +678,7 @@ state, and the Supervisor decides who runs next (CLAUDE.md invariant 5).
 | `reflection_scores` | `list[ReflectionScore]` | Reflection node | **Append-only** (one per pass) | The history is what makes "did it improve?" answerable |
 | `failed_dimensions` | `list[str]` | Reflection node | **Current** (overwritten each pass) | The dimensions failing *right now*. The gate payload and the targeted retry both read it without recomputing from scores and weights |
 | `revision_count` | `int` | Reflection node | Current (counter) | Improvement cycles, not passes. Compared against `MAX_REVISIONS` with `>=` |
-| `quality_flag` | `str \| None` | Reflection node | Current (overwritten) | `None`, `"below_threshold"`, or `"unscored"`. Carries the outcomes no automatic cycle can fix - the cap, an exhausted research target (ADR 0004), and a scoring failure - to the gate, the API, and `jobs.quality_flag` |
+| `quality_flag` | `str \| None` | Reflection node | Current (overwritten) | `None`, `"below_threshold"`, or `"unscored"`. Carries the outcomes no automatic cycle can fix - the cap, every research target exhausted (ADR 0004), and a scoring failure - to the gate, the API, and `jobs.quality_flag` |
 | `hop_count` | `int` | Supervisor | Current (counter) | Compared against `MAX_SUPERVISOR_HOPS` |
 | `llm_calls_used` | `int` | Every LLM caller | Current (counter) | Compared against `MAX_LLM_CALLS_PER_JOB` |
 | `reviewer_edit_text` | `str \| None` | Approval endpoint sets, Synthesizer clears | Current (**set once, consumed once**) | The `edit` decision's text. It must reach the Synthesizer, and it must not be re-applied on a later pass |
@@ -699,7 +704,7 @@ state that already exists.
 |---|---|
 | **Owner** | The reflection node. Nothing else writes it |
 | **Lifecycle** | `None` while the job runs → set on the last reflection pass → read at the gate and by `GET /jobs/{id}` → persisted to `jobs.quality_flag` by `finalize` |
-| **Values** | `None` (scored and passed) · `"below_threshold"` (a failing score no automatic cycle can fix: the revision cap, or nothing left to research — ADR 0004) · `"unscored"` (the scoring call failed and the report was kept) |
+| **Values** | `None` (scored and passed) · `"below_threshold"` (a failing score no automatic cycle can fix: the revision cap, or every subtopic already `unresearched` — ADR 0004) · `"unscored"` (the scoring call failed and the report was kept) |
 | **Why in state** | It has to survive the interrupt and travel from the reflection node to the gate payload and the API. Recomputing it from `reflection_scores` would not work for `"unscored"`, where there is no score to recompute from |
 
 **`"unscored"` is not `None`.** A `None` flag means the rubric ran and the report passed. `"unscored"`
@@ -961,7 +966,7 @@ This is the complete list. A control-flow node with a longer list would be an ag
 | `researcher` | **`report = None`**, `subtopic_status[targeted] = "pending"` |
 | `synthesizer` | nothing extra — the Synthesizer overwrites the draft itself |
 | `fact_checker` | nothing extra |
-| `human_gate` | `quality_flag` when the cap was hit, scoring failed, or nothing is left to research |
+| `human_gate` | `quality_flag` when the cap was hit, scoring failed, or every subtopic is already `unresearched` |
 
 The `researcher` row is the one that can be **declined**. When every subtopic is exhausted there is
 no target, so neither field is written and the route becomes `human_gate` instead
@@ -1353,7 +1358,7 @@ audit_events  (event_id PK, job_id FK, actor, action, detail JSONB, created_at)
 | `question` | The original text, validated and length-capped at the API |
 | `idempotency_key` | **UNIQUE, NOT NULL.** `sha256(user_id + question + date)`, derived server-side. See below |
 | `status` | Lifecycle: `running` → `awaiting_approval` → `approved` / `rejected` / `failed` |
-| `quality_flag` | `NULL`, `below_threshold` (a failing score no automatic cycle can fix: the revision cap, or nothing left to research — ADR 0004), or `unscored` (the scoring call failed and the report was kept) |
+| `quality_flag` | `NULL`, `below_threshold` (a failing score no automatic cycle can fix: the revision cap, or every subtopic already `unresearched` — ADR 0004), or `unscored` (the scoring call failed and the report was kept) |
 | `revision_count`, `llm_calls_used` | Persisted so budget behaviour is auditable after the job ends |
 | `report_json` | **JSONB, nullable.** The approved `Report` body, written by the export node **only after the gate passes**. `NULL` means nothing was ever exported. This is what makes the report retrievable in Phase 2, before S3 exists (§8) |
 | `exported_at` | Nullable. Set alongside `report_json`. `NULL` here and `status=approved` means the export did not complete |
@@ -1736,7 +1741,7 @@ The two `quality_flag` values say different things and the payload must not blur
 
 | `quality_flag` | What the reviewer is being told |
 |---|---|
-| `"below_threshold"` | The rubric ran and the report failed it, and no automatic cycle can fix it — either both improvement cycles are spent, or the only failing dimensions needed research this job has exhausted (ADR 0004). `failed_dimensions` says which dimensions; the subtopic statuses say which of the two it was |
+| `"below_threshold"` | The rubric ran and the report failed it, and no automatic cycle can fix it — either both improvement cycles are spent, or the only failing dimensions needed research and **every** subtopic is already `unresearched` (ADR 0004). `failed_dimensions` says which dimensions; the subtopic statuses say which of the two it was |
 | `"unscored"` | **The rubric never ran.** The report is complete and fact-checked, but nothing scored it. `failed_dimensions` is empty because it is *unknown*, not because it is clean. You are the only quality judgement on this job |
 | `None` | The rubric ran and the report passed |
 
@@ -2483,10 +2488,13 @@ recorded in §20 and applied in the sections they affect; where a decision made 
 to drift.
 
 **No open question blocks implementation.** One item remains open — exposed by the export-failure
-decision, and needed before Phase 3 — with a second low-stakes reading marked as such. Two further
+decision, and needed before Phase 3 — with a second low-stakes reading marked as such. Four further
 items are listed below as **deferred**: one whose design is settled and whose code ships with
-Phase 2, and one raised by [ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)
-whose design is not settled at all. **Nothing has been silently resolved.**
+Phase 2; one raised by [ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)
+whose design is not settled at all; and two raised by the live end-to-end smoke runs of
+2026-08-14/15 — an evaluation gap the reflection rubric does not currently cover, and a retry-policy
+question — both of which wait on evidence rather than on a decision. **Nothing has been silently
+resolved.**
 
 ### Decided at architecture review
 
@@ -2592,6 +2600,91 @@ Open questions, none of which have an answer yet:
 *Not blocking:* the loop it would replace is already bounded and its gap is already visible at the
 gate. Revisit after the Phase 4 calibration, which is what would make "is this evidence better?"
 answerable.
+
+#### 5. Evaluation gap: a report that is grounded but underuses the evidence it was given
+
+**Not a defect, and no change is proposed here.** It is the first concrete **calibration and
+regression case** for the Phase 4 hand-scoring pass (§6, gl §6, gl §15), recorded because it was
+measured and would otherwise be rediscovered as a bug.
+
+Case name: `thin_report_high_evidence_utilization_gap`.
+
+A live smoke job on **2026-08-15** — `thread_id=smoke-e2e-03`, question *"What products has Anthropic
+released in the last 12 months?"* (the `event_tracking` shape, `MEASUREMENT_QUESTIONS[8]`) — reached
+`approved` through the whole of §3's normal execution path: 23 of 60 calls, 7 of 30 hops, 0
+revisions, 11m38s, no crash, and the trace is in the LangSmith project under that thread id.
+
+| Stage | Result |
+|---|---|
+| Research | 4 planned subtopics, **all `done`**, none `unresearched` — **53 findings across 10 unique URLs** |
+| Synthesis | **2 claims, 1 cited source** |
+| Fact-check | 2 verdicts, both `supported`, none unsupported |
+| Reflection | rc=5 sc=5 cc=5 fc=5 rq=4 → **weighted 4.90**, `failed_dimensions=[]`, `quality_flag=None`, routed to the gate as a **pass** |
+| Gate → export | auto-approved by the smoke run, as `scripts/measure_jobs.py` does; the export gate passed — every claim reached a source URL |
+
+**The rubric was not wrong by its own definition, which is the point.** A 5 for research completeness
+is "every planned subtopic has findings, from more than one source" (§6) and every subtopic had 2–3.
+Citation coverage asks whether every claim carries a source, and both did. The five dimensions score
+**the research that was performed** and **the grounding of what was written** — none of them asks
+whether the report drew on a reasonable share of the evidence gathered. A report using 2 of 53
+findings and 1 of 10 sources therefore scores as a clean pass.
+
+**The export gate was also right to pass it.** Invariant 1 is that every claim traces to at least one
+source URL, not that the report covers the research; §9's check is arithmetic over the claims that
+exist. Nothing in the graph, the agents, the tool boundary, or the guards behaved incorrectly.
+
+So the gap is in what the rubric *measures*, not in any component's behaviour. What Phase 4 has to be
+able to tell apart:
+
+```text
+grounded, and synthesises the evidence gathered      -> pass
+grounded, but uses a small fraction of the evidence  -> must not score 4.90
+```
+
+Open, and deliberately unanswered here:
+
+- **What is the signal?** `findings_cited / findings_available` and `sources_cited / sources_available`
+  are both arithmetic and cheap, which gl §15 prefers over a judge call. Whether either is the *right*
+  measure is not established — a subtopic can legitimately yield twenty findings that say one thing,
+  and a good report would cite one of them.
+- **A sixth dimension, or a sharpening of research completeness?** Adding a dimension changes the
+  weights, and the weights are load-bearing in §6's threshold arithmetic.
+- **A gate, or a metric?** gl §15 already argues a countable property makes a better regression check
+  than a judge.
+- **What threshold?** Not knowable until the hand-scoring pass gives the rubric a calibrated baseline
+  to move from.
+
+**No hard-coded rule such as `minimum_claims >= N` is implied by any of this**, and none should be
+added ahead of the calibration — it would invent a requirement no measurement supports.
+
+*Not blocking:* the human gate is the designed backstop for exactly this, and it held — the thin
+report reached a reviewer rather than being exported unseen, and became an export only because the
+smoke run auto-approves. **Revisit with the Phase 4 calibration**, the same pass question 4 waits on.
+
+#### 6. Deferred: should a request timeout retry on the same schedule as a connection error?
+
+`LLMClient._send` catches `APITimeoutError` in the same branch as `APIConnectionError` and
+`InternalServerError`, so all three get gl §17's transport schedule — 2 retries at 2s and 8s on the
+main tier. That is correct for the two that are genuinely transient, and it is what recovered three
+503s during these same smoke runs.
+
+**Four timeout episodes were observed on 2026-08-14/15** — `measure-04`, `measure-17`, and smoke runs
+1 and 2 — and every one has the same shape: three consecutive 180s timeouts, ~550s in the node, then
+`llm_call_failed`. No retry succeeded once the endpoint was in that state.
+
+**It is a cost question, not a correctness one.** Every episode was bounded, loud, recorded its
+reason, and finalized the job exactly as §15 specifies. What it costs is ~9 minutes and 3 of the
+60-call budget per episode — and that cost is also what pushes a job toward the `MAX_JOB_RUNTIME`
+bound that `CLAUDE.md`'s environment table already records as configured-but-unenforced until the
+Phase 3 worker owns it (smoke run 2 ran 1557s against the configured 1800s).
+
+**The four episodes are NIM free-tier degradation, not a property of the client.** The same
+fact-check-shaped call — 20 claims, ~12,000 prompt tokens — completed in 66.2s once the endpoint
+recovered, and smoke run 3 then finished a whole job. A schedule tuned to a degraded development tier
+would be tuning to the wrong thing, which is also why `LLM_MAIN_TIMEOUT_S` was **not** raised.
+
+*Not blocking:* nothing is incorrect today. Revisit when there is production-endpoint evidence, or if
+the episodes recur against a paid endpoint.
 
 ---
 

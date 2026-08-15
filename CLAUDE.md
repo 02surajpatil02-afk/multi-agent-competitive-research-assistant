@@ -90,14 +90,17 @@ The important design point: **route back by which dimension failed**, not a blin
 | Weak structure or writing | Synthesizer |
 | Unverified or unsupported claims | Fact-Checker |
 
-**A Researcher route is only taken when some subtopic still has a source left to read.** A subtopic
-that already produced nothing would be re-researched from the same planned query and the same cached
-search results, with no unread source to reach, so it is not a target. With no target left, reflection
-acts on the next failing dimension, or reaches the human gate with `quality_flag="below_threshold"` —
-the evidence gap travels to the reviewer, and is never turned into a pass. **This is a revision-budget
-heuristic, not a proof:** extraction is a fresh LLM call, so such a retry can still find something —
-2 of 6 measured ones did — and [ADR 0004](docs/adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)
-records the trade.
+**A subtopic already marked `unresearched` is not a Researcher target — the retry is aimed at an
+eligible subtopic instead.** It would otherwise be re-researched from the same planned query and the
+same cached search results, with no unread source to reach. **The route itself usually still fires:**
+while one eligible subtopic remains it is the fallback target, so the guard changes *which* subtopic
+is retried far more often than *whether* the retry happens. Only when **every** subtopic is
+`unresearched` is there no target at all — then reflection acts on the next failing dimension, or
+reaches the human gate with `quality_flag="below_threshold"`. Either way the evidence gap travels to
+the reviewer, and is never turned into a pass. **This is a revision-budget heuristic, not a proof:**
+extraction is a fresh LLM call, so such a retry can still find something — 2 of 6 measured ones did —
+and [ADR 0004](docs/adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md) records the trade,
+with its 2026-08-15 correction recording how rare the no-target case is: 0 of 20 measured jobs.
 
 It scores five dimensions, 1–5: **Research completeness · Source correctness · Citation coverage ·
 Factual consistency · Report quality.** These are the same five dimensions the offline evaluation
@@ -107,8 +110,8 @@ A **revision** is one automatic improvement cycle triggered by reflection *after
 Bounded by `MAX_REVISIONS` (default 2, so two improvement cycles and at most 3 passes). A reviewer
 `edit` is not a revision. Hitting the cap is invariant 2 below — a visible outcome, never a silent
 pass. A cycle that could not change anything is not started at all, so a job can reach the gate with
-cycles unspent. A Researcher route invalidates the draft, so new findings always re-enter through the
-Synthesizer.
+cycles unspent — though that needs every subtopic exhausted, and no measured job has hit it. A
+Researcher route invalidates the draft, so new findings always re-enter through the Synthesizer.
 
 Full rubric, weights, thresholds, and what exactly happens at the cap:
 `docs/engineering-guidelines.md` §6.
@@ -134,7 +137,7 @@ flowchart TD
     REFL -->|"coverage weak"| RES
     REFL -->|"writing weak"| SYN
     REFL -->|"claims unverified"| FC
-    REFL -->|"pass, revision cap hit,<br/>or nothing left to research"| GATE["Human gate<br/>interrupt - awaits approval"]
+    REFL -->|"pass, revision cap hit,<br/>or every subtopic exhausted"| GATE["Human gate<br/>interrupt - awaits approval"]
 
     GATE -->|"approve"| EXPORT["Export gate<br/>every claim has a source URL?"]
     GATE -->|"reject"| REJECTED(["job closed, not exported"])

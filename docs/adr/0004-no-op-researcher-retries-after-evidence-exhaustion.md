@@ -6,6 +6,42 @@
   `docs/engineering-guidelines.md` §6 · `CLAUDE.md`
 - **Found by:** The 6-job diagnostic run of 2026-08-13/14 — `measure-06` spent three revision
   cycles re-researching the same subtopic and produced nothing each time
+- **Corrected:** 2026-08-15 — see the Correction below
+
+---
+
+## Correction — 2026-08-15, the suppression path and the saving claimed for it
+
+**This record described the guard as though it usually cancels a Researcher route. It usually does
+not — it redirects one. Cancelling requires *every* planned subtopic to be `unresearched`, and the
+saving this record claimed from `measure-06` does not exist. The decision itself does not change, and
+neither does any figure describing what `measure-06` actually did.**
+
+`_thin_subtopics` excludes `unresearched` and then falls back to the eligible subtopics with the
+fewest sources. That fallback always returns something while one eligible subtopic remains, so the
+candidate list is empty **only when every subtopic is `unresearched`**. `measure-06` had one of five.
+Four eligible subtopics remained, so under this guard its three cycles still run — aimed elsewhere, at
+much the same cost. What this record presented as work removed is work re-aimed.
+
+| Claim | As published | Corrected |
+|---|---|---|
+| When the Researcher route is dropped | "when no target is left" — condition unstated | Only when **every** subtopic is `unresearched` |
+| Primary effect of the guard | Cancels an unproductive cycle | **Substitutes the target** of a cycle that still runs |
+| Saving on the `measure-06` shape | 3 cycles, 19 LLM calls, ~1,059s | **None.** Those cycles run against an eligible subtopic |
+| "Do nothing" alternative | "63% of one measured job's wall clock" | Spend is **redirected, not reclaimed**; 63% is not recovered |
+| Cause of the benefit | Work avoided | A **better-aimed** cycle — a hit rate, not a saving |
+
+**Measured on the clean n=20 run of 2026-08-14** (`measurements/jobs.jsonl`, `run.log`,
+`console.adr0004-n20.log`), which ran with the guard in place: 8 re-research decisions naming 12
+targets, **0 `unresearched`** — the invariant holds — but **0 gates reached for want of a target** and
+**0 routes redirected to another dimension**. Substitution fired 4 times, dropping 9 targets. Revision
+cycles were 8 across 4 jobs, matching the pre-guard baseline's 8 across 4.
+
+**Unchanged:** every figure describing what `measure-06` did (1,675.0s, 46 LLM calls, 3 cycles, 45
+findings, the four empty visits to `s5`, and the 19-calls/1,059s cost of those cycles *as they
+happened*), the 2-of-6 and 3-of-5 retry hit rates, the TCS 8→9 counterexample, the decision, the code,
+and every alternative's rejection. The error is in what this record claimed the guard would *save*,
+not in what it measured.
 
 ---
 
@@ -153,15 +189,49 @@ both terminal, after a real job routed on the other reading. `ARCHITECTURE.md` �
 on the next failing dimension instead — and if none is left, the job goes to the human gate carrying
 `quality_flag="below_threshold"`.**
 
+### Two modes, and only one of them is common
+
+**"When no target is left" is far narrower than that sentence suggests, and this record originally
+left the condition unsaid.** Excluding `unresearched` empties the candidate list *only when every
+planned subtopic is `unresearched`*. While one eligible subtopic remains, the "fewest sources"
+fallback always returns it, so a target always exists. The guard therefore has two modes:
+
+| Mode | What actually happens | Measured, n=20 of 2026-08-14 |
+|---|---|---:|
+| **Target substitution** — the common one | `unresearched` subtopics are dropped from the candidate set and the retry goes to an **eligible** subtopic instead. The revision cycle still runs, at full cost | **4 decisions, 9 targets dropped** |
+| **Route suppression** — the rare one | Every subtopic is `unresearched`, so no target exists, the Researcher route is dropped, and the sentence above applies | **0 of 20 jobs** |
+
+The clean n=20 run (`measurements/jobs.jsonl`, `run.log`, `console.adr0004-n20.log`) is the evidence:
+8 re-research decisions naming 12 targets, **0 of them `unresearched`** — the invariant holding — but
+also **0 gates reached for want of a target** and **0 routes redirected to the Synthesizer or the
+Fact-Checker**. Reflection routed to the Researcher on every failing-research decision it made. Of
+the 4 substituted decisions, 2 produced additional sources (measure-12, 2→4; measure-18, 5→8) and 2
+produced none.
+
+So the primary effect of this guard is **which subtopic a cycle is spent on**, not whether the cycle
+is spent. The suppression path is real, is tested, and is what keeps the all-exhausted case from
+looping — but it is a backstop, not the mechanism.
+
+**One interaction worth recording**, observed in the same run: a `done` subtopic re-researched
+unproductively is demoted to `unresearched` by the Researcher itself
+(`agents/researcher.py`, `status = "done" if findings else "unresearched"`), and is thereby excluded
+from every later retry. In `measure-12`, `s1` was targeted, came back empty, and was excluded from the
+two decisions that followed. The eligible set shrinks as a job proceeds, which is how a job could
+reach the suppression path — none did here.
+
 Two changes in `graph/reflection.py`, and nothing else:
 
 - **`_thin_subtopics` skips `unresearched`.** They are excluded before thinness is computed, so the
   "fewest sources" fallback cannot reach for one either — an exhausted subtopic is thinner than every
-  eligible one and would otherwise always win.
+  eligible one and would otherwise always win. **It returns an empty list only when the exclusion
+  removes every subtopic**; otherwise the fallback guarantees a target, which is why substitution and
+  not suppression is the usual outcome.
 - **`_route_for` replaces the direct table lookup.** When the lowest failing dimension routes to the
   Researcher and there is no target, **both** research dimensions are dropped — whether a target
   exists is a property of the subtopics, not of which dimension scored lowest — and the lowest
-  remaining failing dimension is acted on. With none left, the route is `human_gate`.
+  remaining failing dimension is acted on. With none left, the route is `human_gate`. **This branch
+  needs the all-`unresearched` case to be reached at all**, so it is the guard's backstop rather than
+  its working path: it did not execute once across the 20 jobs of 2026-08-14.
 
 **Nothing changes for an eligible target**, and that is as deliberate as the exclusion. A `done`
 subtopic is still selected, still returned to `pending`, and still re-researched — including through
@@ -182,14 +252,24 @@ unread source rather than on re-rolling extraction over pages that already came 
 trade is the whole of this decision, and it is a heuristic about where the remaining research
 opportunity lies** — not a claim about what a retry would have found.
 
-**The gap stays visible.** Reaching the gate this way is the `below_threshold` path, identical to the
-revision cap: the score, the `failed_dimensions` and the `unresearched` subtopics all reach the
-reviewer, and `gl §10` shows unresearched subtopics **first**. It is never converted into a pass, and
-it bypasses nothing — the Fact-Checker has already run, the human gate still holds the job, and the
-export gate still refuses an uncited claim.
+**The gap stays visible.** Reaching the gate *by the suppression path* is the `below_threshold` path,
+identical to the revision cap: the score, the `failed_dimensions` and the `unresearched` subtopics all
+reach the reviewer, and `gl §10` shows unresearched subtopics **first**. It is never converted into a
+pass, and it bypasses nothing — the Fact-Checker has already run, the human gate still holds the job,
+and the export gate still refuses an uncited claim.
 
-**No revision is counted for a cycle that is not started.** A job that reaches the gate this way
-arrives with its remaining cycles unspent rather than burned.
+**But that flag is not what carries the gap in the common case.** A substituted retry leaves the
+`unresearched` subtopic in place and the job can then pass the rubric outright, reaching the gate with
+`quality_flag=None`. `measure-12` did exactly that on 2026-08-14: **3 of 5 subtopics `unresearched`,
+scored 4.00, passed.** The gap still reaches the reviewer — `gl §10` lists unresearched subtopics
+first regardless of the flag — but it travels in `subtopic_status`, not in `quality_flag`. Anything
+that keys on `quality_flag` alone to find an incomplete report will miss it. That is a property of the
+uncalibrated rubric (`gl §6`) rather than of this guard, and it is recorded here because this guard is
+what leaves the subtopic `unresearched` for the rubric to overlook.
+
+**No revision is counted for a cycle that is not started.** A job that reaches the gate by the
+suppression path arrives with its remaining cycles unspent rather than burned. A substituted retry
+*is* a started cycle and is counted normally.
 
 ### What is deliberately unchanged
 
@@ -208,7 +288,7 @@ the search and fetch behaviour, and every prompt. The Researcher is untouched.
 | **Exclude permanently failed URLs** | Already true of URLs that *worked* — `seen` is exactly that. Adding an exclusion list for failures does not help in the measured case: `measure-06`'s visit fetched **one** page from the whole result list, well under `MAX_LLM_CALLS_PER_SUBTOPIC`, which means it walked the candidates to the end. There was nothing further down to reach. It would also need the retry-scope state field `ARCHITECTURE.md` §5 deliberately refused to add |
 | **Cache unreachable results** | Saves the repeated fetch attempts, not the cycle. The extraction calls, the redraft, the re-verification and the reflection pass are the expensive part; this makes an unproductive retry cheaper rather than spending the cycle somewhere better |
 | **Let `MAX_REVISIONS` absorb it** | It already does — the loop is bounded, which is why this was wasted work rather than a hang. But "bounded" is not "well spent": two cycles aimed at the least promising target are two cycles a job with a real fixable weakness could have used |
-| **Do nothing until query rewriting lands** | It is 63% of one measured job's wall clock, and the fix is an eligibility check on a list that is already being built |
+| **Do nothing until query rewriting lands** | The fix is an eligibility check on a list that is already being built, so it is close to free to make. **The 63%-of-wall-clock figure originally cited here overstated it**: that spend is redirected to a better target, not reclaimed (see Consequences). The case rests on aiming a cycle better, not on saving one |
 
 ---
 
@@ -216,9 +296,19 @@ the search and fetch behaviour, and every prompt. The Researcher is untouched.
 
 ### What gets better
 
-- A cycle is no longer spent on the subtopic with the least left to find. On `measure-06`'s shape
-  that is three cycles, 19 LLM calls, ~1,059s, and the associated search and fetch traffic, none of
-  which produced evidence.
+- A cycle is no longer **aimed** at the subtopic with the least left to find. It is aimed at an
+  eligible one instead.
+- **This record originally claimed the `measure-06` shape saves "three cycles, 19 LLM calls,
+  ~1,059s". That was wrong, and the error was the suppression assumption.** `measure-06` had **one**
+  `unresearched` subtopic of five, so four eligible subtopics remained and `_thin_subtopics` would
+  have returned one of them. Under this guard those three cycles still run — against a different
+  target, at much the same cost. **The spend is redirected, not recovered.** The n=20 run of
+  2026-08-14 shows the same thing at scale: 8 revision cycles across 4 jobs, identical to the
+  historical baseline's 8 across 4, with a total wall clock that this change cannot be credited for.
+- What is actually bought is a **better-aimed** cycle, and the case for it is a hit rate, not a
+  saving: 3 of 5 measured `done` retries produced findings against 2 of 6 for `unresearched` ones,
+  and 2 of the 4 substituted decisions on 2026-08-14 produced additional sources. Both samples are
+  small enough that this remains a heuristic.
 - Revision behaviour becomes predictable: a cycle is spent where a specialist has something to act
   on.
 - The code now agrees with `ADR 0001` point 6 and with the Supervisor's own prompt about what
@@ -241,7 +331,10 @@ the search and fetch behaviour, and every prompt. The Researcher is untouched.
   and their outcome is what produces the `unresearched` status this guard then respects.
 - **`quality_flag="below_threshold"` now has two causes**, the revision cap and an exhausted research
   target. A reader who needs to tell them apart reads `failed_dimensions` and the subtopic statuses,
-  both of which are already in the gate payload.
+  both of which are already in the gate payload. **The second cause needs every subtopic
+  `unresearched` and has not yet been observed** — across 20 jobs on 2026-08-14 the single
+  `below_threshold` was the revision cap. Treat it as a path that is tested but not yet exercised in
+  a real run.
 
 ### Unchanged
 
