@@ -9,18 +9,26 @@ exported report traces back to a URL.
 
 > **Status: Phase 1 is complete, and measured.** The graph runs locally, end to end, in memory — five
 > agents, the reflection node, the tool boundary, the LLM client, in-memory checkpointing, and a test
-> suite that makes no network calls. **20 real jobs ran against the real endpoint and the real web on
-> 2026-08-12/13; 16 reached `approved`**, and the latency, token, call, and cost baselines in
-> `docs/engineering-guidelines.md` §13–§14 are measurements rather than estimates.
-> **Phase 2 onwards is not built:** no API, no database, no worker, no Redis, no S3, no AWS, no
-> tracing, no eval set.
+> suite that makes no network calls. **Two n=20 runs against the real endpoint and the real web, both
+> reaching 16 `approved`**: the **reference baseline of 2026-08-12/13**, and the **post-hardening run
+> of 2026-08-14**, the same 20 questions re-run with ADR 0002's concurrency and ADR 0004's guard in
+> place. The second **supplements** the first rather than replacing it, and the two are never merged
+> into one number. Latency, calls, node shares, revisions and cache come from the post-hardening run;
+> its tokens were **recovered from LangSmith** (the per-job rows carry none) and are published with
+> the reconciliation behind them. Both runs are maintained in `docs/engineering-guidelines.md`
+> §13–§14, and both are measurements rather than estimates. **Phase 2 onwards is not built:** no API,
+> no database, no worker, no Redis, no S3, no AWS, no tracing, no eval set.
 >
-> **That baseline is not a production-default benchmark.** Those 20 jobs ran under the NIM
-> development overrides in `.env` — `MAX_REVISIONS=3`, `MAX_SUPERVISOR_HOPS=30`,
-> `LLM_MAIN_TIMEOUT_S=180`, `MAX_JOB_RUNTIME=1800` — not under the defaults in the environment table
-> below, which are unchanged and remain the production values. Which of those overrides could have
-> moved a measured number, and which could not: `docs/engineering-guidelines.md` §14 "Measurement
-> context".
+> **Neither baseline is a production-default benchmark.** Both runs used the NIM development overrides
+> in `.env` — `MAX_REVISIONS=3`, `MAX_SUPERVISOR_HOPS=30`, `LLM_MAIN_TIMEOUT_S=180`,
+> `MAX_JOB_RUNTIME=1800` — not the defaults in the environment table below, which are unchanged and
+> remain the production values. Which of those overrides could have moved a measured number, and which
+> could not: `docs/engineering-guidelines.md` §14 "Measurement context". The 2026-08-14 run
+> additionally ran through a **local DNS outage that cost three of its twenty jobs**, and both its
+> all-jobs p95 and its all-jobs token p50 land on failed jobs — §14 carries every caveat, and the
+> approved-only figures next to them. **Cost is derived throughout, never provider spend:** actual NIM
+> development spend is $0. The next useful measurement is a **production-default** run at the
+> documented defaults, which answers a different question and is not another re-baseline of these two.
 >
 > Every section below marks what is **built** versus **planned**. If you are reading this and the two
 > disagree, the code wins and this file must be corrected — a doc that claims working code is worse
@@ -55,7 +63,8 @@ Per-job ceiling: **60 LLM calls** (`MAX_LLM_CALLS_PER_JOB`). Exceeding it fails 
 **The per-component caps do not sum below 60 — they sum to 79** for the automatic workflow (5
 subtopics researched three times over, 24 hops, 3 report-producing passes, no reviewer edits). So
 **60 is the binding guard, not headroom above a worst case** — it is the one that catches "everything
-else". Measured max over 20 real jobs was 44.
+else". Measured max was 44 on the 2026-08-13 reference run and **53** on the 2026-08-14
+post-hardening run — a call is an attempt, so a retried transport failure spends budget too.
 
 Reviewer edits add 3 calls each and are **not bounded yet**: the planned `MAX_REVIEWER_EDITS` = 3
 gives 88, and 91 is only what today's hop margin would permit at 4 edits — an artefact, not a design

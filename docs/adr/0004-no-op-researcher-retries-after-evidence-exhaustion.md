@@ -31,11 +31,17 @@ much the same cost. What this record presented as work removed is work re-aimed.
 | "Do nothing" alternative | "63% of one measured job's wall clock" | Spend is **redirected, not reclaimed**; 63% is not recovered |
 | Cause of the benefit | Work avoided | A **better-aimed** cycle — a hit rate, not a saving |
 
-**Measured on the clean n=20 run of 2026-08-14** (`measurements/jobs.jsonl`, `run.log`,
+**Measured on the n=20 run of 2026-08-14** (`measurements/jobs.jsonl`, `run.log`,
 `console.adr0004-n20.log`), which ran with the guard in place: 8 re-research decisions naming 12
 targets, **0 `unresearched`** — the invariant holds — but **0 gates reached for want of a target** and
 **0 routes redirected to another dimension**. Substitution fired 4 times, dropping 9 targets. Revision
 cycles were 8 across 4 jobs, matching the pre-guard baseline's 8 across 4.
+
+**That run carried a local DNS outage, and part of what it contributed to those counts is
+environmental rather than a property of the guard.** `measure-12` supplied **8 of the 9 dropped
+targets**, and two of its three `unresearched` subtopics were caused by the outage rather than by
+evidence exhaustion. What is and is not usable as evidence is set out in
+["What `measure-12` is and is not evidence of"](#what-measure-12-is-and-is-not-evidence-of) below.
 
 **Unchanged:** every figure describing what `measure-06` did (1,675.0s, 46 LLM calls, 3 cycles, 45
 findings, the four empty visits to `s5`, and the 19-calls/1,059s cost of those cycles *as they
@@ -201,12 +207,22 @@ fallback always returns it, so a target always exists. The guard therefore has t
 | **Target substitution** — the common one | `unresearched` subtopics are dropped from the candidate set and the retry goes to an **eligible** subtopic instead. The revision cycle still runs, at full cost | **4 decisions, 9 targets dropped** |
 | **Route suppression** — the rare one | Every subtopic is `unresearched`, so no target exists, the Researcher route is dropped, and the sentence above applies | **0 of 20 jobs** |
 
-The clean n=20 run (`measurements/jobs.jsonl`, `run.log`, `console.adr0004-n20.log`) is the evidence:
+The n=20 run (`measurements/jobs.jsonl`, `run.log`, `console.adr0004-n20.log`) is the evidence:
 8 re-research decisions naming 12 targets, **0 of them `unresearched`** — the invariant holding — but
 also **0 gates reached for want of a target** and **0 routes redirected to the Synthesizer or the
 Fact-Checker**. Reflection routed to the Researcher on every failing-research decision it made. Of
 the 4 substituted decisions, 2 produced additional sources (measure-12, 2→4; measure-18, 5→8) and 2
 produced none.
+
+**The `measure-12` half of that last figure is not a clean result and must not be quoted as one.**
+The growth itself happened after the DNS outage had recovered, but the starting count of 2 sources is
+*depressed by* the outage: `s3` and `s4` contributed nothing because the resolver was down, not
+because the guard aimed a cycle elsewhere. So 2→4 measures a recovery from an environmental floor at
+least as much as it measures what substitution bought. **`measure-18`'s 5→8 is unaffected** — that
+job ran an hour and twenty minutes after the outage ended — and it is the one to quote. Counting the
+substituted decisions the same way: `measure-12`'s first substitution was triggered **only** by the
+two outage-caused statuses, so **3 of the 4 rest on statuses the research itself produced, and 6 of
+the 9 dropped targets trace to the outage**.
 
 So the primary effect of this guard is **which subtopic a cycle is spent on**, not whether the cycle
 is spent. The suppression path is real, is tested, and is what keeps the all-exhausted case from
@@ -217,7 +233,9 @@ unproductively is demoted to `unresearched` by the Researcher itself
 (`agents/researcher.py`, `status = "done" if findings else "unresearched"`), and is thereby excluded
 from every later retry. In `measure-12`, `s1` was targeted, came back empty, and was excluded from the
 two decisions that followed. The eligible set shrinks as a job proceeds, which is how a job could
-reach the suppression path — none did here.
+reach the suppression path — none did here. **`s1` is the one `measure-12` subtopic whose
+`unresearched` status the outage did not cause**, which is why this interaction is safe to read off
+that job while its two sibling statuses are not.
 
 Two changes in `graph/reflection.py`, and nothing else:
 
@@ -260,12 +278,43 @@ and the export gate still refuses an uncited claim.
 
 **But that flag is not what carries the gap in the common case.** A substituted retry leaves the
 `unresearched` subtopic in place and the job can then pass the rubric outright, reaching the gate with
-`quality_flag=None`. `measure-12` did exactly that on 2026-08-14: **3 of 5 subtopics `unresearched`,
-scored 4.00, passed.** The gap still reaches the reviewer — `gl §10` lists unresearched subtopics
+`quality_flag=None`. `measure-12` did exactly that on 2026-08-14: **3 of 4 subtopics `unresearched`,
+scored 4.00, passed.**
+
+<a id="what-measure-12-is-and-is-not-evidence-of"></a>
+
+#### What `measure-12` is and is not evidence of
+
+**The `3 of 4` count is correct. The three statuses behind it do not share a cause, and this record
+must not be read as offering three evidence-exhaustion cases.** `measure-12` ran from 17:12:46 to
+17:26:30 IST, through a **local DNS resolver outage** that `run.log` records from roughly 17:06 to
+17:15 — `getaddrinfo failed` against five unrelated hosts, including `api.tavily.com`,
+`api.smith.langchain.com` and `en.wikipedia.org`, so the failure was this machine's resolver and not
+any provider's.
+
+| Subtopic | Marked `unresearched` | Cause | Evidence for this ADR? |
+|---|---|---|---|
+| `s3` | 17:14:37 | Tavily unreachable — `search_unavailable` after 2 retries, `getaddrinfo failed`. **No search ran, so no page was ever a candidate** | **No** — environmental |
+| `s4` | 17:15:05 | Three candidate URLs refused as unresolvable, one `connection_error`, and the one surviving extraction failed on a transport error | **No** — environmental |
+| `s1` | 17:16:19 | Retried **after** the resolver had recovered — `en.wikipedia.org` resolved and answered `403` — reached its remaining candidates, and every one returned `403 Forbidden` | **Yes** — the clean case |
+
+`s3` and `s4` are **environmental contamination**: a resolver failure produces that status under any
+retry policy, including no guard at all, and neither says anything about whether a subtopic's
+evidence was exhausted. **`s1` is the clean evidence-exhaustion example** — a `done` subtopic
+re-researched after the network was healthy, which reached its sources and found nothing usable in
+them.
+
+**The architectural observation survives the correction, because it needs one such subtopic and `s1`
+supplies it:** a job can reach the human gate carrying an `unresearched` subtopic and still be handed
+a passing rubric outcome. The gap still reaches the reviewer — `gl §10` lists unresearched subtopics
 first regardless of the flag — but it travels in `subtopic_status`, not in `quality_flag`. Anything
 that keys on `quality_flag` alone to find an incomplete report will miss it. That is a property of the
 uncalibrated rubric (`gl §6`) rather than of this guard, and it is recorded here because this guard is
 what leaves the subtopic `unresearched` for the rubric to overlook.
+
+**Nothing about the decision or the code changes.** `_thin_subtopics`, `_route_for`, the exclusion
+itself, and the 6/2/4 and 5/3/2 retry hit rates above are all untouched by this correction — it
+narrows what `measure-12` is evidence *of*, not what the guard does.
 
 **No revision is counted for a cycle that is not started.** A job that reaches the gate by the
 suppression path arrives with its remaining cycles unspent rather than burned. A substituted retry
@@ -308,7 +357,9 @@ the search and fetch behaviour, and every prompt. The Researcher is untouched.
 - What is actually bought is a **better-aimed** cycle, and the case for it is a hit rate, not a
   saving: 3 of 5 measured `done` retries produced findings against 2 of 6 for `unresearched` ones,
   and 2 of the 4 substituted decisions on 2026-08-14 produced additional sources. Both samples are
-  small enough that this remains a heuristic.
+  small enough that this remains a heuristic — and the second is smaller than it looks, because one
+  of those two decisions is `measure-12`, whose 2→4 rises off a source count the DNS outage had
+  already depressed. `measure-18`'s 5→8 is the uncontaminated half.
 - Revision behaviour becomes predictable: a cycle is spent where a specialist has something to act
   on.
 - The code now agrees with `ADR 0001` point 6 and with the Supervisor's own prompt about what

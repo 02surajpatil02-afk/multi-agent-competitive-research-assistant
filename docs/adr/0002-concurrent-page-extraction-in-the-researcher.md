@@ -193,14 +193,38 @@ requests/minute — 13% of the development tier.
 **None of that column is a measured system property, and it must not be quoted as one.** It is
 arithmetic over the baseline's own per-request latencies, and it becomes a result only when a
 re-baseline runs. The two checks above verify the mechanism on one subtopic and one job; they say
-nothing about a p50 over twenty. **The published latency baseline is unchanged: p50 13m48s, p95
-22m01s, n=20, 2026-08-13** — and that baseline is not a production-default benchmark: it ran under
-the NIM development overrides, which
-[`gl §14 "Measurement context"`](../engineering-guidelines.md#baseline-measurement-context) sets out
-in full.
+nothing about a p50 over twenty.
 
-The 6-minute p50 target is still not met even if the projection lands: 712s is 11.9 minutes. The
-remaining gap is generation speed and the two report-producing calls, which this ADR does not touch.
+> **Outcome — the re-baseline ran on 2026-08-14** (n=20, `measurements/jobs.jsonl`, `run.log`): the
+> same 20 questions, the same two models, and the same NIM development overrides, with concurrency in
+> place.
+>
+> | | Baseline (08-13) | Projected | Measured (08-14) |
+> |---|---|---|---|
+> | Total wall clock | 18,460s | 14,865s (−19%) | **14,291s (−23%)** |
+> | p50 job latency | 829s | 712s (−14%) | **650s (−22%)** |
+> | Slowest approved job | 1,685s | — | **924s (−45%)** |
+> | Researcher share of wall clock | 45.2% | — | **33.1%** |
+>
+> **The projection was conservative on both figures it predicted.** The all-jobs p95 is deliberately
+> absent: 1,322s on 08-13 is an approved job and 1,359s on 08-14 is a job that failed after 30 of its
+> 60 calls, so the two rank-19 observations are not the same kind of event and the pair must not be
+> quoted as a trend. The approved-only row is used instead, and at n=16 nearest-rank that row *is* the
+> slowest approved job, which is why it is labelled as one rather than as a p95.
+>
+> **Two caveats travel with these numbers.** The 08-14 run **recorded no token counts** — they moved
+> to LangSmith — so it restates nothing about tokens or cost. And it ran through a **local DNS outage
+> that cost three of its twenty jobs**, which is disclosed wherever its figures are cited.
+>
+> **Neither the decision nor the projection method changes.** This records the result that the
+> paragraph above said would settle them.
+
+Neither baseline is a production-default benchmark: both ran under the NIM development overrides,
+which [`gl §14 "Measurement context"`](../engineering-guidelines.md#baseline-measurement-context)
+sets out in full.
+
+The 6-minute p50 target is still not met: the measured 650s is 10.8 minutes. The remaining gap is
+generation speed and the two report-producing calls, which this ADR does not touch.
 
 ---
 
@@ -223,8 +247,10 @@ remaining gap is generation speed and the two report-producing calls, which this
 
 - **Verified:** a subtopic's extraction stops costing the sum of its calls and starts costing the
   longest of them — 2.42× within-run on the A/B/A, 46.8s per subtopic pass against the baseline's
-  93.8s on one full job. **Projected but not yet verified:** −19% total wall clock, −14% p50, −18%
-  p95 across the sample. The second line needs the re-baseline before it is quotable.
+  93.8s on one full job. **Projected, and since measured:** the projection was −19% total wall clock
+  and −14% p50; the 2026-08-14 re-baseline returned **−23% and −22%**, beating both. The projected
+  −18% p95 is the one figure that cannot be checked this way — the Outcome block above records why
+  the all-jobs p95 is not comparable across the two runs.
 - Fewer subtopics cut short by `SUBTOPIC_TIMEOUT_S`. Four hit it in the baseline; three sequential
   calls at p50 26.7s already spend 80s of the 120s, and the deadline now stops a subtopic choosing
   more sources rather than stopping it mid-extraction.
@@ -262,8 +288,10 @@ a search result. The graph topology, `MAX_LLM_CALLS_PER_JOB`, `MAX_LLM_CALLS_PER
 
 ### Revisit when
 
-- The re-baseline lands. If the projection is not met, the model of where the time goes is wrong and
-  this record should say so.
+- ~~The re-baseline lands.~~ **It landed on 2026-08-14 and beat the projection on both figures it
+  could check** (Outcome, above), so the model of where the time goes holds. The version of this that
+  is still open is a **production-endpoint** run, which would test the same model against hardware
+  that is not the NIM development tier.
 - The shared Redis limiter arrives (Phase 3). At that point in-job concurrency stops being bounded
   only by this setting, and `LLM_RPM_LIMIT` becomes the real bound.
 - More than one worker runs. `RESEARCHER_CONCURRENCY` × workers is the number that matters then, and

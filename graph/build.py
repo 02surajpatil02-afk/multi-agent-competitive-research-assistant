@@ -20,17 +20,17 @@ WHY THIS FILE EXISTS
     a fixed edge - three to the Supervisor, the Fact-Checker to reflection - so a node that
     has just failed the job hands it to a component whose whole purpose is to send it
     somewhere. The Supervisor would route a plan-less job straight back to the Planner and
-    spend twelve hops rediscovering the same failure; reflection would score a draft whose
-    claims were never checked. Both routers therefore read `status` before they do anything
+    spend the whole hop budget rediscovering the same failure; reflection would score a
+    draft whose claims were never checked. Both routers read `status` before they do anything
     else. That check is what makes "empty plan after one retry -> finalize, status=failed"
     true of the graph and not only of the Planner (ARCHITECTURE.md §15).
 
     **The three documented guards are the only ones that stop a job.** LangGraph has a
     recursion limit of its own, and it raises `GraphRecursionError` - a framework exception
     with no `status`, no `failure_reason`, and nothing a caller can branch on. It is left at
-    its default, because it does not need changing: `MAX_SUPERVISOR_HOPS` = 12 bounds the
-    longest job to 26 super-steps, and the limit sits three orders of magnitude above that.
-    A test measures that gap rather than leaving it assumed (guidelines §5).
+    its default, because it does not need changing: `MAX_SUPERVISOR_HOPS` = 24 bounds the
+    longest job to 50 super-steps, and LangGraph's default limit of 1,000 sits well above
+    that. A test measures that gap rather than leaving it assumed (guidelines §5).
 
     Phase 1 scope, stated so the gaps are not mistaken for oversights. The checkpointer is
     in-memory, because there is no gate to resume to yet (guidelines §4). `export` runs the

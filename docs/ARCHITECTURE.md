@@ -456,7 +456,7 @@ taken from gl §2 and gl §9.
 | **Output** | `SupervisorDecision`, whose `next` is always `allowed_target(state)` |
 | **Tools** | None |
 | **Model** | `LLM_FAST_MODEL` |
-| **Budget** | 1 call per hop, `MAX_SUPERVISOR_HOPS` = 12 |
+| **Budget** | 1 call per hop, `MAX_SUPERVISOR_HOPS` = 24 |
 | **Timeout** | Fast tier — a fixed 30s, 2 retries at 1s and 4s (gl §17) |
 | **On failure** | A disagreeing proposal, `invalid_output`, or `llm_call_failed` → logged, routing continues on state. `rate_limited` / `budget_exceeded` → `finalize`, `status=failed`, reason recorded |
 
@@ -474,7 +474,7 @@ and name the next node.
 or report body text. It never scores quality — that is the reflection node. It never calls a tool.
 It never routes to `reflection`; that literal is deliberately absent from its output type (gl §5).
 
-**Budget note:** 12 fast-model calls in the worst case, which is 12 of the 60-call job ceiling. That
+**Budget note:** 24 fast-model calls in the worst case, which is 24 of the 60-call job ceiling. That
 is why `hop_count` exists as its own guard rather than relying on the total budget.
 
 ### 4.2 Planner — the research plan
@@ -869,7 +869,7 @@ disagreeing — while the route returned was always `allowed_target(state)` rega
 `Literal` of the five node names, so a wrong target is schema-valid and the validation retry never
 fires: **wrong-but-valid output is not caught by Pydantic and cannot be fixed by strengthening it.**
 
-**`MAX_SUPERVISOR_HOPS` = 12.** It catches routing oscillation — A → B → A → B — which the call
+**`MAX_SUPERVISOR_HOPS` = 24.** It catches routing oscillation — A → B → A → B — which the call
 budget alone would catch too slowly and the revision cap would not catch at all.
 
 > **Raised from 12 to 24 on 2026-08-13.** Only a `supervisor` visit costs a hop — `fact_checker →
@@ -1963,29 +1963,45 @@ ECS task metrics, SQS queue metrics, and the application's structured JSON logs.
 Timeouts are not targets. §17's 20-minute limit is when a job is killed, which says nothing about
 what normal looks like (gl §14):
 
-| Signal | Target | Alarm | Measured (n=20, 2026-08-13) |
-|---|---|---|---|
-| Job latency, p50 | ≤ 6 min | — | **13m48s** — 2.3× over |
-| Job latency, p95 | ≤ 15 min | > 18 min | **22m01s** — over, and past the alarm |
-| Cost per job | ≤ $0.50 | > $2 on any single job | **$0.14** *(derived)* |
-| Daily spend | — | > $20 in a day | not measured; NIM spend is $0 |
-| Search + fetch cache hit rate | ≥ 30% once revisions run | < 10% for a day | **25%** (157 of 621) |
-| Revision rate | ≤ 40% of jobs need one | > 70% | **20%** (4 of 20) |
+**Two measured runs. `2026-08-13` is the reference baseline — it ran before ADR 0002 and it is the
+only run carrying per-job token and cost figures. `2026-08-14` is the post-hardening measurement, on
+the same 20 questions and the same overrides, with ADR 0002 and ADR 0004 in place.** It supplements
+the reference rather than replacing it. gl §14 maintains both.
+
+| Signal | Target | Alarm | 2026-08-13 — reference | 2026-08-14 — post-hardening |
+|---|---|---|---|---|
+| Jobs reaching `approved` | — | — | 16 of 20 | 16 of 20 |
+| Job latency, p50 | ≤ 6 min | — | **13m48s** — 2.3× over | **10m50s** — 1.8× over |
+| Job latency, p95, all jobs | ≤ 15 min | > 18 min | **22m01s** — over, past the alarm | **22m39s** — ⚠ failure-contaminated |
+| Job latency, p95, approved only | — | — | 28m05s | **15m24s** |
+| LLM calls per job | ≤ 60 | budget exceeded fails the job | p50 26, max 44 | **p50 28, max 53** |
+| Tokens per job, p50 | alarm at 600k | — | **114,967** | **104,934** all jobs / 115,729 approved |
+| Cost per job, p50 | ≤ $0.50 | > $2 on any single job | **$0.14** *(derived)* | **$0.14** all jobs / **$0.15** approved *(derived)* |
+| Daily spend | — | > $20 in a day | not measured; NIM spend is $0 | not measured; NIM spend is $0 |
+| Search + fetch cache hit rate | ≥ 30% once revisions run | < 10% for a day | **25%** (157 of 621) | **26.9%** (173 of 643) |
+| Revision rate | ≤ 40% of jobs need one | > 70% | **20%** (4 of 20) | **20%** (4 of 20) |
+
+**⚠ The all-jobs p95 is not comparable across the two runs.** At n=20 nearest-rank it is the 19th of
+20 observations: on 2026-08-13 that is an approved job, on 2026-08-14 it is a job that failed after 30
+of 60 calls. The approved-only row is the like-for-like comparison — 1685s → 924s — and gl §14 carries
+the full explanation.
 
 **Measured by step 12** — 20 real jobs against the real endpoint and the real web, sequential, on
-2026-08-12/13; 16 reached `approved`. **Targets are not overwritten**: a target is the aim, the
-measurement is the baseline a regression shows up against, and both stay visible.
+2026-08-12/13; 16 reached `approved`. The 2026-08-14 re-run is the same shape and also reached 16.
+**Targets are not overwritten**: a target is the aim, the measurements are the baselines a regression
+shows up against, and all of them stay visible.
 
-**Not a production-default benchmark.** The run used the NIM development overrides in `.env` —
-`MAX_REVISIONS=3`, `MAX_SUPERVISOR_HOPS=30`, `LLM_MAIN_TIMEOUT_S=180`, `MAX_JOB_RUNTIME=1800` — while
-the documented defaults are 2, 24, 60, and 1200 and are unchanged. Two of those four could have moved
-a number and two could not; the table that says which is gl §14 "Measurement context", and it is
-the one place that claim is maintained.
+**Neither is a production-default benchmark.** Both runs used the NIM development overrides in `.env`
+— `MAX_REVISIONS=3`, `MAX_SUPERVISOR_HOPS=30`, `LLM_MAIN_TIMEOUT_S=180`, `MAX_JOB_RUNTIME=1800` —
+while the documented defaults are 2, 24, 60, and 1200 and are unchanged. Two of those four could have
+moved a number and two could not; the table that says which is gl §14 "Measurement context", and it is
+the one place that claim is maintained. **The 2026-08-14 run additionally ran through a local DNS
+outage that cost three of its twenty jobs**, which gl §14 records alongside its figures.
 
-Every figure above is **NIM development on 2026-08-13**, not a property of the system. That endpoint
-generates at ~15–20 output tokens/second (gl §17) and latency follows from it. The latency targets
-were written for a production API, are **not met on this hardware**, and are left unchanged rather
-than relaxed to fit a development tier — Phase 5 re-baselines them against real hardware.
+Every figure above is **NIM development**, not a property of the system. That endpoint generates at
+~15–20 output tokens/second (gl §17) and latency follows from it. The latency targets were written for
+a production API, are **not met on this hardware**, and are left unchanged rather than relaxed to fit
+a development tier — Phase 5 re-baselines them against real hardware.
 
 Caveats that travel with the numbers: **cache hit rate is process-local reuse within one job**, not a
 Redis or cross-worker benchmark, and its ≥30% target assumes revisions are running, which only 20% of
@@ -1997,7 +2013,12 @@ derived** from measured tokens × assumed production prices, not provider spend 
 the Researcher's share is ~90% LLM extraction and ~9% search, fetch, and robots.txt, not the roughly
 even split this document's earlier reading of it assumed. It is the evidence
 [ADR 0002](adr/0002-concurrent-page-extraction-in-the-researcher.md) rests on. **All of it describes
-the pre-ADR-0002 sequential Researcher**, and the re-baseline that would replace it has not run.
+the pre-ADR-0002 sequential Researcher.** The post-hardening run — n=20, 2026-08-14 — puts the
+Researcher at **33.1%** against 45.2% and the p50 at **650s** against 829s. That movement is
+consistent with the expected effect of ADR 0002, but the run carried **four** hardening changes at
+once (ADR 0002, ADR 0003's Finding-IDs, ADR 0004's guard, and the `wrap_openai` fix), so it is not an
+isolation of any one of them — ADR 0002's controlled A/B/A is the causal evidence, and gl §14 keeps
+the two kinds of evidence apart. gl §14 holds all the figures and the caveats.
 
 ### The rule that stops duplicate telemetry
 
@@ -2035,7 +2056,7 @@ still live in exactly one place.
 | **Reflection scoring call fails, report exists** | Timeout, or invalid `ReflectionScore` after its retry | Fast-model policy: 2 retries at 1s, 4s | **The report is kept.** `quality_flag="unscored"`, `revision_count` unchanged, `audit_events` records `reflection_failed`, route to the human gate. **`unscored` is not a pass** — the export gate and the reviewer both still apply |
 | **Reflection scoring call fails, no report yet** | Same | Same | Nothing to gate: fail the node per gl §17 → `finalize`, `status=failed` |
 | **Revision limit reached** | `revision_count >= MAX_REVISIONS` with a failing score | none — the loop is over | Job continues with `quality_flag="below_threshold"`, breakdown attached, **the reviewer decides**. Citation coverage still blocks export regardless |
-| **Supervisor guard trips** | `hop_count >= 12` or `llm_calls_used >= 60` | none | `finalize`, `status=failed`, `failure_reason` set |
+| **Supervisor guard trips** | `hop_count >= 24` or `llm_calls_used >= 60` | none | `finalize`, `status=failed`, `failure_reason` set |
 | **Whole job exceeds 20 min** | Worker job timer | none | `finalize`, `status=failed`, reason `job_timeout` |
 | **SQS retry / duplicate delivery** | Message redelivered after 25-min visibility timeout | 3 deliveries | Then DLQ + CloudWatch alarm. A duplicate resumes from the checkpoint; it never restarts the job |
 | **Worker crash** | Visibility timeout expires without a delete | Redelivery, resume from the last per-node checkpoint | At most the in-flight node is re-executed. After 3 deliveries → DLQ |
@@ -2067,7 +2088,7 @@ publish. One job's calls (gl §13):
 | Synthesizer | 1 per pass × up to 3 passes | main |
 | Fact-Checker | 1 batched per pass × up to 3 passes | main |
 | Reflection *(control-flow node)* | 1 per pass × up to 3 passes | fast |
-| **Total** | **p50 26 measured (n=20, 2026-08-13); caps sum to 79** | |
+| **Total** | **p50 26 (2026-08-13), p50 28 max 53 (2026-08-14); caps sum to 79** | |
 
 `MAX_LLM_CALLS_PER_JOB` = 60 — **below** the sum of the caps, so it is the binding guard rather than
 headroom, and below the point where a runaway job goes unnoticed. **A single job can consume a full minute of the entire rate budget, so two concurrent jobs
@@ -2092,6 +2113,11 @@ saturate the development tier.** That is a development constraint to plan around
 one request in flight at a time.** The "a single job can consume a full minute of the entire rate
 budget" line above describes the worst case the call caps permit, not the jobs this system runs.
 
+**That figure describes the sequential Researcher and has not been re-derived.** Since ADR 0002 a job
+can hold up to `RESEARCHER_CONCURRENCY` (3) extraction requests open at once, so the 2026-08-14 run's
+rate profile is higher than 1.76/min — by how much is not published here, because the 2026-08-13
+figure's numerator was per-request timing that the current run does not record in a row.
+
 ADR 0002 spends part of that headroom: a subtopic's extraction calls overlap, so a job holds up to
 `RESEARCHER_CONCURRENCY` requests open and runs at roughly 5.3 requests/minute — about 13% of the
 development tier. Three consequences, all of them Phase 3 work to close properly:
@@ -2115,12 +2141,12 @@ carrying a 2,000-character snippet, and the call count is identical either way.
 Counting only calls means `MAX_LLM_CALLS_PER_JOB` can be satisfied by a job that cost ten times what
 it should have. So both units are tracked and both have a ceiling (gl §13):
 
-| Unit | Ceiling | Enforced by | Measured (n=20, 2026-08-13) |
-|---|---|---|---|
-| LLM calls per job | 60 | `MAX_LLM_CALLS_PER_JOB`, checked in state | **p50 26, max 44** |
-| Input characters per page | 24,000 | `MAX_PAGE_CHARS`, applied at fetch | — |
-| Tokens per job | **p50 115k, max 253k**; alarm at 600k | Recorded per job from LangSmith | **p50 114,967, max 252,503** |
-| Cost per job | target ≤ $0.50, alarm at $2 | Recorded per job | **$0.14 derived** |
+| Unit | Ceiling | Enforced by | 2026-08-13 — reference | 2026-08-14 — post-hardening |
+|---|---|---|---|---|
+| LLM calls per job | 60 | `MAX_LLM_CALLS_PER_JOB`, checked in state | **p50 26, max 44** | **p50 28, max 53** |
+| Input characters per page | 24,000 | `MAX_PAGE_CHARS`, applied at fetch | — | — |
+| Tokens per job | **p50 115k, max 253k**; alarm at 600k | Recorded per job from LangSmith | **p50 114,967, max 252,503** | **p50 104,934, max 213,330** — recovered from LangSmith |
+| Cost per job | target ≤ $0.50, alarm at $2 | Recorded per job | **$0.14 derived** | **$0.14 derived** |
 
 **Measured by step 12.** The old "~250k typical" was about 2× too high; the measured p50 is 115k, and
 the max of 253k means a heavy job does reach the old estimate, so the 600k alarm stays. Cost is
@@ -2179,9 +2205,11 @@ everything the hop and revision caps do not — and it means a job running every
 ends with `budget_exceeded`, loudly, which is the designed outcome. **Bounding reviewer edits does
 not require revisiting 60.**
 
-**Measured (n=20, 2026-08-13): p50 26 requests, max 44.** The old estimate of ~24 typical was close.
-The measured max of 44 happens to equal the old worst-case figure; that is a coincidence and confirms
-nothing. If a job that is genuinely doing useful work ever ends on `budget_exceeded`, the choice is to
+**Measured: p50 26 requests, max 44 (n=20, 2026-08-13); p50 28, max 53 (n=20, 2026-08-14).** The old
+estimate of ~24 typical was close. The 2026-08-13 max of 44 happens to equal the old worst-case
+figure; that is a coincidence and confirms nothing — the 2026-08-14 run then reached 53 with no
+component cap changed, because a call is an **attempt** and a retried transport failure spends budget
+without returning anything (gl §13). If a job that is genuinely doing useful work ever ends on `budget_exceeded`, the choice is to
 raise 60 or lower a component cap — a decision to take when it is observed, not before.
 
 ---
@@ -2612,7 +2640,31 @@ Case name: `thin_report_high_evidence_utilization_gap`.
 A live smoke job on **2026-08-15** — `thread_id=smoke-e2e-03`, question *"What products has Anthropic
 released in the last 12 months?"* (the `event_tracking` shape, `MEASUREMENT_QUESTIONS[8]`) — reached
 `approved` through the whole of §3's normal execution path: 23 of 60 calls, 7 of 30 hops, 0
-revisions, 11m38s, no crash, and the trace is in the LangSmith project under that thread id.
+revisions, 11m38s, no crash.
+
+> **Provenance: this evidence is LangSmith-only. There is no local artifact behind it.** The smoke
+> runs were driven interactively rather than through `scripts/measure_jobs.py`, so they wrote no row
+> to `measurements/jobs.jsonl` and no `measurements/run.log` entry — unlike every `measure-NN` figure
+> in this document, which has both. The traces were **confirmed present in the LangSmith project on
+> 2026-08-15**, as root `LangGraph` runs under these thread ids:
+>
+> | `thread_id` | Root runs | Trace start (UTC) |
+> |---|---:|---|
+> | `smoke-e2e-01` | 1 | 2026-08-14 17:45:36 |
+> | `smoke-e2e-02` | 1 | 2026-08-14 18:26:07 |
+> | `smoke-e2e-03` | 2 | 2026-08-14 20:06:11 and 20:17:50 |
+>
+> **Dates differ by timezone, not by fact:** this section dates the run 2026-08-15 in IST, which is
+> 2026-08-14 in the UTC the traces are stamped with. `smoke-e2e-03` has **two** root runs because a
+> job that reaches the gate is invoked once, interrupts, and is resumed after approval — the same
+> pattern every completed `measure-NN` job shows. The single-root runs for 01 and 02 are consistent
+> with their ending before the gate, which is what item 6 below records.
+>
+> **What this means for the claims above.** The per-stage table is read off that trace and cannot be
+> re-derived from anything in this repository. If the LangSmith retention window lapses, this case
+> becomes unverifiable — so treat it as a **recorded observation pending the Phase 4 hand-scoring
+> pass**, not as a reproducible measurement. Nothing in this section should be restated as if it had
+> a local artifact behind it.
 
 | Stage | Result |
 |---|---|
@@ -2682,6 +2734,13 @@ Phase 3 worker owns it (smoke run 2 ran 1557s against the configured 1800s).
 fact-check-shaped call — 20 claims, ~12,000 prompt tokens — completed in 66.2s once the endpoint
 recovered, and smoke run 3 then finished a whole job. A schedule tuned to a degraded development tier
 would be tuning to the wrong thing, which is also why `LLM_MAIN_TIMEOUT_S` was **not** raised.
+
+**Two of the four episodes have different provenance from the other two, and it matters here.**
+`measure-04` and `measure-17` are rows in `measurements/jobs.jsonl` with `run.log` lines behind them,
+so they are reproducible from this repository. Smoke runs 1 and 2 are **LangSmith-only** — see the
+provenance note in item 5 — so the "~550s in the node" shape is read off two local rows and two
+traces, not four of either. The conclusion is unaffected, but a reader reconstructing this from
+`measurements/` will find two episodes, not four.
 
 *Not blocking:* nothing is incorrect today. Revisit when there is production-endpoint evidence, or if
 the episodes recur against a paid endpoint.
