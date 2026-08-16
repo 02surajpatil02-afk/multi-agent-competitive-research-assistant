@@ -44,8 +44,11 @@ from typing import Any, cast, get_args, get_type_hints
 
 import pytest
 from fakes import FakeOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 from openai import OpenAI
+from psycopg.rows import dict_row
 from pydantic import BaseModel, HttpUrl
 
 import graph.build
@@ -67,9 +70,13 @@ from graph.build import (
     finalize_node,
     human_gate_node,
     planner_node,
+    postgres_checkpointer,
     reflection_node,
+    refuse_edit,
     researcher_node,
+    reviewer_payload,
     run_config,
+    state_serde,
     supervisor_node,
     synthesizer_node,
 )
@@ -137,6 +144,17 @@ def _llm(*script: object) -> tuple[LLMClient, FakeOpenAI]:
 def _deps(*script: object) -> tuple[NodeDeps, FakeOpenAI]:
     llm, fake = _llm(*script)
     return NodeDeps(config=_config(), llm=llm), fake
+
+
+def _plain_deps() -> NodeDeps:
+    """Deps for `export` and `finalize`, the two nodes that call no model.
+
+    `db` is left None, which is the Phase 1 behaviour these tests are about: the export gate
+    is arithmetic over the report in state and answers the same way whether or not there is
+    a database underneath. What the two nodes write when there is one is
+    tests/test_graph_persistence.py.
+    """
+    return _deps()[0]
 
 
 def _decision(target: str, reason: str = "the rule says so") -> str:
@@ -220,6 +238,38 @@ def _checked(**overrides: object) -> ResearchState:
         "verdicts": [Verdict(claim_id="c1", supported=True, quote="q", note="stated")],
     }
     return _planned(**{**defaults, **overrides})
+
+
+class _FakePool:
+    """Enough of `psycopg_pool.ConnectionPool` to see how it was built, and no database.
+
+    It records what it was constructed with and whether it was closed, which is all the
+    checkpointer factory's contract is: a pool built from this URL, with these connection
+    settings, released when the caller is done with it.
+    """
+
+    def __init__(self, conninfo: str, **kwargs: Any) -> None:
+        self.conninfo = conninfo
+        self.kwargs = kwargs
+        self.closed = False
+
+    def __enter__(self) -> _FakePool:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.closed = True
+
+
+class _FakeSaver:
+    """`PostgresSaver` minus PostgreSQL: what it was handed, and whether `setup()` ran."""
+
+    def __init__(self, pool: _FakePool, *, serde: JsonPlusSerializer) -> None:
+        self.pool = pool
+        self.serde = serde
+        self.setups = 0
+
+    def setup(self) -> None:
+        self.setups += 1
 
 
 class _Agents:
@@ -338,8 +388,10 @@ def test_the_supervisor_cannot_route_to_reflection() -> None:
     assert ("fact_checker", "reflection") in _FIXED_EDGES
 
 
-def test_the_graph_compiles_with_the_in_memory_checkpointer() -> None:
-    # Phase 1 only, and the one line Phase 2 replaces with the Postgres checkpointer.
+def test_the_graph_compiles_with_the_in_memory_checkpointer_when_given_none() -> None:
+    # The default, and what the offline suite and the measurement harness run on. A process
+    # that has to survive a restart passes `postgres_checkpointer()` instead - the graph
+    # never reaches for a database on its own (implementation step 14).
     llm, _ = _llm()
 
     compiled = build_graph(config=_config(), llm=llm)
@@ -567,25 +619,67 @@ def test_a_job_that_already_failed_leaves_reflection_without_a_call() -> None:
 # --- The gate, export, and finalize ------------------------------------------------
 
 
-def test_the_gate_pauses_on_the_job_it_is_holding(monkeypatch: pytest.MonkeyPatch) -> None:
-    payloads: list[object] = []
+def test_the_gate_shows_the_reviewer_the_problems_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ARCHITECTURE.md §12's order is the contract, not a preference: a reviewer who has to
+    # hunt for the problems will approve past them. Insertion order is the rendered order.
+    payloads: list[Any] = []
 
-    def pause(payload: object) -> dict[str, str]:
+    def pause(payload: Any) -> dict[str, str]:
         payloads.append(payload)
         return {"decision": "approve"}
 
     monkeypatch.setattr(graph.build, "interrupt", pause)
 
-    human_gate_node(_checked())
+    human_gate_node(_checked(), deps=_plain_deps())
 
-    assert payloads == [{"job_id": "job-1"}]
+    assert list(payloads[0]) == [
+        "job_id",
+        "unsupported_claims",
+        "unresearched_subtopics",
+        "quality_flag",
+        "score",
+        "failed_dimensions",
+        "revision_count",
+        "llm_calls_used",
+        "report",
+        "claims",
+    ]
+
+
+def test_the_gate_payload_carries_the_problems_and_the_evidence() -> None:
+    # What the reviewer is judging: which claims failed verification, which subtopics found
+    # nothing, and what each surviving claim is standing on.
+    state = _checked(
+        subtopic_status={"s1": "done", "s2": "unresearched", "s3": "done"},
+        verdicts=[Verdict(claim_id="c1", supported=False, quote=None, note="not in the source")],
+    )
+
+    payload = reviewer_payload(state)
+
+    assert payload["unsupported_claims"] == ["c1"]
+    assert payload["unresearched_subtopics"] == ["s2"]
+    assert payload["claims"] == [
+        {
+            "claim_id": "c1",
+            "text": "TCS grew.",
+            "sources": [_URL],
+            "supported": False,
+            "quote": None,
+            "note": "not in the source",
+        }
+    ]
+    # The live call count, which is what an edit's budget check reads (ADR 0006 decision 7).
+    assert payload["llm_calls_used"] == state["llm_calls_used"]
 
 
 def test_the_gate_routes_approve_into_export(monkeypatch: pytest.MonkeyPatch) -> None:
     command = _gate_decision(monkeypatch, {"decision": "approve"})
 
     assert command.goto == "export"
-    assert command.update is None
+    # The gate is the only writer of the field, and an approval ends any edit in flight.
+    assert command.update == {"reviewer_edit_text": None}
 
 
 def test_the_gate_routes_reject_to_finalize_without_exporting(
@@ -594,7 +688,7 @@ def test_the_gate_routes_reject_to_finalize_without_exporting(
     command = _gate_decision(monkeypatch, {"decision": "reject", "note": "sources are weak"})
 
     assert command.goto == "finalize"
-    assert command.update == {"status": "rejected"}
+    assert command.update == {"status": "rejected", "reviewer_edit_text": None}
 
 
 def test_the_gate_routes_edit_to_the_synthesizer_and_carries_the_text(
@@ -640,26 +734,26 @@ def test_the_export_gate_blocks_a_claim_that_reaches_no_source() -> None:
     report = _report("c1")
     report.claims.append(Claim(claim_id="c2", section_id="sec1", text="X.", finding_ids=["f9"]))
 
-    update = export_node(_planned(report=report))
+    update = export_node(_planned(report=report), deps=_plain_deps())
 
     assert update == {"status": "failed", "failure_reason": "uncited_claims"}
 
 
 def test_the_export_gate_passes_when_every_claim_is_cited() -> None:
-    update = export_node(_planned(report=_report("c1", "c2")))
+    update = export_node(_planned(report=_report("c1", "c2")), deps=_plain_deps())
 
     assert update == {"status": "approved"}
 
 
 def test_export_without_a_report_fails_rather_than_exporting_nothing() -> None:
-    update = export_node(_planned())
+    update = export_node(_planned(), deps=_plain_deps())
 
     assert update == {"status": "failed", "failure_reason": "no_report_to_export"}
 
 
 @pytest.mark.parametrize("status", sorted(TERMINAL_STATUSES))
 def test_finalize_records_a_terminal_status_without_changing_it(status: str) -> None:
-    update = finalize_node(_state(status=status, failure_reason="whatever"))
+    update = finalize_node(_state(status=status, failure_reason="whatever"), deps=_plain_deps())
 
     assert update == {}
 
@@ -667,13 +761,13 @@ def test_finalize_records_a_terminal_status_without_changing_it(status: str) -> 
 def test_finalize_fails_loudly_when_it_is_reached_with_no_outcome() -> None:
     # Every documented path here carries a terminal status. Arriving without one is a wiring
     # bug, and a job that ends loudly is cheaper to diagnose than one that ends plausibly.
-    update = finalize_node(_state())
+    update = finalize_node(_state(), deps=_plain_deps())
 
     assert update == {"status": "failed", "failure_reason": "no_terminal_status"}
 
 
 def test_finalize_never_leaves_a_failure_without_a_reason() -> None:
-    update = finalize_node(_state(status="failed"))
+    update = finalize_node(_state(status="failed"), deps=_plain_deps())
 
     assert update == {"failure_reason": "unrecorded_failure"}
 
@@ -686,7 +780,7 @@ def _gate_decision(monkeypatch: pytest.MonkeyPatch, raw: object) -> Command[Any]
     with a checkpointer under it.
     """
     monkeypatch.setattr(graph.build, "interrupt", lambda _payload: raw)
-    return human_gate_node(_checked())
+    return human_gate_node(_checked(), deps=_plain_deps())
 
 
 # --- The whole job, end to end -----------------------------------------------------
@@ -719,7 +813,10 @@ def test_the_normal_path_runs_to_the_gate_and_out_through_export(
         "fact_checker",
     ]
     assert compiled.get_state(settings).next == ("human_gate",)
-    assert paused["__interrupt__"][0].value == {"job_id": "job-1"}
+    # The reviewer's payload, problems first (ARCHITECTURE.md §12). Its shape is asserted
+    # where the gate is tested; here the point is that the pause carries it at all.
+    assert paused["__interrupt__"][0].value["job_id"] == "job-1"
+    assert paused["__interrupt__"][0].value["unsupported_claims"] == []
     assert paused["quality_flag"] is None  # the rubric ran and the report passed
 
     final = compiled.invoke(Command(resume={"decision": "approve"}), settings)
@@ -880,6 +977,80 @@ def test_resuming_does_not_re_execute_completed_nodes(monkeypatch: pytest.Monkey
     assert final["status"] == "approved"
 
 
+def test_the_graph_uses_the_checkpointer_it_is_given() -> None:
+    # The seam step 14 needs: the worker hands in the Postgres saver, and nothing about the
+    # topology changes because of it.
+    llm, _ = _llm()
+    saver = InMemorySaver(serde=state_serde())
+
+    compiled = build_graph(config=_config(), llm=llm, checkpointer=saver)
+
+    assert compiled.checkpointer is saver
+
+
+def test_a_graph_that_did_not_start_a_job_resumes_it_from_the_checkpointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # What durable checkpointing is *for*: the process that approves a job is not the process
+    # that ran it. A second graph object, sharing only the checkpointer, picks the job up at
+    # the gate - and its LLM has no script at all, so any re-executed node fails the test
+    # rather than quietly re-billing (guidelines §10).
+    agents = _Agents()
+    agents.install(monkeypatch)
+    saver = InMemorySaver(serde=state_serde())
+    llm, _ = _llm(
+        _decision("planner"),
+        *[_decision("researcher")] * 3,
+        _decision("synthesizer"),
+        _decision("fact_checker"),
+        _rubric(),
+    )
+    settings = run_config("job-1")
+    build_graph(config=_config(), llm=llm, checkpointer=saver).invoke(_state(), settings)
+    before = list(agents.calls)
+
+    resumed, _ = _llm()
+    final = build_graph(config=_config(), llm=resumed, checkpointer=saver).invoke(
+        Command(resume={"decision": "approve"}), settings
+    )
+
+    assert agents.calls == before  # no agent ran again
+    assert final["status"] == "approved"
+
+
+def test_the_postgres_checkpointer_creates_its_tables_and_carries_the_state_serde(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory's wiring, with the pool and the saver stubbed.
+
+    **What it proves:** the connection string reaches the pool, the connections are the
+    dict-row autocommit ones the checkpointer requires, `setup()` runs before anything uses
+    it - that is how it owns its own tables (guidelines §19) - the serde is the one that can
+    rebuild a `Finding`, and the pool is closed on the way out.
+
+    **What it does not prove:** anything about PostgreSQL. No database is involved here, and
+    none can be until Compose provides one in Phase 3.
+    """
+    monkeypatch.setattr(graph.build, "ConnectionPool", _FakePool)
+    monkeypatch.setattr(graph.build, "PostgresSaver", _FakeSaver)
+
+    with postgres_checkpointer("postgresql://user@host/jobs") as checkpointer:
+        saver = cast(_FakeSaver, checkpointer)
+        pool = saver.pool
+
+        assert pool.conninfo == "postgresql://user@host/jobs"
+        assert pool.kwargs["kwargs"] == {"autocommit": True, "row_factory": dict_row}
+        assert saver.setups == 1
+        # A Finding that came back as a dict fails on the next `.url`, and it fails days
+        # later, in the resumed job - so the durable saver gets the same serde as the memory
+        # one, and this is what says so.
+        packed = saver.serde.dumps_typed(_finding())
+        assert saver.serde.loads_typed(packed) == _finding()
+        assert not pool.closed
+
+    assert pool.closed
+
+
 def test_every_model_in_the_state_is_registered_with_the_checkpointer() -> None:
     # LangGraph will not rebuild a class it was not told about - it hands back the field
     # dict, and the failure surfaces later as an AttributeError on a resumed job. Deriving
@@ -948,3 +1119,44 @@ def test_a_finished_job_carries_no_state_field_the_contract_does_not_name(
     compiled.invoke(Command(resume={"decision": "approve"}), settings)
 
     assert set(compiled.get_state(settings).values) == set(ResearchState.__annotations__)
+
+
+# --- Whether an edit may start at all (ADR 0006) -----------------------------------
+
+
+def test_an_edit_is_allowed_while_both_bounds_have_room() -> None:
+    assert refuse_edit(config=_config(), llm_calls_used=10, edits_made=2) is None
+
+
+def test_the_fourth_reviewer_edit_is_refused() -> None:
+    # MAX_REVIEWER_EDITS = 3. The bound exists because an edit is human-triggered, so
+    # MAX_REVISIONS does not bound it and nothing else did.
+    assert (
+        refuse_edit(config=_config(), llm_calls_used=0, edits_made=3)
+        == "reviewer_edit_limit_reached"
+    )
+
+
+@pytest.mark.parametrize(("used", "refused"), [(58, True), (57, False)])
+def test_an_edit_is_refused_when_the_budget_cannot_fund_its_three_calls(
+    used: int, refused: bool
+) -> None:
+    # An edit needs a Synthesizer, a Fact-Checker and a reflection pass. With exactly three
+    # of the 60 left it may start; with two it may not, because it would start, spend, and
+    # die on the Supervisor's guard - losing a report the reviewer could have approved,
+    # since export never runs on a failed job.
+    answer = refuse_edit(config=_config(), llm_calls_used=used, edits_made=0)
+
+    assert (answer == "insufficient_call_budget_for_edit") is refused
+
+
+def test_the_edit_bounds_are_read_from_config_not_hard_coded() -> None:
+    lowered = _config(MAX_REVIEWER_EDITS="1", MAX_LLM_CALLS_PER_JOB="10")
+
+    assert (
+        refuse_edit(config=lowered, llm_calls_used=0, edits_made=1) == "reviewer_edit_limit_reached"
+    )
+    assert (
+        refuse_edit(config=lowered, llm_calls_used=8, edits_made=0)
+        == "insufficient_call_budget_for_edit"
+    )

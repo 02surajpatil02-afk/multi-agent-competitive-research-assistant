@@ -32,11 +32,26 @@ WHY THIS FILE EXISTS
     longest job to 50 super-steps, and LangGraph's default limit of 1,000 sits well above
     that. A test measures that gap rather than leaving it assumed (guidelines §5).
 
-    Phase 1 scope, stated so the gaps are not mistaken for oversights. The checkpointer is
-    in-memory, because there is no gate to resume to yet (guidelines §4). `export` runs the
-    claim-to-URL gate and writes no artifact; the approved body goes to `jobs.report_json`
-    in Phase 2 and to S3 in Phase 3, in this same node. `finalize` writes the terminal
-    status; `audit_events` and `completed_at` arrive with the database.
+    **Both durable stores are injected, and both are optional here** (implementation steps
+    14-16). `checkpointer` is the Postgres one in any process that has to survive a restart
+    - `postgres_checkpointer()` below builds it - and the in-memory one otherwise, which is
+    what the offline test suite and the single-process measurement harness run on.
+    `db` is the SQLAlchemy engine the nodes write findings, claims, `claim_sources`, and
+    audit events through as the job runs; without it the graph behaves exactly as it did in
+    Phase 1. Neither is a fallback the code chooses on its own: a caller that wants
+    durability passes both, and one that does not gets no surprise.
+
+    **Where a node writes, it writes before it returns.** LangGraph applies a node's update
+    and writes the checkpoint after the node returns, so a crash in between leaves the
+    database one node ahead of the checkpoint and the redelivered message replays that node
+    (ARCHITECTURE.md §11). Every graph-time write is keyed so that replay converges rather
+    than duplicating - see database/queries.py, which owns the transaction for each one. A
+    write that fails propagates: guidelines §17 gives the database 0 retries, and a job
+    whose audit trail silently disagrees with what it did is worse than a loud failure.
+
+    The gate's own rows - `gate_opened` and `reviewer_decision`, with the reviewer's
+    identity rather than `system` - are not written here. They arrive with the authenticated
+    endpoint that produces them, in implementation step 17.
 
 WHO CALLS IT
     The worker, once it exists (implementation step 20). Tests call `build_graph()` and the
@@ -46,17 +61,25 @@ WHO CALLS IT
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, interrupt
+from psycopg import Connection
+from psycopg.rows import DictRow, dict_row
+from psycopg_pool import ConnectionPool
 from pydantic import ValidationError
+from sqlalchemy.engine import Engine
 
 from agents.fact_checker import FactCheckerUpdate, check_report
 from agents.planner import PlannerUpdate, plan_research
@@ -64,7 +87,8 @@ from agents.researcher import ResearcherUpdate, research_subtopic
 from agents.supervisor import decide_next
 from agents.synthesizer import SynthesizerUpdate, write_report
 from config import Config
-from graph.reflection import reflect
+from database import queries
+from graph.reflection import ReflectionOutcome, reflect
 from graph.state import ResearchState
 from llm_client import LLMClient
 from schemas import (
@@ -75,6 +99,7 @@ from schemas import (
     ReflectionScore,
     Report,
     ResearchPlan,
+    SubtopicStatus,
     SupervisorTarget,
     Verdict,
 )
@@ -102,6 +127,17 @@ nothing, and repeating them at every call site would."""
 GateRoute = Literal["export", "synthesizer", "finalize"]
 """The gate's three outcomes, in ARCHITECTURE.md §12's order: approve, edit, reject."""
 
+EditRefusal = Literal["reviewer_edit_limit_reached", "insufficient_call_budget_for_edit"]
+"""Why a reviewer edit was not allowed to start. Each is a stable error code the step-18
+endpoint returns with a `409`, so a caller branches on the string rather than on prose."""
+
+EDIT_CALL_COST = 3
+"""Logical calls one reviewer edit needs: a Synthesizer pass, a Fact-Checker pass, and a
+reflection pass. The Supervisor hop it also costs is already inside `MAX_SUPERVISOR_HOPS`
+(guidelines §13's `1 + 24 + 45 + 3 × (3 + E)`), and this is the minimum - a validation retry
+buys a second request for the same logical call, which is what the budget guard still
+backstops (ADR 0006 decision 7)."""
+
 TERMINAL_STATUSES: frozenset[JobStatus] = frozenset({"approved", "rejected", "failed"})
 """The three `status` values a job may end on (ARCHITECTURE.md §3). Reaching `finalize` on
 any other value is a wiring bug, and `finalize` says so rather than inventing an outcome."""
@@ -109,9 +145,9 @@ any other value is a wiring bug, and `finalize` says so rather than inventing an
 
 @dataclass(frozen=True)
 class NodeDeps:
-    """The collaborators the six LLM-using nodes need, carried as one argument.
+    """The collaborators the nodes need, carried as one argument.
 
-    It exists for two concrete reasons rather than tidiness. Six nodes need the same two or
+    It exists for two concrete reasons rather than tidiness. Most nodes need the same two or
     three values; and binding those values with `functools.partial` under their own names
     would put a parameter called `config` in a node signature, which LangGraph reads as a
     request for its own `RunnableConfig` and warns about. One `deps` parameter is
@@ -121,6 +157,13 @@ class NodeDeps:
     config: Config
     llm: LLMClient
     cache: ToolCache | None = None
+    db: Engine | None = None
+    """Where the audit trail is written, or None to run without one.
+
+    None is Phase 1's behaviour exactly: the job runs, state carries everything, and nothing
+    outlives the process. It is what the offline test suite and `scripts/measure_jobs.py`
+    use, because neither has a database and neither is what persistence is for.
+    """
 
 
 class GateUpdate(TypedDict, total=False):
@@ -146,13 +189,26 @@ class TerminalUpdate(TypedDict, total=False):
 # --- The graph ---------------------------------------------------------------------
 
 
-def build_graph(*, config: Config, llm: LLMClient, cache: ToolCache | None = None) -> ResearchGraph:
+def build_graph(
+    *,
+    config: Config,
+    llm: LLMClient,
+    cache: ToolCache | None = None,
+    db: Engine | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+) -> ResearchGraph:
     """Wire the five agents and the four control-flow nodes, and compile.
 
     The whole topology is in one function on purpose: ARCHITECTURE.md §3's diagram should be
     checkable against this code by reading it, without following any indirection.
+
+    `db` and `checkpointer` are the two durable stores, and both default to absent: no
+    engine means no rows are written, and no checkpointer means the in-memory one. A process
+    that has to survive a restart passes `postgres_checkpointer()` below and an engine from
+    `database.queries.create_database_engine()`; the test suite and the measurement harness
+    pass neither, which is why they still run with no service behind them.
     """
-    deps = NodeDeps(config=config, llm=llm, cache=cache)
+    deps = NodeDeps(config=config, llm=llm, cache=cache, db=db)
     builder = StateGraph(ResearchState)
 
     # The five agents. Each node hands the state to one agent function and returns that
@@ -174,10 +230,12 @@ def build_graph(*, config: Config, llm: LLMClient, cache: ToolCache | None = Non
         destinations=("researcher", "synthesizer", "fact_checker", "human_gate", "finalize"),
     )
     builder.add_node(
-        "human_gate", human_gate_node, destinations=("export", "synthesizer", "finalize")
+        "human_gate",
+        partial(human_gate_node, deps=deps),
+        destinations=("export", "synthesizer", "finalize"),
     )
-    builder.add_node("export", export_node)
-    builder.add_node("finalize", finalize_node)
+    builder.add_node("export", partial(export_node, deps=deps))
+    builder.add_node("finalize", partial(finalize_node, deps=deps))
 
     # The fixed edges. The Supervisor is visited between agents, which is what makes routing
     # a state decision rather than one agent handing off to another (CLAUDE.md invariant 5).
@@ -192,14 +250,7 @@ def build_graph(*, config: Config, llm: LLMClient, cache: ToolCache | None = Non
     builder.add_edge("export", "finalize")
     builder.add_edge("finalize", END)
 
-    # Phase 1 only. The gate can hold a job for days and in-memory state dies with the
-    # process, so Phase 2 swaps InMemorySaver for the Postgres one - keeping this serde,
-    # because what a checkpoint may rebuild does not depend on where it is stored.
-    return builder.compile(
-        checkpointer=InMemorySaver(
-            serde=JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINTED_TYPES)
-        )
-    )
+    return builder.compile(checkpointer=checkpointer or InMemorySaver(serde=state_serde()))
 
 
 def run_config(job_id: str) -> RunnableConfig:
@@ -209,6 +260,57 @@ def run_config(job_id: str) -> RunnableConfig:
     what makes the human gate resumable across a restart (guidelines §4).
     """
     return {"configurable": {"thread_id": job_id}}
+
+
+def state_serde() -> JsonPlusSerializer:
+    """What a checkpoint may rebuild, wherever it is stored.
+
+    Both savers take this one, because the answer does not depend on where the bytes go: the
+    five state models and the serializer's own safe types, and nothing else this process
+    happens to be able to import (guidelines §16).
+    """
+    return JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINTED_TYPES)
+
+
+@contextmanager
+def postgres_checkpointer(database_url: str) -> Iterator[PostgresSaver]:
+    """The durable checkpointer, with its tables created if they are not there.
+
+    This is the reason the gate works. `interrupt()` can hold a job for days, and in-memory
+    state dies with the worker - so without this, an approval would re-run the whole
+    research pipeline and re-bill every LLM call already spent (guidelines §4, §10).
+
+    **`setup()` owns its own tables.** LangGraph creates and migrates them itself; Alembic
+    never touches them, and they are deliberately absent from database/schema.py
+    (guidelines §19). Calling it repeatedly is safe - it is how the checkpointer applies its
+    own migrations - so a worker calls it at startup rather than guessing.
+
+    The pool is small on purpose: a worker runs one job at a time (ARCHITECTURE.md §11), so
+    one connection is the whole working set and the second is headroom for the pool
+    replacing a connection without the job waiting on it.
+
+    Used as a context manager, so the pool closes when the process is done with it:
+
+        with postgres_checkpointer(url) as checkpointer:
+            graph = build_graph(config=config, llm=llm, db=engine, checkpointer=checkpointer)
+    """
+    # `connection_class` says these connections hand back dict rows, which is both what the
+    # checkpointer reads its own tables with and what makes the pool's type match what it
+    # expects. Without it the checkpointer is handed rows of tuples and fails at the first
+    # read.
+    with ConnectionPool(
+        database_url,
+        connection_class=Connection[DictRow],
+        min_size=1,
+        max_size=2,
+        # Both are the checkpointer's requirements, not preferences: it manages its own
+        # transactions, and it reads its rows back by column name.
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        open=False,
+    ) as pool:
+        saver = PostgresSaver(pool, serde=state_serde())
+        saver.setup()
+        yield saver
 
 
 # --- The five agent nodes ----------------------------------------------------------
@@ -224,23 +326,52 @@ def supervisor_node(state: ResearchState, *, deps: NodeDeps) -> Command[Supervis
 
 def planner_node(state: ResearchState, *, deps: NodeDeps) -> PlannerUpdate:
     """3-5 subtopics and the success criteria, or a failed job."""
-    return plan_research(state, config=deps.config, llm=deps.llm)
+    update = plan_research(state, config=deps.config, llm=deps.llm)
+    plan = update.get("plan")
+    if deps.db is not None and plan is not None:
+        queries.record_plan(deps.db, job_id=state["job_id"], plan=plan)
+    return update
 
 
 def researcher_node(state: ResearchState, *, deps: NodeDeps) -> ResearcherUpdate:
     """Findings for one pending subtopic. `findings` carries only the new ones; the
-    operator.add reducer on the state appends them."""
-    return research_subtopic(state, config=deps.config, llm=deps.llm, cache=deps.cache)
+    operator.add reducer on the state appends them, and the same list is what reaches the
+    `findings` table."""
+    update = research_subtopic(state, config=deps.config, llm=deps.llm, cache=deps.cache)
+    if deps.db is not None:
+        subtopic, status = _resolved_subtopic(state, update)
+        queries.record_research(
+            deps.db,
+            job_id=state["job_id"],
+            new_findings=update.get("findings", []),
+            subtopic=subtopic,
+            status=status,
+        )
+    return update
 
 
 def synthesizer_node(state: ResearchState, *, deps: NodeDeps) -> SynthesizerUpdate:
-    """The draft, written from findings only."""
-    return write_report(state, config=deps.config, llm=deps.llm)
+    """The draft, written from findings only.
+
+    Its claims and their `claim_sources` rows are written here rather than at export,
+    because the audit trail has to be written while the job runs rather than reconstructed
+    after it (implementation step 15).
+    """
+    update = write_report(state, config=deps.config, llm=deps.llm)
+    report = update.get("report")
+    if deps.db is not None and report is not None:
+        queries.record_claims(deps.db, job_id=state["job_id"], report=report)
+    return update
 
 
 def fact_checker_node(state: ResearchState, *, deps: NodeDeps) -> FactCheckerUpdate:
     """One batched verification pass over the current draft's claims."""
-    return check_report(state, config=deps.config, llm=deps.llm, cache=deps.cache)
+    update = check_report(state, config=deps.config, llm=deps.llm, cache=deps.cache)
+    if deps.db is not None:
+        queries.record_verdicts(
+            deps.db, job_id=state["job_id"], verdicts=update.get("verdicts", [])
+        )
+    return update
 
 
 # --- The four control-flow nodes ---------------------------------------------------
@@ -258,31 +389,46 @@ def reflection_node(
     if _job_already_failed(state, "reflection"):
         return Command(goto="finalize")
     outcome = reflect(state, config=deps.config, llm=deps.llm)
+    if deps.db is not None:
+        _record_reflection(state["job_id"], outcome, deps.db)
     goto: ReflectionRoute | Literal["finalize"] = (
         "finalize" if outcome.route is None else outcome.route
     )
     return Command(goto=goto, update=outcome.update)
 
 
-def human_gate_node(state: ResearchState) -> Command[GateRoute]:
+def human_gate_node(state: ResearchState, *, deps: NodeDeps) -> Command[GateRoute]:
     """Pause for a reviewer, then route on what they decided.
 
-    `interrupt()` aborts the node and re-runs it from the top on resume, so nothing written
-    before this line would survive it. That is why `status` becomes `awaiting_approval`
-    where the interrupt is observed - the API, in Phase 2 - and not here.
+    `interrupt()` aborts the node and re-runs it from the top on resume, so nothing this
+    function returns before that line survives - which is why `status` cannot become
+    `awaiting_approval` in the update. It becomes that **in the job row**, written with the
+    `gate_opened` event before the pause, because "this job is waiting for a human" has to be
+    durable and visible to a poller while the graph is stopped (ARCHITECTURE.md §12).
 
-    The payload is deliberately minimal for now. What the reviewer is shown - unsupported
-    claims and unresearched subtopics first, then `quality_flag`, then the report - is the
-    gate's Phase 2 contract (ARCHITECTURE.md §12, implementation step 17).
+    **The gate is the only writer of `reviewer_edit_text`** (ADR 0006). It sets the text on an
+    `edit` and clears it on `approve` and `reject`, so the field means "an edit is in flight"
+    and nothing else has to remember whether one is. The Synthesizer reads it for the one
+    pass that follows; reflection reads it as the marker that sends that pass back here
+    rather than into an automatic cycle.
     """
-    raw = interrupt({"job_id": state["job_id"]})
+    if deps.db is not None:
+        queries.record_gate_opened(
+            deps.db,
+            job_id=state["job_id"],
+            calls_used=state["llm_calls_used"],
+            summary=_gate_summary(state),
+        )
+
+    raw = interrupt(reviewer_payload(state))
 
     try:
         decision = GateDecision.model_validate(raw)
     except ValidationError as error:
         # The gate is the backstop the whole injection defense leans on. A decision nobody
         # can parse is not an approval, and guessing which of the three it meant is exactly
-        # the silent wrong answer guidelines §3 refuses.
+        # the silent wrong answer guidelines §3 refuses. `reviewer_edit_text` is left as it
+        # was: this is not one of the three decisions, and the job is ending anyway.
         logger.error("gate resumed with a decision that does not validate: %s", error)
         return Command(
             goto="finalize",
@@ -291,15 +437,18 @@ def human_gate_node(state: ResearchState) -> Command[GateRoute]:
 
     if decision.decision == "approve":
         logger.info("job %s approved at the gate", state["job_id"])
-        return Command(goto="export")
+        return Command(goto="export", update=GateUpdate(reviewer_edit_text=None))
 
     if decision.decision == "reject":
         # Not a failure - a decision. `failure_reason` stays None, and the reviewer's note
-        # becomes an audit_events row once the database arrives in Phase 2.
+        # becomes a `reviewer_decision` audit row when the endpoint that authenticates them
+        # arrives in step 18.
         logger.info(
             "job %s rejected at the gate: %s", state["job_id"], decision.note or "no reason given"
         )
-        return Command(goto="finalize", update=GateUpdate(status="rejected"))
+        return Command(
+            goto="finalize", update=GateUpdate(status="rejected", reviewer_edit_text=None)
+        )
 
     # An edit is human-triggered, so it is not a revision and does not touch
     # `revision_count`. The edited draft carries fresh claim ids, so the Supervisor's
@@ -309,38 +458,99 @@ def human_gate_node(state: ResearchState) -> Command[GateRoute]:
     return Command(goto="synthesizer", update=GateUpdate(reviewer_edit_text=decision.edits))
 
 
-def export_node(state: ResearchState) -> TerminalUpdate:
-    """The claim-to-URL gate. The project's first invariant, and it is code, not a score.
+def refuse_edit(*, config: Config, llm_calls_used: int, edits_made: int) -> EditRefusal | None:
+    """May a reviewer edit start? `None` means yes (ADR 0006 decisions 6 and 7).
+
+    Decided **before** the graph is resumed, so a refused edit spends nothing. Both bounds
+    protect the same thing: a reviewer holding an approvable report, who asks for a change
+    and gets a failed job instead - which is what happens today when the Supervisor's budget
+    guard trips halfway through the edit pass, because `export` then never runs.
+
+    `llm_calls_used` is the **live** count, from the checkpoint by way of the gate payload.
+    It is never `jobs.llm_calls_used`: that column is written by `finalize` and reads `0` for
+    the whole time a job waits at the gate, so a check against it would compute a full budget
+    every time and allow every edit silently.
+
+    The endpoint in step 18 turns each answer into a `409` with the reason as its stable
+    error code. This function is the decision; the HTTP shape is not.
+    """
+    if edits_made >= config.max_reviewer_edits:
+        return "reviewer_edit_limit_reached"
+    if config.max_llm_calls_per_job - llm_calls_used < EDIT_CALL_COST:
+        return "insufficient_call_budget_for_edit"
+    return None
+
+
+def export_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
+    """The claim-to-URL gate, and Phase 2's artifact write.
 
     Every claim must reach at least one source URL, or the export does not happen - not a
     warning, and not a footnote on an exported report (CLAUDE.md invariant 1). Coverage is
     arithmetic, so a judge here would add variance to a number that should be exact
-    (ARCHITECTURE.md §20 row 12).
+    (ARCHITECTURE.md §20 row 12). The check itself is unchanged and runs on the report in
+    state, whether or not there is a database underneath.
 
-    No artifact is written in Phase 1. The approved body goes to `jobs.report_json` in
-    Phase 2 and to S3 in Phase 3, in this same node.
+    What the database adds is the record: `export_attempted` before the check, so an export
+    that fails the invariant is still visible as an attempt, and then `export_result`
+    either way. A passing export writes the approved body to `jobs.report_json` and stamps
+    `exported_at` in the same transaction as its audit row, which is where the report is
+    read from until S3 arrives in Phase 3 - in this same node (ARCHITECTURE.md §8).
+
+    **A blocked export is never retried.** An uncited claim is a defect in the report, not
+    an infrastructure error, and the two are handled differently on purpose.
     """
     report = state["report"]
     if report is None:
         logger.error("export reached with no report")
         return TerminalUpdate(status="failed", failure_reason="no_report_to_export")
 
+    if deps.db is not None:
+        queries.record_export_attempt(
+            deps.db, job_id=state["job_id"], claims_checked=len(report.claims)
+        )
+
     uncited = _uncited_claims(report)
     if uncited:
         logger.error("export blocked: %d claim(s) reach no source URL: %s", len(uncited), uncited)
+        if deps.db is not None:
+            queries.record_export_result(
+                deps.db, job_id=state["job_id"], report=None, uncited=uncited
+            )
         return TerminalUpdate(status="failed", failure_reason="uncited_claims")
+
+    if deps.db is not None:
+        queries.record_export_result(deps.db, job_id=state["job_id"], report=report, uncited=())
 
     logger.info("export gate passed: %d claims, every one cited", len(report.claims))
     return TerminalUpdate(status="approved")
 
 
-def finalize_node(state: ResearchState) -> TerminalUpdate:
+def finalize_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
     """The single terminal node. It records the outcome; it does not decide it.
 
     Every path here already carries its terminal status - a tripped guard, a rejection at
     the gate, or the export gate's answer. Arriving without one is a wiring bug, and a job
     that ends loudly is cheaper to diagnose than one that ends plausibly.
+
+    It is also the only place `jobs.completed_at` is set (ARCHITECTURE.md §9), and where the
+    two counters become durable, so budget behaviour stays auditable once state is gone.
     """
+    update = _terminal_update(state)
+
+    if deps.db is not None:
+        queries.finish_job(
+            deps.db,
+            job_id=state["job_id"],
+            status=update.get("status", state["status"]),
+            quality_flag=state["quality_flag"],
+            revision_count=state["revision_count"],
+            llm_calls_used=state["llm_calls_used"],
+        )
+    return update
+
+
+def _terminal_update(state: ResearchState) -> TerminalUpdate:
+    """How the job ended, and - when it ended badly and nobody said why - that too."""
     status = state["status"]
 
     if status not in TERMINAL_STATUSES:
@@ -374,6 +584,145 @@ def _job_already_failed(state: ResearchState, node: str) -> bool:
         state["failure_reason"],
     )
     return True
+
+
+def reviewer_payload(state: ResearchState) -> dict[str, Any]:
+    """What the reviewer is shown, in the order ARCHITECTURE.md §12 puts it.
+
+    **The order is the contract, not a preference.** Unsupported claims and unresearched
+    subtopics come first, then `quality_flag`, then the score breakdown, then the report, and
+    the per-claim sources last - because a reviewer who has to hunt for the problems will
+    approve past them. Python keeps insertion order, so the keys below are that order and a
+    test asserts it.
+
+    `llm_calls_used` is here for one concrete reason: it is the live number `refuse_edit()`
+    needs, and the gate is where a caller can read it without loading the checkpoint itself.
+    """
+    report = state["report"]
+    scores = state["reflection_scores"]
+    latest = scores[-1] if scores else None
+    return {
+        "job_id": state["job_id"],
+        "unsupported_claims": _unsupported_claims(state),
+        "unresearched_subtopics": _unresearched_subtopics(state),
+        # None means the rubric ran and the report passed. "unscored" means it never ran, and
+        # a client that reads an empty `failed_dimensions` as "no problems" without reading
+        # this flag has a bug (ARCHITECTURE.md §12).
+        "quality_flag": state["quality_flag"],
+        "score": latest.model_dump(mode="json") if latest is not None else None,
+        "failed_dimensions": list(state["failed_dimensions"]),
+        "revision_count": state["revision_count"],
+        "llm_calls_used": state["llm_calls_used"],
+        "report": report.model_dump(mode="json") if report is not None else None,
+        "claims": _claims_with_sources(state),
+    }
+
+
+def _gate_summary(state: ResearchState) -> dict[str, Any]:
+    """The counts that make a `gate_opened` row worth reading, without the report in it."""
+    return {
+        "unsupported_claims": len(_unsupported_claims(state)),
+        "unresearched_subtopics": len(_unresearched_subtopics(state)),
+        "quality_flag": state["quality_flag"],
+    }
+
+
+def _unsupported_claims(state: ResearchState) -> list[str]:
+    """Claim ids in the *current* draft the Fact-Checker did not support.
+
+    Verdicts accumulate across passes (guidelines §4), so the current draft's claim ids are
+    what filters them - an earlier draft's unsupported claim is not this draft's problem.
+    """
+    report = state["report"]
+    if report is None:
+        return []
+    current = {claim.claim_id for claim in report.claims}
+    return [
+        verdict.claim_id
+        for verdict in state["verdicts"]
+        if verdict.claim_id in current and not verdict.supported
+    ]
+
+
+def _unresearched_subtopics(state: ResearchState) -> list[str]:
+    return [
+        subtopic
+        for subtopic, status in state["subtopic_status"].items()
+        if status == "unresearched"
+    ]
+
+
+def _claims_with_sources(state: ResearchState) -> list[dict[str, Any]]:
+    """Every claim with the URLs it rests on and the quote the Fact-Checker found.
+
+    This is the part of the payload that makes an approval a judgement rather than a
+    formality: the reviewer sees what each sentence is standing on.
+    """
+    report = state["report"]
+    if report is None:
+        return []
+    urls = {finding.finding_id: str(finding.url) for finding in state["findings"]}
+    verdicts = {verdict.claim_id: verdict for verdict in state["verdicts"]}
+    claims = []
+    for claim in report.claims:
+        verdict = verdicts.get(claim.claim_id)
+        claims.append(
+            {
+                "claim_id": claim.claim_id,
+                "text": claim.text,
+                "sources": [urls[fid] for fid in claim.finding_ids if fid in urls],
+                "supported": None if verdict is None else verdict.supported,
+                "quote": None if verdict is None else verdict.quote,
+                "note": None if verdict is None else verdict.note,
+            }
+        )
+    return claims
+
+
+def _resolved_subtopic(
+    state: ResearchState, update: ResearcherUpdate
+) -> tuple[str | None, SubtopicStatus | None]:
+    """Which subtopic this Researcher visit finished, and how it turned out.
+
+    Read off the update rather than recomputed from the plan: the Researcher marks exactly
+    one subtopic `done` or `unresearched` per visit, so the one status that changed is the
+    visit's subject. Asking the plan again would be a second copy of the agent's "next
+    pending subtopic" rule, and the copies would drift.
+
+    A visit that failed before it resolved anything changes no status and answers (None,
+    None) - its findings are still written, because they were still paid for.
+    """
+    before = state["subtopic_status"]
+    changed = [
+        (subtopic, status)
+        for subtopic, status in update.get("subtopic_status", {}).items()
+        if before.get(subtopic) != status
+    ]
+    return changed[0] if len(changed) == 1 else (None, None)
+
+
+def _record_reflection(job_id: str, outcome: ReflectionOutcome, db: Engine) -> None:
+    """The two reflection events the audit trail names, and nothing else.
+
+    A pass, or a cap that routes to the gate, is not an event of its own: the score is in
+    state and in the checkpoint, and `jobs.quality_flag` carries the outcome at finalize.
+    What is worth reconstructing later is that a revision was started, or that the rubric
+    never ran at all - `unscored` is not a pass, and this row is what says so afterwards
+    (ARCHITECTURE.md §9, §15).
+    """
+    update = outcome.update
+    if outcome.route is not None and "revision_count" in update:
+        scores = update.get("reflection_scores", [])
+        queries.record_revision(
+            db,
+            job_id=job_id,
+            revision=update["revision_count"],
+            route=outcome.route,
+            failed_dimensions=update.get("failed_dimensions", []),
+            weighted_score=scores[-1].weighted_score if scores else 0.0,
+        )
+    elif update.get("quality_flag") == "unscored":
+        queries.record_reflection_failed(db, job_id=job_id)
 
 
 def _uncited_claims(report: Report) -> list[str]:

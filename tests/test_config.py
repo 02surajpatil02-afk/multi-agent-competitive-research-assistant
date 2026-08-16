@@ -67,6 +67,7 @@ def test_an_empty_string_counts_as_unset_for_a_required_variable() -> None:
         ("max_revisions", 2),
         ("max_supervisor_hops", 24),
         ("max_llm_calls_per_job", 60),
+        ("max_reviewer_edits", 3),
         ("reflection_pass_threshold", 3.5),
         ("max_fetch_bytes", 2_097_152),
         ("max_page_chars", 24_000),
@@ -253,3 +254,19 @@ def test_secrets_are_not_in_the_repr() -> None:
     for secret in _SECRETS.values():
         assert secret not in printed
     assert "main-model" in printed  # non-secret values are still visible
+
+
+AUTOMATIC_WORKFLOW_HOPS = 20
+"""guidelines §5's derivation for the automatic workflow: 5 subtopics, 2 revisions."""
+
+
+def test_the_reviewer_edit_bound_leaves_the_hop_guard_room() -> None:
+    """20 automatic hops + 3 edit hops = 23, under the guard's 24 (ADR 0006 decision 6).
+
+    Asserted rather than believed, because the arithmetic is what says the guard must not be
+    lowered to 20 when the edit path is bounded: three permitted edits are three legitimate
+    hops, and a guard at 20 would stop a job that used them.
+    """
+    config = load_config(_env())
+
+    assert AUTOMATIC_WORKFLOW_HOPS + config.max_reviewer_edits < config.max_supervisor_hops

@@ -233,11 +233,19 @@ def _scored(
         scores["citation_coverage"] == COVERAGE_GATE
     )
     capped = state["revision_count"] >= config.max_revisions
+    # A reviewer edit is one Synthesizer pass over the evidence the job already holds, and it
+    # goes back to the human who asked for it - scored, never re-routed (ADR 0006). Without
+    # this the edited draft is treated as any other: a failing score with revisions left
+    # would start an automatic cycle, and a failing research dimension would send a
+    # reviewer's wording to the Researcher, which the same record forbids.
+    edited = state["reviewer_edit_text"] is not None
 
     # A failing report always has a failing dimension: the weighted score is a convex
     # combination of the five, so all five clearing the bar puts the total over it too, and
     # a coverage gate that bit means coverage itself is below 5.
-    route: ReflectionRoute = "human_gate" if passed or capped else _route_for(state, scores, failed)
+    route: ReflectionRoute = (
+        "human_gate" if passed or capped or edited else _route_for(state, scores, failed)
+    )
 
     score = ReflectionScore(
         research_completeness=rubric.research_completeness,
@@ -259,11 +267,14 @@ def _scored(
     if route == "human_gate":
         # None is a value, not an absence: it means the rubric ran and the report passed.
         # Writing it keeps that true on a second pass over a draft an earlier one failed.
+        # A failing edit pass therefore reaches the reviewer flagged `below_threshold`, which
+        # ADR 0006 widened to mean "a failing score the graph will not act on automatically"
+        # - the same flag, a third way to earn it, and no new value to migrate.
         update["quality_flag"] = None if passed else "below_threshold"
         logger.info(
             "reflection scored %.2f (%s) and routed to the human gate",
             weighted,
-            _gate_reason(passed=passed, capped=capped),
+            _gate_reason(passed=passed, capped=capped, edited=edited),
         )
         return ReflectionOutcome(route, update)
 
@@ -369,10 +380,12 @@ def _route_for(state: ResearchState, scores: dict[str, int], failed: list[str]) 
     return _ROUTE_BY_DIMENSION[_lowest(scores, actionable)]
 
 
-def _gate_reason(*, passed: bool, capped: bool) -> str:
+def _gate_reason(*, passed: bool, capped: bool, edited: bool) -> str:
     """Why a job reached the gate, for the log line that records it going there."""
     if passed:
         return "passed"
+    if edited:
+        return "reviewer edit, which returns to the gate"
     if capped:
         return "revision cap reached"
     return "no failing dimension left to act on"

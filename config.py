@@ -108,6 +108,19 @@ class Config:
     max_llm_calls_per_job: int
     reflection_pass_threshold: float
 
+    max_reviewer_edits: int
+    """How many times one reviewer may send a job back for an edit (ADR 0006).
+
+    A reviewer edit is human-triggered, so `MAX_REVISIONS` does not bound it and nothing else
+    did until this existed. Each edit costs 3 logical calls and exactly 1 hop, which is what
+    makes 3 a derived number rather than a guess: it puts the hop ceiling at 20 + 3 = 23,
+    under `MAX_SUPERVISOR_HOPS` = 24, and the call ceiling at 88, where the 60-call budget
+    binds first (guidelines §5, §13).
+
+    Enforced before the graph is resumed - `graph.build.refuse_edit()` - so a refused edit
+    spends nothing at all.
+    """
+
     researcher_concurrency: int
     """How many of one subtopic's page extractions may be in flight at once (ADR 0002).
 
@@ -142,6 +155,19 @@ class Config:
 
     # Auth. Required from Phase 2; None until then.
     auth_keys_secret_id: str | None
+
+    auth_keys: str | None = field(repr=False)
+    """The API keys, hashed, as JSON: `{"<sha256 of the key>": {"user_id", "role"}}`.
+
+    guidelines §16 keeps secrets in environment variables locally and in Secrets Manager in
+    AWS, so this is the local half of one thing: the same JSON that `AUTH_KEYS_SECRET_ID`
+    names in Phase 5, read from the environment until there is a Secrets Manager to read it
+    from. It holds **hashes**, never keys, so a leaked environment does not hand anyone a
+    working credential.
+
+    `routes/auth.py` parses and validates it once, at startup, so a malformed value fails
+    the process rather than the first request.
+    """
 
     # Operations.
     retention_days: int
@@ -189,17 +215,23 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         langsmith_api_key=langsmith_api_key,
         langsmith_project=_optional(source, "LANGSMITH_PROJECT") or "competitive-research",
         max_revisions=_int(source, "MAX_REVISIONS", default=2),
-        # 20 is the derived maximum a legitimate job can need (guidelines §5); the extra 4 is
-        # temporary margin for the reviewer-edit path, which is not bounded yet.
+        # 20 is the automatic workflow's derived maximum (guidelines §5) and MAX_REVIEWER_EDITS
+        # = 3 makes three more hops legitimate, so the ceiling is 23 and 24 is that plus one.
+        # It is ordinary headroom above a derived ceiling, not margin for an unbounded path -
+        # ADR 0006 decision 6 bounded the edits and withdrew the instruction to reduce this
+        # to 20, which would kill a job that used its three permitted edits.
         max_supervisor_hops=_int(source, "MAX_SUPERVISOR_HOPS", default=24),
         max_llm_calls_per_job=_int(source, "MAX_LLM_CALLS_PER_JOB", default=60),
         reflection_pass_threshold=_float(source, "REFLECTION_PASS_THRESHOLD", default=3.5),
+        # ADR 0006's bound on the reviewer-edit path. 3 keeps the hop ceiling at 23.
+        max_reviewer_edits=_int(source, "MAX_REVIEWER_EDITS", default=3),
         researcher_concurrency=_researcher_concurrency(source),
         # guidelines §17's whole-job row, 20 minutes. Configured only - see the field.
         max_job_runtime=_int(source, "MAX_JOB_RUNTIME", default=1200),
         max_fetch_bytes=_int(source, "MAX_FETCH_BYTES", default=2_097_152),
         max_page_chars=_int(source, "MAX_PAGE_CHARS", default=24_000),
         auth_keys_secret_id=_optional(source, "AUTH_KEYS_SECRET_ID"),
+        auth_keys=_optional(source, "AUTH_KEYS"),
         retention_days=_int(source, "RETENTION_DAYS", default=365),
         app_env=_app_env(source),
         log_level=_optional(source, "LOG_LEVEL") or "INFO",

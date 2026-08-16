@@ -105,8 +105,10 @@ intake → plan → research (per subtopic) → synthesize → fact-check → re
 **One Python process, no infrastructure.** A job is a call to `build_graph()` and `invoke()`: the
 Supervisor routes, the five agents run, the reflection node scores, the graph pauses at the human
 gate with `interrupt()`, and a resume decision carries it through the export gate to `finalize`.
-State lives in an in-memory checkpointer keyed on `thread_id = job_id`, so it dies with the process —
-which is acceptable only because there is no API yet to resume a job from (CLAUDE.md phase plan).
+State lives in a checkpointer keyed on `thread_id = job_id`. **Since step 14 that checkpointer is a
+parameter:** a process that has to survive a restart passes the Postgres one, and everything else -
+the offline suite, `scripts/measure_jobs.py` - gets the in-memory one and dies with the process, which
+is acceptable there because neither is what durability is for (CLAUDE.md phase plan).
 
 The lifecycle above is the Phase 3+ shape. Steps 1–2 and 5–8 of it — the API, the queue, the
 database, and the presigned URL — do not exist yet; the graph in the middle does.
@@ -129,7 +131,8 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | Human gate node and export gate, as graph nodes | 1 | **Built** — `graph/build.py`; the endpoint and the audit rows are Phase 2 |
 | Test suite: unit, agent contract, graph, integration, injection | 1 | **Built** — `tests/`, zero network calls |
 | MCP protocol client or server | — | **Not built, and not scheduled.** The boundary is in-process (§7) |
-| Postgres checkpointer, audit tables, `POST /jobs/{id}/approve`, API + API-key auth | 2 | Planned |
+| Postgres checkpointer; `jobs` / `findings` / `claims` / `claim_sources` / `audit_events` and their Alembic migration; the audit trail written as the graph runs; the export gate's write to `jobs.report_json` | 2 | **Built** (2026-08-15, steps 13–16) — `database/`, `graph/build.py`. Both stores are injected: the graph runs exactly as it did in Phase 1 without them ([ADR 0005](adr/0005-graph-time-persistence-semantics.md)) |
+| `POST /jobs/{id}/approve`, the reviewer payload, the API and API-key auth | 2 | **Built** (2026-08-16, steps 17–18) — `routes/`, `app.py`. The gate resumes in-process; the enqueue in §12 arrives with the Phase 3 worker |
 | Docker Compose, async worker, SQS/S3 via LocalStack, CI | 3 | Planned |
 | Redis: shared rate limiter, caches, URL dedupe | 3 | Planned — the interfaces exist and are wired (§7) |
 | LangSmith tracing, eval dataset, eval as a release gate | 4 | Planned |
@@ -392,8 +395,15 @@ days is closed the same way with reason `gate_expired` (gl §10, §17).
 
 ### Terminal states
 
-Every path ends at `finalize`, which writes the terminal status, sets `completed_at`, emits the audit
-event, and hands to `END`.
+Every path ends at `finalize`, which writes the terminal status, sets `completed_at`, persists
+`revision_count` and `llm_calls_used`, and hands to `END`.
+
+**It writes no audit row of its own**, and the earlier version of this sentence — "emits the audit
+event" — claimed one that has never existed: `AuditAction` has no job-finished action. That is the
+second half of the gap [ADR 0005](adr/0005-graph-time-persistence-semantics.md) recorded, and
+[ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md) decides it — the row,
+carrying `failure_reason`, is Phase 3's, and until then a failed job's reason lives in the durable
+checkpoint.
 
 | Terminal `status` | Meaning |
 |---|---|
@@ -681,7 +691,7 @@ state, and the Supervisor decides who runs next (CLAUDE.md invariant 5).
 | `quality_flag` | `str \| None` | Reflection node | Current (overwritten) | `None`, `"below_threshold"`, or `"unscored"`. Carries the outcomes no automatic cycle can fix - the cap, every research target exhausted (ADR 0004), and a scoring failure - to the gate, the API, and `jobs.quality_flag` |
 | `hop_count` | `int` | Supervisor | Current (counter) | Compared against `MAX_SUPERVISOR_HOPS` |
 | `llm_calls_used` | `int` | Every LLM caller | Current (counter) | Compared against `MAX_LLM_CALLS_PER_JOB` |
-| `reviewer_edit_text` | `str \| None` | Approval endpoint sets, Synthesizer clears | Current (**set once, consumed once**) | The `edit` decision's text. It must reach the Synthesizer, and it must not be re-applied on a later pass |
+| `reviewer_edit_text` | `str \| None` | **The gate sets it and the gate clears it** (ADR 0006) | Current (**set once, consumed once**) | The `edit` decision's text. It reaches the Synthesizer's prompt, and reflection reads it as the edit pass's marker — so the clear waits for the next gate decision rather than happening mid-pass |
 | `status` | `Literal["running","awaiting_approval","approved","rejected","failed"]` | Gate, finalize | Current | The externally visible job state |
 | `failure_reason` | `str \| None` | Whichever guard trips | Current | Set whenever `status=failed`; never left `None` on a failure |
 
@@ -789,9 +799,11 @@ fields — mapping them here rather than adding state:
 `thread_id = job_id`. One job, one thread, one checkpoint history. Checkpoints are written **per
 node**, which is what makes both the human gate and a worker crash survivable (gl §4, gl §12).
 
-Phase 1 uses the in-memory checkpointer, because there is no gate yet. Phase 2 switches to the
-Postgres checkpointer — not for scale, but because the gate can hold a job for days and in-memory
-state dies with the worker, which would mean re-billing every LLM call for work already done (gl §4).
+Phase 1 used the in-memory checkpointer, because there was no gate to resume to yet. **Step 14 built
+the Postgres one** — `graph.build.postgres_checkpointer()`, injected through `build_graph(checkpointer=...)`
+— not for scale, but because the gate can hold a job for days and in-memory state dies with the worker,
+which would mean re-billing every LLM call for work already done (gl §4). Both savers take the same
+serde, so what a checkpoint may rebuild does not depend on where it is stored.
 
 LangGraph's Postgres checkpointer manages its own tables through `setup()`. Alembic does not touch
 them (gl §19).
@@ -1328,8 +1340,11 @@ sentence?" into a query rather than an investigation (gl §9).
 
 ## 9. Database Model
 
-Conceptual schema only — gl §9's sketch, with the keys, relationships, and indexes made explicit. **No
-migration is written in Phase 0.** Alembic migrations arrive in Phase 2 (CLAUDE.md phase plan).
+gl §9's sketch, with the keys, relationships, and indexes made explicit. **Built in step 13**:
+`database/schema.py` holds the tables and `database/migrations/versions/rev_0001_initial_schema.py`
+creates them, with a test that compares the two so they cannot drift. One deliberate difference from
+the text below: `ix_jobs_user_created` is `(user_id, created_at)` without the `DESC`, because a b-tree
+is scanned backwards just as cheaply and an expression index costs that drift test its strictness.
 
 ```sql
 jobs          (job_id PK, user_id, question, idempotency_key UNIQUE, status, quality_flag,
@@ -1359,7 +1374,7 @@ audit_events  (event_id PK, job_id FK, actor, action, detail JSONB, created_at)
 | `idempotency_key` | **UNIQUE, NOT NULL.** `sha256(user_id + question + date)`, derived server-side. See below |
 | `status` | Lifecycle: `running` → `awaiting_approval` → `approved` / `rejected` / `failed` |
 | `quality_flag` | `NULL`, `below_threshold` (a failing score no automatic cycle can fix: the revision cap, or every subtopic already `unresearched` — ADR 0004), or `unscored` (the scoring call failed and the report was kept) |
-| `revision_count`, `llm_calls_used` | Persisted so budget behaviour is auditable after the job ends |
+| `revision_count`, `llm_calls_used` | Persisted so budget behaviour is auditable after the job ends. **Written by `finalize` only**, so both read `0` while a job waits at the gate — anything needing the live count reads the checkpoint, never this row (ADR 0005; [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md) decision 7) |
 | `report_json` | **JSONB, nullable.** The approved `Report` body, written by the export node **only after the gate passes**. `NULL` means nothing was ever exported. This is what makes the report retrievable in Phase 2, before S3 exists (§8) |
 | `exported_at` | Nullable. Set alongside `report_json`. `NULL` here and `status=approved` means the export did not complete |
 | `created_at`, `completed_at` | `completed_at` is set by `finalize` only |
@@ -1509,19 +1524,36 @@ every internal boundary. **Every route except `/health` requires authentication*
 
 - **Response:** `{job_id, status, phase, revision_count, quality_flag, report?}`
 - **Codes:** `200` · `401` · `403` not the owner · `404`
-- **Auth:** required. **Authz:** the caller must own the job.
+- **Auth:** required. **Authz:** a `submitter` must own the job; a `reviewer` may read any job (§13).
 - **Behaviour:** `phase` is a **coarse progress label, not a stream**. No SSE, no websockets. Polling
   a 20-minute job every few seconds is cheap, and streaming partial research to a caller who cannot
   act on it buys nothing. If a UI ever needs real progress, `phase` is the field that widens (gl §12).
+
+**`phase`'s vocabulary**, so a client is not reading an undocumented field:
+
+| Value | Meaning |
+|---|---|
+| `queued` | The checkpoint has no next node — the job has not started. **In Phase 2 that is every job until something runs it**, because `POST /jobs` enqueues nothing |
+| `supervisor` · `planner` · `researcher` · `synthesizer` · `fact_checker` · `reflection` · `human_gate` · `export` · `finalize` | The next node in the checkpoint. These are the graph's node names (§3), which is what makes the field widen cheaply rather than needing a second vocabulary |
+| `approved` · `rejected` · `failed` | The job has ended; `phase` repeats the terminal `status` rather than naming a node |
+
+**A failed job reads `status: "failed"`, `phase: "failed"`, `report: null`.** There is deliberately no
+reason field: the reason lives in the durable checkpoint for Phase 2, and
+[ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md) records why and which
+phase owns the durable one.
 
 ### 3. `POST /jobs/{id}/approve`
 
 - **Request:** `{decision: "approve" | "reject" | "edit", note?, edits?}`
 - **Response:** `{job_id, status}`
-- **Codes:** `200` · `401` · `403` **not a reviewer** · `404` · `409` job is not `awaiting_approval`
+- **Codes:** `200` · `400` unusable body, or reviewer text over the cap · `401` · `403` **not a
+  reviewer** · `404` · `409` job is not `awaiting_approval`, or `gate_already_decided`
 - **Auth:** required. **Authz:** role `reviewer` only.
-- **Behaviour:** record the decision and the reviewer identity as an `audit_events` row, then resume
-  the graph from the checkpoint.
+- **Behaviour:** clean the reviewer's `edits` and `note` — control characters stripped, whitespace
+  collapsed, length-capped, exactly as `POST /jobs` treats the question
+  ([ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md) decision 8) — then record the
+  decision and the reviewer identity as an `audit_events` row, then resume the graph from the
+  checkpoint. The cleaned value is what reaches both the audit row and the Synthesizer's prompt.
 
 **There is no separate `/reject` route.** Rejection is a `decision` value on this endpoint, as gl §12
 defines it. Approving a report is an authorization decision and it is the backstop the whole
@@ -1539,7 +1571,10 @@ injection defense leans on, so one authenticated endpoint owns all three outcome
 
 ### 5. `GET /health`
 
-- **Response:** `{status, checks: {db, redis}}` — booleans only
+- **Response:** `{status, checks}` — booleans only, one key per dependency the process actually
+  reaches. **Phase 2 checks `db` and nothing else; `redis` appears when Phase 3 provides it.** A
+  dependency nothing reaches for yet would report unhealthy forever, which means an unhealthy task is
+  never replaced — the exact failure this route exists to avoid
 - **Codes:** `200` healthy · `503` degraded
 - **Auth:** **none. This is the one unauthenticated route.**
 - **Behaviour:** not decoration. The ECS target group and API Gateway need a liveness answer, and a
@@ -1592,8 +1627,17 @@ One shape, everywhere:
 
 | Role | May | May not |
 |---|---|---|
-| `submitter` | `POST /jobs`; read its **own** jobs and reports | Decide anything at the gate |
-| `reviewer` | Everything a submitter may, plus approve, reject, or edit at the gate | — |
+| `submitter` | `POST /jobs`; read its **own** jobs and reports | Read another caller's job; decide anything at the gate |
+| `reviewer` | Everything a submitter may, plus read **any** job and decide at **any** open gate | — |
+
+**Why a reviewer's read is not limited to its own jobs.** A reviewer is asked to decide on work it did
+not submit — that is the whole role — and deciding without reading would be approving unseen, which is
+the one thing the gate exists to prevent. So the ownership check applies to `submitter` and is
+deliberately not applied to `reviewer`, on the two read routes or at the gate.
+
+**This is a single-tenant statement.** Every table carries `user_id` so tenant scoping is additive
+later (CLAUDE.md phase plan); when it arrives, "any job" has to become "any job in the reviewer's
+tenant", and this paragraph is the one to re-read.
 
 Every authenticated identity is written to `audit_events.actor`. That is what turns "the report was
 approved" into "this person approved it", which is the only version worth auditing (gl §9, gl §16).
@@ -1741,7 +1785,7 @@ The two `quality_flag` values say different things and the payload must not blur
 
 | `quality_flag` | What the reviewer is being told |
 |---|---|
-| `"below_threshold"` | The rubric ran and the report failed it, and no automatic cycle can fix it — either both improvement cycles are spent, or the only failing dimensions needed research and **every** subtopic is already `unresearched` (ADR 0004). `failed_dimensions` says which dimensions; the subtopic statuses say which of the two it was |
+| `"below_threshold"` | The rubric ran and the report failed it, and **the graph will not act on it automatically**. Three ways to get here: both improvement cycles are spent; the only failing dimensions needed research and **every** subtopic is already `unresearched` (ADR 0004); or the pass was a reviewer edit, which returns to the gate by design (ADR 0006). `failed_dimensions` says which dimensions; the subtopic statuses and `reviewer_edit_text` say which of the three it was |
 | `"unscored"` | **The rubric never ran.** The report is complete and fact-checked, but nothing scored it. `failed_dimensions` is empty because it is *unknown*, not because it is clean. You are the only quality judgement on this job |
 | `None` | The rubric ran and the report passed |
 
@@ -1764,24 +1808,28 @@ Fact-Checker like any other (gl §10). It still respects `MAX_LLM_CALLS_PER_JOB`
 reflection (§3). An edit is human-triggered, so it does not increment `revision_count` and cannot be
 starved by the cap — a reviewer can still ask for a fix on a job that already spent both cycles.
 
-**[derived] The edit pass is scored but not re-routed.** `fact_checker → reflection` is a fixed edge,
-so an edited draft passes through reflection and the reviewer gets a fresh score. But gl §10 says the
-edit goes "to the Synthesizer for one pass, **then back to the gate**", so on this path reflection
-records its score and routes to `human_gate` regardless of the result. Letting it start an automatic
-cycle here would contradict "one pass, then back to the gate" and would let one reviewer edit trigger
-open-ended rework.
+**The edit pass is scored but not re-routed.** `fact_checker → reflection` is a fixed edge, so an
+edited draft passes through reflection and the reviewer gets a fresh score. gl §10 says the edit goes
+"to the Synthesizer for one pass, **then back to the gate**", so on this path reflection records its
+score and routes to `human_gate` regardless of the result — and never returns a subtopic to `pending`,
+which is what would put a reviewer's wording in front of the Researcher. Derived at architecture
+review, decided in [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md), and built in step
+17: `state["reviewer_edit_text"] is not None` is the marker reflection reads.
 
-**`reviewer_edit_text` is consumed exactly once.** The Synthesizer clears it at the end of the pass
-that applies it. Left set, a later pass would silently re-apply an edit written against an older
-draft. The text survives in `audit_events` regardless (§5).
+**`reviewer_edit_text` is applied exactly once**, and the routing rule is what makes that true
+rather than the clear: exactly one Synthesizer pass sits between one gate visit and the next, so there
+is no later pass to re-apply it. The **gate** clears it on the next decision — `None` on `approve` and
+`reject`, the new text on another `edit` — because reflection has to read it two nodes after the
+Synthesizer, and a field the Synthesizer had already cleared could not tell it anything (ADR 0006).
+The text survives in `audit_events` regardless (§5).
 
-> **Not built yet — the one Phase-1 gap on this path.** The gate node writes `reviewer_edit_text` on
-> an `edit` decision, but the Synthesizer neither reads it nor clears it: it is absent from the
-> prompt and absent from `SynthesizerUpdate`. So an edit today routes a Synthesizer pass that has not
-> been told what to change, and the field stays set. Both halves — applying the text and clearing it —
-> belong with the gate's Phase 2 work (§21 step 17), where the endpoint that produces the text also
-> arrives. Recorded here rather than fixed silently, because the field's contract above is the
-> specification and the code is what is behind.
+> **Built in step 17** ([ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md)). The
+> Synthesizer reads the text into its prompt as an authorised instruction — outside the untrusted
+> block, because a reviewer is not a fetched page — and the **gate** clears it on the next decision
+> rather than the Synthesizer clearing it mid-pass, so reflection can still read it two nodes later as
+> the marker for an edit pass. **The scope boundary is the part to read:** an edit rewrites the report
+> from the evidence the job already holds. It may not research, may not invent, and where the findings
+> cannot support what was asked, the report reports the gap.
 
 ### Resuming without re-executing completed work
 
@@ -1802,6 +1850,45 @@ paths to test. Confirmed at architecture review; recorded in §20.
 A resume message reuses the job's existing `idempotency_key` and `job_id`, so it is subject to exactly
 the same at-least-once handling as the original — a redelivered resume replays from the checkpoint
 rather than approving twice (§11).
+
+### One decision per gate visit, and what a failed resume does
+
+Recorded in [ADR 0007](adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md) and built
+on 2026-08-16, after a resume was measured dying mid-pass and leaving the row and the checkpoint
+disagreeing about whether a human still held the job.
+
+**A gate visit is `(job_id, calls_used)`** — the job's `llm_calls_used` at the pause. It needs no new
+column: `gate_opened` is already keyed on it, and the `reviewer_decision` row now carries the same
+key, so "which opening does this decision answer?" is a join. The value is identical across the gate
+node's replay and strictly greater at the next visit, because no edge reaches `human_gate` without
+spending a call.
+
+| Situation | `POST /jobs/{id}/approve` |
+|---|---|
+| No decision for the current visit | Require `awaiting_approval`, claim the gate, record the decision, resume |
+| The **same** decision already recorded for this visit, job not terminal | **Retry:** write nothing, count nothing, continue the graph from the checkpoint |
+| A **different** decision on a visit that already has one | `409 gate_already_decided` |
+| Job already terminal | `409 job_not_awaiting_approval` — unchanged |
+
+**The retry path is the recovery path.** A reviewer who gets a `500` sends the same request again;
+there is no operator route and no unwind step. The retry invokes the same thread, so LangGraph
+replays from the last checkpoint and the cost is bounded by the single node that was in flight —
+the same bound §11 gives a redelivered SQS message. Crucially it costs no second edit:
+`count_reviewer_edits` counts rows, and the key is what stops an infrastructure failure spending one
+of the three edits ADR 0006 allows.
+
+**`jobs.status = 'awaiting_approval'` if and only if the checkpoint holds a pending interrupt at
+`human_gate`.** The gate node writes it only when it is genuinely opening a visit — the same guard
+that protects its audit row, so its replay can no longer hand back a gate `claim_gate` has just
+claimed — and the endpoint reconciles the row from the checkpoint in a `finally` around the resume:
+a pending interrupt means `awaiting_approval`, an active graph without one means `running`, and a
+job `finalize` has ended is left alone. The predicate is the **pending interrupt, not `next`**: a job
+that has not yet entered the gate also reports `next == ("human_gate",)` while nobody is being
+waited on.
+
+**An unexpected failure uses the error envelope too.** A catch-all handler answers
+`{"error": {"code": "internal_error", "message", "job_id"}}`, because "one shape, everywhere" is only
+true if the framework's default `500` cannot leak through it.
 
 ### Expiry
 
@@ -2192,12 +2279,13 @@ counted inside the 24.
 | Case | Reviewer edits | Cap | Status |
 |---|---|---|---|
 | Automatic workflow only | 0 | **79** | **What exists today.** Phase 1 has no external route to the gate |
-| Planned bound | 3 (`MAX_REVIEWER_EDITS`) | **88** | **Planned, not built** — arrives with the Phase 2 gate (§21 step 17) |
+| Bounded edits | 3 (`MAX_REVIEWER_EDITS`) | **88** | **Built in step 17.** `refuse_edit()` decides it before the graph runs; the endpoint that calls it is step 18 |
 | Current hop margin at its limit | 4 | 91 | An artefact of `MAX_SUPERVISOR_HOPS` = 24 allowing 4 edits at 1 hop each — **not a design target** |
 
-`total = 1 + 24 + 45 + 3 × (3 + E)`. **91 must not be quoted as the production worst case:** the
-reviewer-edit path is neither bounded nor fully implemented — `reviewer_edit_text` is written by the
-gate and read by nobody (§12, §22 item 3), and no edit counter exists anywhere.
+`total = 1 + 24 + 45 + 3 × (3 + E)`. **91 must not be quoted as the production worst case:** it is
+what an unbounded edit path would reach at the hop guard's limit, and the path is bounded at
+`MAX_REVIEWER_EDITS` = 3, which is the 88 row. The edits are counted from the `reviewer_decision` rows
+in `audit_events`, so the count has one home rather than two (ADR 0006).
 
 **All three exceed `MAX_LLM_CALLS_PER_JOB` = 60, so the budget is the binding guard in every case**
 rather than headroom above a worst case. That is the role gl §5 gives it — the guard that catches
@@ -2461,7 +2549,8 @@ reconciliation** that made its token figures publishable. That run **supplements
 reference baseline and never replaces it; gl §13–§14 maintains both, with the DNS-outage,
 p95-contamination, derived-cost and measurement-override caveats attached.
 
-The next work is Phase 2, starting at step 13.
+Phase 2 followed and is also complete (steps 13–19, closed 2026-08-16). **The next work is Phase 3,
+starting at step 20.**
 
 | # | Step | Depends on | Status · why here |
 |---|---|---|---|
@@ -2485,15 +2574,40 @@ the one place the suggested ordering had to change.
 
 ### Phase 2 — persistence, the gate, and the API
 
+**Phase 2 is complete. All seven steps are done**, steps 13–16 on 2026-08-15 and steps 17–19 on
+2026-08-16.
+
+Steps 13–16 landed as one change: the schema and its migration, the Postgres checkpointer, the writes
+the graph makes as it runs, and the export gate's durable answer. The semantics that step 15 forced a
+decision on — the transaction boundary, what a replayed node does to rows it already wrote, and what a
+failed write does — are recorded in [ADR 0005](adr/0005-graph-time-persistence-semantics.md), along
+with two gaps in this document that they surfaced. **Step 17** implemented
+[ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md) in full, and **step 18** added the five
+routes, API-key authentication, and the two `409` refusals `refuse_edit()` decides.
+
+**A completion audit against the repository closed the phase**, rather than a green suite doing it.
+It found three things and each was fixed: a gate decision whose resume died left the job row and the
+checkpoint disagreeing, and a retry spent one of the reviewer's three edits
+([ADR 0007](adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md)); ADR 0006 decision 8's
+edge cleaning of the reviewer's `edits` and `note` had never been built; and ADR 0005's
+`failure_reason` gap was still undecided a phase after it was recorded
+([ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md)). **Step 19** is
+gl §18's shipping list, and every row on it now has an executing test.
+
+**Two Phase-3 seams stay visible in the route layer** and are marked at their call sites: `POST /jobs`
+records a job without enqueuing one, and a gate decision resumes the graph in-process rather than
+through the queue §12 describes. **Nothing here runs against a real PostgreSQL** — the database tests
+use a temporary SQLite file, and Compose provides the real one at step 22.
+
 | # | Step | Depends on | Why here |
 |---|---|---|---|
-| 13 | **Database layer** — schema, Alembic migrations, queries for jobs / findings / claims / claim_sources / audit | 4, 12 | Schema follows the schemas; writing it earlier means migrating it twice |
-| 14 | **Postgres checkpointer** replaces the in-memory one; `setup()` owns its own tables | 13 | The gate is not resumable without it |
-| 15 | **Persistence integration** — findings, claims, `claim_sources`, and audit events written as the graph runs | 13, 10 | The audit trail must be written *during* the job, not reconstructed after |
-| 16 | **Export gate + export node** — the claim-to-URL check, the write to `jobs.report_json`, and the test that an uncited claim blocks it | 15 | The project's first invariant. It gates everything after it. The S3 write and its bounded retry join this same node in Phase 3 (§8) |
-| 17 | **Human gate** — `interrupt()` before export, the reviewer payload with problems first, approve / reject / edit | 14, 16 | Needs a resumable checkpoint and an export node to gate |
-| 18 | **FastAPI routes + API-key auth on every route** — all five endpoints, two roles, the one error shape | 13, 17 | Auth ships with the routes; the approval endpoint is an authorization decision |
-| 19 | **Phase 2 test set** — every item in gl §18's "must have a test before Phase 2 ships" list | 11, 16, 17, 18 | It is a shipping condition, not a follow-up |
+| 13 | **Database layer** — schema, Alembic migrations, queries for jobs / findings / claims / claim_sources / audit | 4, 12 | **Done.** `database/`. Schema follows the schemas; writing it earlier means migrating it twice |
+| 14 | **Postgres checkpointer** replaces the in-memory one; `setup()` owns its own tables | 13 | **Done.** `graph.build.postgres_checkpointer()`, injected. The gate is not resumable without it |
+| 15 | **Persistence integration** — findings, claims, `claim_sources`, and audit events written as the graph runs | 13, 10 | **Done.** The nodes write through `database/queries.py`; routing is untouched. The audit trail must be written *during* the job, not reconstructed after |
+| 16 | **Export gate + export node** — the claim-to-URL check, the write to `jobs.report_json`, and the test that an uncited claim blocks it | 15 | **Done.** The check itself is unchanged — it is the project's first invariant, and it gates everything after it. The S3 write and its bounded retry join this same node in Phase 3 (§8) |
+| 17 | **Human gate** — `interrupt()` before export, the reviewer payload with problems first, approve / reject / edit | 14, 16 | **Done (2026-08-16).** The payload, `gate_opened`, `awaiting_approval` on the job row, and [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md)'s whole edit path. `refuse_edit()` decides the two edit refusals; the endpoint that returns them is step 18 |
+| 18 | **FastAPI routes + API-key auth on every route** — all five endpoints, two roles, the one error shape | 13, 17 | **Done (2026-08-16).** `routes/api.py`, `routes/auth.py`, `app.py`. `POST /jobs` records but does not enqueue, and the gate decision resumes in-process — both become the worker's in Phase 3 |
+| 19 | **Phase 2 test set** — every item in gl §18's "must have a test before Phase 2 ships" list | 11, 16, 17, 18 | **Done (2026-08-16).** It is a shipping condition, not a follow-up. Every row on that list has an executing test, and the suite additionally covers what Phase 2 added after the list was written — persistence and replay convergence, the reviewer-edit bounds, gate-decision idempotency, status reconciliation, reviewer-text cleaning, and the error envelope on every status code. Still no network calls. **CI is step 23 and depends on this step**, so an unimplemented pipeline does not leave this one open |
 
 ### Phase 3 — async, Redis, containers, CI
 
@@ -2534,13 +2648,15 @@ recorded in §20 and applied in the sections they affect; where a decision made 
 to drift.
 
 **No open question blocks implementation.** One item remains open — exposed by the export-failure
-decision, and needed before Phase 3 — with a second low-stakes reading marked as such. Four further
-items are listed below as **deferred**: one whose design is settled and whose code ships with
-Phase 2; one raised by [ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md)
-whose design is not settled at all; and two raised by the live end-to-end smoke runs of
-2026-08-14/15 — an evaluation gap the reflection rubric does not currently cover, and a retry-policy
-question — both of which wait on evidence rather than on a decision. **Nothing has been silently
-resolved.**
+decision, and needed before Phase 3. **Question 2 is no longer open: it was decided on 2026-08-16 by
+[ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md)**, which also amends question 3's
+mechanism; both are kept below with what was decided, because the code does not implement either
+until step 17. Four further items are listed as **deferred**: one whose design is settled and whose
+code ships with Phase 2; one raised by
+[ADR 0004](adr/0004-no-op-researcher-retries-after-evidence-exhaustion.md) whose design is not settled
+at all; and two raised by the live end-to-end smoke runs of 2026-08-14/15 — an evaluation gap the
+reflection rubric does not currently cover, and a retry-policy question — both of which wait on
+evidence rather than on a decision. **Nothing has been silently resolved.**
 
 ### Decided at architecture review
 
@@ -2594,9 +2710,26 @@ who edits a job that has revisions left.
 
 **Note on what the code does today:** the reflection node applies its normal rules on every pass, so
 an edited draft that scores badly with revisions left would start a cycle rather than returning to the
-gate. Nothing distinguishes the edit path there yet, because the field that would mark it —
+gate — and if that cycle's lowest failing dimension is a research one, the edit silently launches the
+Researcher. Nothing distinguishes the edit path there yet, because the field that would mark it —
 `reviewer_edit_text` — is not read by any node (§12). Both are the same piece of Phase 2 work, and
 this question has to be answered before that work lands, not after.
+
+> **Decided on 2026-08-16 by
+> [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md), accepted.** It takes the "one pass,
+> then back to the gate" reading, closes question 3 in the same change because the two halves cannot
+> ship apart, and adds the scope boundary this question did not have: **an edit is a synthesis
+> operation over the evidence the job already holds, never an implicit research request** — so it may
+> not launch the Researcher, may not start an automatic cycle, may not invent what the evidence does
+> not support, and reports the gap to the reviewer instead. It also settles `MAX_REVIEWER_EDITS` = 3,
+> keeps `MAX_SUPERVISOR_HOPS` at **24** on a corrected ceiling of 23, refuses an edit the live call
+> budget cannot fund **before** the graph runs, and leaves the `report_cites_unknown_findings`
+> grounding guard unchanged on this path.
+>
+> **Built in step 17 on 2026-08-16.** The paragraph above describes what the code did before that,
+> and is kept because the record of what was wrong is the useful part. What remains unbuilt is the
+> pair of `409` refusals: `graph.build.refuse_edit()` decides them, and the endpoint that calls it is
+> step 18.
 
 #### 3. Deferred, not decided: how the reviewer's edit reaches the Synthesizer
 
@@ -2604,6 +2737,13 @@ this question has to be answered before that work lands, not after.
 Synthesizer applies it and clears it in the same pass; the code does neither. This is deferred rather
 than open — the *design* is settled — but it is listed here so it is not mistaken for finished work.
 It ships with §21 step 17, alongside the endpoint that produces the text.
+
+**Amended 2026-08-16 by [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md) and built in
+step 17:** the field is written **and cleared by the gate**, not by the Synthesizer. Reflection reads
+it two nodes later as the marker for "this is an edit pass", which a field the Synthesizer had already
+cleared could not tell it — and question 2's answer is what keeps "applied exactly once" true
+regardless, because exactly one Synthesizer pass sits between one gate visit and the next. **This item
+is closed.**
 
 #### 4. Future enhancement: adaptive Researcher query rewriting after evidence exhaustion
 

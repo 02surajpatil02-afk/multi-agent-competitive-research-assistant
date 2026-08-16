@@ -47,6 +47,7 @@ from fakes import FakeCache, rate_limit_error, server_error
 from harness import (
     Answer,
     FakeLLM,
+    LLMRequest,
     Page,
     RecordedWeb,
     decision,
@@ -215,7 +216,13 @@ def test_the_job_pauses_at_the_gate_before_anything_is_exported(web: RecordedWeb
 
     assert compiled.get_state(settings).next == ("human_gate",)
     assert paused["status"] == "running"
-    assert paused["__interrupt__"][0].value == {"job_id": "job-1"}
+    # The reviewer's payload, built from a real job: six claims, each with the URL it rests
+    # on and the Fact-Checker's quote (ARCHITECTURE.md §12).
+    payload = paused["__interrupt__"][0].value
+    assert payload["job_id"] == "job-1"
+    assert payload["unsupported_claims"] == []
+    assert len(payload["claims"]) == len(paused["report"].claims)
+    assert all(claim["sources"] for claim in payload["claims"])
 
 
 def test_every_finding_carries_the_page_it_was_actually_fetched_from(web: RecordedWeb) -> None:
@@ -619,3 +626,177 @@ def test_a_resumed_job_keeps_the_findings_and_the_report_it_paused_with(
     assert [finding.finding_id for finding in final["findings"]] == before
     assert final["report"] == paused["report"]
     assert str(final["findings"][0].url) in web.fetched
+
+
+# --- The reviewer-edit path (ADR 0006) -----------------------------------------------
+
+
+_EDIT = "Add the missing information about Product B."
+"""One reviewer instruction, reused so the assertions can look for it by identity."""
+
+
+def _edit_script(*, reflection: list[Answer], drafts: int = 2, checks: int = 2) -> FakeLLM:
+    """The clean job, plus what one reviewer edit needs after it.
+
+    An edit costs a Synthesizer pass, the Supervisor hop that follows it, a Fact-Checker
+    pass, and a reflection pass - the 3 logical calls guidelines §13 counts, plus the hop
+    already inside the 24.
+    """
+    return _fake(
+        supervisor=[*_ROUTE_TO_THE_GATE, *[decision("fact_checker")] * (drafts - 1)],
+        synthesizer=[draft(revision) for revision in range(1, drafts + 1)],
+        fact_checker=[verdict_batch(quote=_sentence("1a"))] * checks,
+        reflection=reflection,
+    )
+
+
+def _edit_once(compiled: ResearchGraph) -> ResearchState:
+    """Run to the gate, send one edit, and stop wherever that leaves the job."""
+    settings = run_config("job-1")
+    compiled.invoke(_start(), settings)
+    resumed = compiled.invoke(Command(resume={"decision": "edit", "edits": _EDIT}), settings)
+    return cast(ResearchState, resumed)
+
+
+def test_a_failing_edit_returns_to_the_gate_and_never_reaches_the_researcher(
+    web: RecordedWeb,
+) -> None:
+    # The rule ADR 0006 exists for. The second rubric is the same failing score the
+    # completeness-retry test above uses, so without the edit-path rule this job would route
+    # to the Researcher - re-researching on a reviewer's wording, which the record forbids.
+    fake = _edit_script(
+        reflection=[rubric(), rubric(research_completeness=1, source_correctness=1)]
+    )
+
+    compiled = _graph(fake)
+    paused = _edit_once(compiled)
+
+    assert compiled.get_state(run_config("job-1")).next == ("human_gate",)  # back to the human
+    # Search is the only way to reach a source this job has not read, and the Researcher is
+    # the only caller that searches. Neither moved, and no finding was added - which is what
+    # "the edit worked over existing evidence" means structurally. The pages the Fact-Checker
+    # re-read are the ones the findings already name, so nothing new was reached.
+    assert web.queries == list(_SUBTOPICS)
+    assert fake.roles.count("researcher") == 6  # the initial pass only
+    assert len(paused["findings"]) == 6
+    assert set(web.fetched) == {str(finding.url) for finding in paused["findings"]}
+    assert paused["revision_count"] == 0  # an edit is not a revision
+    assert paused["quality_flag"] == "below_threshold"  # failing, and reported as such
+    assert paused["report"] is not None  # the draft was not invalidated
+    assert fake.unused() == {}
+
+
+def test_an_edited_draft_is_verified_before_it_reaches_the_reviewer(web: RecordedWeb) -> None:
+    # An edited claim is a new claim: it has no verdict, so the Supervisor's existing row
+    # sends the draft through the Fact-Checker like any other (ARCHITECTURE.md §12).
+    fake = _edit_script(reflection=[rubric(), rubric()])
+
+    paused = _edit_once(_graph(fake))
+
+    assert fake.roles[-4:] == ["synthesizer", "supervisor", "fact_checker", "reflection"]
+    # Two drafts, both checked: an edited claim is a new claim and is verified like any other.
+    assert len({verdict.claim_id for verdict in paused["verdicts"]}) == 12
+    assert len(paused["reflection_scores"]) == 2
+
+
+def test_the_reviewer_instruction_reaches_the_synthesizer_exactly_once(
+    web: RecordedWeb,
+) -> None:
+    # The gate is the only writer of the field, so the instruction is visible for exactly one
+    # Synthesizer pass - and the routing rule is what leaves no second pass to re-apply it.
+    fake = _edit_script(reflection=[rubric(), rubric()])
+
+    compiled = _graph(fake)
+    paused = _edit_once(compiled)
+    settings = run_config("job-1")
+    final = compiled.invoke(Command(resume={"decision": "approve"}), settings)
+
+    drafting = fake.requests_for("synthesizer")
+    assert [_EDIT in request.user for request in drafting] == [False, True]
+    assert paused["reviewer_edit_text"] == _EDIT  # still set while the edit is in flight
+    assert final["reviewer_edit_text"] is None  # the approval cleared it
+    assert final["status"] == "approved"
+
+
+def test_a_rejection_clears_the_reviewer_instruction(web: RecordedWeb) -> None:
+    fake = _edit_script(reflection=[rubric(), rubric()])
+    compiled = _graph(fake)
+    _edit_once(compiled)
+
+    final = compiled.invoke(
+        Command(resume={"decision": "reject", "note": "still thin"}), run_config("job-1")
+    )
+
+    assert final["status"] == "rejected"
+    assert final["reviewer_edit_text"] is None
+
+
+def test_an_edit_that_cites_a_finding_the_job_does_not_have_fails_the_job(
+    web: RecordedWeb,
+) -> None:
+    # Grounding is not relaxed for a reviewer (ADR 0006). An instruction the evidence cannot
+    # support must not become an invented citation: the existing guard fails the job, loudly,
+    # rather than exporting a claim that reaches no source.
+    fake = _edit_script(reflection=[rubric()], drafts=2, checks=1)
+    fake._queues["synthesizer"] = [draft(1), _draft_citing_nothing()]
+
+    final = _edit_once(_graph(fake))
+
+    assert final["status"] == "failed"
+    assert final["failure_reason"] == "report_cites_unknown_findings"
+    assert final["report"] is not None  # the previous draft is still there, unexported
+
+
+def test_three_edits_stay_inside_the_hop_guard(web: RecordedWeb) -> None:
+    # ADR 0006's arithmetic, asserted rather than believed: an edit costs exactly +1 hop, so
+    # MAX_REVIEWER_EDITS = 3 puts the ceiling at 20 + 3 = 23, under MAX_SUPERVISOR_HOPS = 24.
+    fake = _edit_script(reflection=[rubric()] * 4, drafts=4, checks=4)
+    compiled = _graph(fake)
+    settings = run_config("job-1")
+    compiled.invoke(_start(), settings)
+    hops = [cast(ResearchState, compiled.get_state(settings).values)["hop_count"]]
+
+    for _ in range(3):
+        state = compiled.invoke(Command(resume={"decision": "edit", "edits": _EDIT}), settings)
+        hops.append(cast(ResearchState, state)["hop_count"])
+
+    final = compiled.invoke(Command(resume={"decision": "approve"}), settings)
+    assert [after - before for before, after in zip(hops[:-1], hops[1:], strict=True)] == [1, 1, 1]
+    assert hops[-1] < 24
+    assert final["status"] == "approved"
+    assert final["revision_count"] == 0  # three edits, no revisions
+
+
+def test_the_call_budget_still_stops_an_edit_that_cannot_afford_itself(
+    web: RecordedWeb,
+) -> None:
+    # `refuse_edit()` keeps an unaffordable edit from starting, and it runs in the endpoint
+    # (step 18). This is the backstop underneath it, unchanged: an edit that starts and runs
+    # out mid-pass still trips the Supervisor's guard rather than quietly producing less.
+    fake = _edit_script(reflection=[rubric(), rubric()])
+
+    final = _edit_once(_graph(fake, MAX_LLM_CALLS_PER_JOB="17"))
+
+    assert final["status"] == "failed"
+    assert final["failure_reason"] == "budget_exceeded"
+
+
+def _draft_citing_nothing() -> Answer:
+    """A draft whose only claim rests on a finding id this job never minted."""
+
+    def answer(_request: LLMRequest) -> str:
+        return json.dumps(
+            {
+                "sections": [{"id": "s1", "heading": "Product B", "body": "Added on request."}],
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "section_id": "s1",
+                        "text": "Product B launched in 2025.",
+                        "finding_ids": ["f99"],
+                    }
+                ],
+            }
+        )
+
+    return answer

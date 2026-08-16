@@ -40,10 +40,36 @@ dependencies = [
     # for days, and resuming from a checkpoint is what stops an approval from re-billing
     # every LLM call already spent (guidelines §4, §10). graph/build.py imports it.
     "langgraph==1.2.11",
+    # The durable side, from Phase 2 (implementation steps 13-16).
+    #
+    # Core only - tables and statements, no ORM. Nothing here needs an identity map or lazy
+    # loading, and it is what gives the five tables one definition that both PostgreSQL and
+    # the offline SQLite test suite run (database/schema.py).
+    "sqlalchemy==2.0.52",
+    # Migrations. It earns its place by tracking which migrations have run and in what
+    # order - the two things a hand-rolled .sql runner gets wrong first, and the two that
+    # are painful to discover against a live database (guidelines §19).
+    "alembic==1.19.1",
+    # The PostgreSQL driver, and the connection pool the checkpointer holds. `psycopg[binary]`
+    # rather than a source build so the container image needs no compiler.
+    "psycopg[binary,pool]==3.3.4",
+    # The Postgres checkpointer itself. The human gate can hold a job for days and in-memory
+    # state dies with the worker, which would mean re-billing every LLM call already spent
+    # (guidelines §4, §10). It owns its own tables through setup(); Alembic never touches
+    # them (guidelines §19). graph/build.py imports it.
+    "langgraph-checkpoint-postgres==3.1.2",
+    # The API (implementation step 18). Typed request and response models on the outermost
+    # boundary, which is the same treatment every internal boundary already gets - and the
+    # dependency system is what keeps authentication one thing rather than a check repeated
+    # in five handlers (guidelines §12, §16).
+    "fastapi==0.141.1",
+    # The server behind `uvicorn app:app --reload` (CLAUDE.md commands). Nothing imports it;
+    # it is how the application is run, in development and in the API container.
+    "uvicorn[standard]==0.52.3",
 ]
 
 # Deliberately absent until something imports them:
-#   fastapi, sqlalchemy, alembic, boto3, redis - Phase 2 and Phase 3.
+#   boto3, redis - Phase 3, and Secrets Manager in Phase 5.
 #
 # langchain-core arrives transitively under langgraph and is imported directly in exactly
 # one place, for the RunnableConfig type that graph/build.run_config() returns. It is not
@@ -64,8 +90,8 @@ build-backend = "setuptools.build_meta"
 # `python -m eval.run` all run from here (CLAUDE.md commands). Listed explicitly because
 # the layout is flat, so setuptools cannot auto-discover it.
 [tool.setuptools]
-py-modules = ["config", "schemas", "llm_client"]
-packages = ["agents", "graph", "tools"]
+py-modules = ["app", "config", "schemas", "llm_client"]
+packages = ["agents", "database", "graph", "routes", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

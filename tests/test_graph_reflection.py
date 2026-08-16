@@ -684,6 +684,49 @@ def test_hitting_the_cap_is_a_visible_outcome_not_a_silent_pass() -> None:
     assert update["reflection_scores"][0].route == "human_gate"
 
 
+def test_an_edited_draft_goes_back_to_the_reviewer_however_it_scores() -> None:
+    # ADR 0006. The reviewer asked for one thing and gets the result of it, scored - not an
+    # open-ended rework of a draft they never saw. The score that would otherwise route to
+    # the Researcher is the one that matters here: a reviewer's wording must not become
+    # research.
+    llm, _ = _llm(_failing("research_completeness"))
+
+    route, update = reflect(
+        _state(reviewer_edit_text="Add the missing information about Product B."),
+        config=_config(),
+        llm=llm,
+    )
+
+    assert route == "human_gate"
+    assert "revision_count" not in update  # an edit is not a revision
+    assert "report" not in update  # the draft is not invalidated
+    assert "subtopic_status" not in update  # nothing returns to `pending`
+    assert update["quality_flag"] == "below_threshold"
+    assert update["reflection_scores"][0].route == "human_gate"
+
+
+def test_an_edited_draft_that_passes_reaches_the_gate_unflagged() -> None:
+    llm, _ = _llm(_rubric())
+
+    route, update = reflect(
+        _state(reviewer_edit_text="Tighten section two."), config=_config(), llm=llm
+    )
+
+    assert route == "human_gate"
+    assert update["quality_flag"] is None
+
+
+def test_a_draft_with_no_edit_in_flight_still_routes_to_a_specialist() -> None:
+    # The edit rule is a carve-out for one path, not a change to the routing table: the same
+    # failing score on an ordinary pass still starts the cycle it always did.
+    llm, _ = _llm(_failing("research_completeness"))
+
+    route, update = reflect(_state(), config=_config(), llm=llm)
+
+    assert route == "researcher"
+    assert update["revision_count"] == 1
+
+
 def test_the_cap_comes_from_config() -> None:
     llm, _ = _llm(_failing("report_quality"))
 

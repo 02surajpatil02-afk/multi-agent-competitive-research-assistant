@@ -7,9 +7,12 @@ strategy"* — and five agents plan the research, search the web, write a report
 claim against its sources. A human approves the report before it is exported. Every claim in the
 exported report traces back to a URL.
 
-> **Status: Phase 1 is complete — core on 2026-08-13, production-hardening pass on 2026-08-15.** The
-> graph runs locally, end to end, in memory — five agents, the reflection node, the tool boundary, the
-> LLM client, in-memory checkpointing, and a test suite that makes no network calls.
+> **Status: Phases 1 and 2 are complete.** Phase 1 core on 2026-08-13 and its production-hardening
+> pass on 2026-08-15; **Phase 2 on 2026-08-16**. Phase 3 onwards is not built.
+>
+> **Phase 1** put the graph on its feet locally, end to end, in memory — five agents, the reflection
+> node, the tool boundary, the LLM client, in-memory checkpointing, and a test suite that makes no
+> network calls.
 >
 > **The hardening pass is closed. Four changes, each implemented, tested offline, and verified against
 > real jobs:**
@@ -30,8 +33,33 @@ exported report traces back to a URL.
 > calls to 544 token-bearing spans. Both runs are maintained in `docs/engineering-guidelines.md`
 > §13–§14, and both are measurements rather than estimates.
 >
-> **Phase 2 onwards is not built:** no API, no database, no worker, no Redis, no S3, no AWS, no eval
-> set. **Tracing is the one partial exception** — see the stack table below.
+> **Phase 2 closed on 2026-08-16**, its seven steps verified against the repository by a completion
+> audit rather than declared from a green suite. What it added:
+>
+> | Capability | Steps · record |
+> |---|---|
+> | Five application tables — `jobs`, `findings`, `claims`, `claim_sources`, `audit_events` — with an Alembic migration, and a test that fails if the migration and `database/schema.py` ever drift | 13 |
+> | The **Postgres checkpointer**, so a job survives a restart and an approval two days later costs only the export | 14 |
+> | The audit trail written **while the job runs**, one transaction per node event, keyed so a replayed node converges, loud on failure | 15 · [ADR 0005](docs/adr/0005-graph-time-persistence-semantics.md) |
+> | The export gate's durable answer — the approved body in `jobs.report_json`, `exported_at` stamped in the same transaction | 16 |
+> | The **reviewer-edit path**: one Synthesizer pass over existing evidence, back to the gate, never research, bounded at 3 edits and refused when the live budget cannot fund it | 17 · [ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md) |
+> | **Five FastAPI routes with API-key authentication** on all but `/health`, two roles, one error envelope, and server-derived idempotency on `POST /jobs` | 18 |
+> | **One decision per gate visit** — keyed `(job_id, calls_used)`, a same-decision retry that continues the graph, `409 gate_already_decided` for a different one, and `jobs.status` reconciled from the checkpoint even when a resume dies | 18 · [ADR 0007](docs/adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md) |
+> | The Phase 2 test set — every item on `docs/engineering-guidelines.md` §18's shipping list, still with **no network calls** | 19 |
+>
+> **Invariant 7 is now satisfied rather than promised:** the gate is authenticated, and every decision
+> carries the `user_id` its API key maps to.
+>
+> **Both durable stores stay injected and optional.** With neither, the graph behaves exactly as Phase
+> 1 did — which is what the offline suite and `scripts/measure_jobs.py` still run on.
+>
+> **Phase 3 onwards is not built:** no worker, no queue, no Redis, no S3, no AWS, no CI, no eval set.
+> Four Phase-2-adjacent items are **deliberately deferred and recorded**, not forgotten — the
+> real-PostgreSQL integration test (Phase 3, with Compose), gate expiry (Phase 5 sweep), Secrets
+> Manager (Phase 5), and a failed job's durable `failure_reason`
+> ([ADR 0008](docs/adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md): it lives in
+> the checkpoint until Phase 3 gives it a row).
+> **Tracing is the one partial exception** — see the stack table below.
 >
 > **Neither baseline is a production-default benchmark.** Both runs used the NIM development overrides
 > in `.env` — `MAX_REVISIONS=3`, `MAX_SUPERVISOR_HOPS=30`, `LLM_MAIN_TIMEOUT_S=180`,
@@ -201,9 +229,14 @@ A row that cannot name the requirement it serves gets deleted.
 | Migrations | Alembic | Tracks which migrations ran, and in what order |
 | CI/CD | GitHub Actions | Enforces the eval gate that §15 asks for |
 
-**Built so far:** the LLM row, the agent framework row, the web-search row, and the testing row — plus
-**part of the AI-observability row**, which is the one entry that is neither fully built nor untouched.
-Every other row is Phase 2 or later and has no code behind it yet.
+**Built so far:** the LLM row, the agent framework row, the web-search row, the testing row, the
+**persistent-data row and the migrations row** (`database/`, steps 13–16, 2026-08-15), the **API row**
+and the **auth row** (`routes/`, `app.py`, step 18, 2026-08-16), plus **part of the AI-observability
+row**, which is the one entry that is neither fully built nor untouched. PostgreSQL now holds `jobs`,
+`findings`, `claims`, `claim_sources`, and `audit_events`, and LangGraph's checkpointer owns its own
+tables beside them. **Every remaining row is Phase 3 or later and has no code behind it yet** — async
+jobs, short-term state, artifacts, containers, compute, API entry, infra observability, evaluation,
+and CI/CD.
 
 **What "partially built" means for tracing, stated precisely, because the two halves ship in different
 phases.**
@@ -279,8 +312,12 @@ tests/           pytest suite, plus harness.py — FakeLLM and the recorded web.
 docs/            ARCHITECTURE.md, adr/. Built. engineering-guidelines.md and interview-prep.md
                  exist locally but are gitignored — not published in this repository
 
-database/        schema, Alembic migrations, queries for jobs / findings / claims / audit — Phase 2
-routes/          FastAPI endpoints — submit job, poll status, approve, fetch report, health — Phase 2
+database/        schema.py the five tables, queries.py the statements, migrations/ Alembic.
+                 Built (steps 13-16). The checkpointer is in graph/build.py, next to the
+                 in-memory one it replaces
+app.py           the API entrypoint - `uvicorn app:app`. Built (step 18)
+routes/          api.py the five endpoints, auth.py the API keys and the two roles.
+                 Built (step 18)
 eval/            dataset, evaluators, run script — Phase 4
 observability/   LangSmith tracing setup, structured logging — Phase 4
 .github/         workflows — lint, types, tests, image build, conditional eval gate — Phase 3
@@ -308,8 +345,20 @@ python scripts/measure_jobs.py --summary
 ruff check . && ruff format --check . && mypy --strict .
 ```
 
+```bash
+alembic upgrade head
+```
+
 `pytest` is the whole suite, and it makes **no network calls** — the LLM, Tavily, and DNS are all
-replaced by the test harness, so it needs no credentials and no running service.
+replaced by the test harness, so it needs no credentials and no running service. **That includes the
+database tests:** they run the real migration and the real statements against a temporary SQLite file,
+which proves the columns, keys, foreign keys, CHECK constraints, and indexes, and proves nothing
+PostgreSQL-specific. Verifying those needs a PostgreSQL, which Compose provides in Phase 3.
+
+`alembic upgrade head` applies the migrations in `database/migrations/`. It reads `DATABASE_URL` — the
+ordinary libpq string, `postgresql://user:pw@host/db` — and nothing else, so a migration does not need
+an LLM key. In deployment it runs as its own task and must exit 0 **before** the new service revision
+starts (`docs/engineering-guidelines.md` §19).
 
 `check_model.py` is the preflight: it confirms the configured endpoint answers, supports tool
 calling and JSON mode, and reports the observed rate limit. It needs real `LLM_*` credentials. Run it
@@ -327,10 +376,18 @@ text and report bodies, and only the summary table is published.
 
 The lint, format, and type commands are what CI will run once CI exists in Phase 3.
 
-These do **not** run yet — there is no app, no worker, no compose file, and no eval set:
+```bash
+uvicorn app:app --reload
+```
+
+`uvicorn app:app` serves the five routes in `routes/api.py`. It needs `DATABASE_URL`, `AUTH_KEYS`, and
+the `LLM_*` credentials, because the API resumes the graph at the gate itself until the Phase 3 worker
+takes that over. **No job runs on its own yet:** `POST /jobs` records the job, and nothing dequeues it
+until Phase 3.
+
+These do **not** run yet — there is no worker, no compose file, and no eval set:
 
 ```text
-uvicorn app:app --reload    # Phase 2
 docker compose up -d        # Phase 3
 python -m worker            # Phase 3
 python -m eval.run          # Phase 4
@@ -358,14 +415,16 @@ python -m eval.run          # Phase 4
 | `LANGSMITH_API_KEY` | LangSmith credential | *(required when tracing)* |
 | `LANGSMITH_PROJECT` | Trace project name | `competitive-research` |
 | `MAX_REVISIONS` | Reflection loop retry cap | `2` |
-| `MAX_SUPERVISOR_HOPS` | Routing loop guard. 20 is the derived legitimate maximum; +4 is temporary margin for the unbounded reviewer-edit path | `24` |
+| `MAX_SUPERVISOR_HOPS` | Routing loop guard. 20 is the automatic workflow's derived maximum; a reviewer edit legitimately costs +1 hop, so the bound of 3 edits accepted in [ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md) puts the ceiling at 23. **24 stays**, as the ceiling plus one | `24` |
 | `MAX_LLM_CALLS_PER_JOB` | Per-job call budget | `60` |
+| `MAX_REVIEWER_EDITS` | How many times a reviewer may send one job back for an edit ([ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md)). Each edit costs 3 calls and 1 hop. Enforced at `POST /jobs/{id}/approve` **before the graph is resumed**, so a refused edit spends nothing; counted from the audit trail, so a retried decision cannot spend one ([ADR 0007](docs/adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md)) | `3` |
 | `MAX_JOB_RUNTIME` | Whole-job runtime bound, seconds. **Configured only — nothing enforces it until the Phase 3 worker** | `1200` |
 | `REFLECTION_PASS_THRESHOLD` | Weighted score needed to pass | `3.5` |
 | `MAX_FETCH_BYTES` | Response cap on a page fetch | `2097152` (2 MB) |
 | `MAX_PAGE_CHARS` | Cleaned text kept per page, ≈6k tokens | `24000` |
 | `RESEARCHER_CONCURRENCY` | How many of one subtopic's page extractions run at once ([ADR 0002](docs/adr/0002-concurrent-page-extraction-in-the-researcher.md)). Refused outside 1–3 at startup. `1` restores sequential extraction | `3` |
-| `AUTH_KEYS_SECRET_ID` | Secrets Manager id holding hashed API keys and their roles | *(required from Phase 2)* |
+| `AUTH_KEYS_SECRET_ID` | Secrets Manager id holding hashed API keys and their roles. **Read from Phase 5**; the same payload comes from `AUTH_KEYS` before then | *(required from Phase 5)* |
+| `AUTH_KEYS` | The hashed API keys themselves, as JSON: `{"<sha256 of the key>": {"user_id", "role"}}`. Secrets are environment variables locally and Secrets Manager in AWS (`docs/engineering-guidelines.md` §16) | *(required from Phase 2)* |
 | `RETENTION_DAYS` | How long jobs, findings, and audit rows are kept | `365` |
 | `APP_ENV` | `local` \| `dev` \| `prod` | `local` |
 | `LOG_LEVEL` | Log verbosity | `INFO` |
@@ -405,7 +464,7 @@ These are the non-negotiables. If a change breaks one, the change is wrong.
 |---|---|---|
 | 0 | Documentation — this file, engineering guidelines, architecture | **Done** |
 | 1 | Local graph: 5 agents + the reflection node, tool boundary, LLM client, in-memory state, no persistence | **Done.** Core on **2026-08-13** — twelve steps, plus the human-gate and export nodes, the test suite, and the 20-job reference baseline. **Production-hardening pass on 2026-08-15** — ADR 0002, ADR 0003, ADR 0004, the shared-`LLMClient` fix, the post-hardening n=20 run of 2026-08-14, and the LangSmith token reconciliation. Both are in the status block above |
-| 2 | Postgres checkpointer, Alembic migrations, audit tables, the gate's **API side** — `POST /jobs/{id}/approve`, the reviewer payload, expiry — FastAPI routes, **API-key auth on every route except `/health`** | Planned |
+| 2 | Postgres checkpointer, Alembic migrations, audit tables, the gate's **API side** — `POST /jobs/{id}/approve`, the reviewer payload, expiry — FastAPI routes, **API-key auth on every route except `/health`** | **Done, 2026-08-16.** Steps 13–16 on **2026-08-15** ([ADR 0005](docs/adr/0005-graph-time-persistence-semantics.md)); steps 17–19 on **2026-08-16** — the reviewer-edit path ([ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md)), the five routes with API-key auth, gate-decision idempotency ([ADR 0007](docs/adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md)), and the §18 test set. Closed by a completion audit against the repository, which found and fixed two blockers: reviewer-text edge cleaning (ADR 0006 decision 8) and the undecided `failure_reason` ([ADR 0008](docs/adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md)). **Gate expiry is the one listed item deliberately not built** — it waits for the Phase 5 sweep |
 | 3 | Docker Compose (Postgres 16, Redis 7, LocalStack for SQS + S3), async worker, **CI: lint, types, tests, image build** | Planned |
 | 4 | LangSmith tracing, eval dataset of 30–50 questions, eval as a release gate | Planned |
 | 5 | AWS: ECS Fargate, RDS, ElastiCache, real SQS + S3, API Gateway, CloudWatch alarms, **Cognito JWT** | Planned |
@@ -414,21 +473,20 @@ These are the non-negotiables. If a change breaks one, the change is wrong.
 change rather than a migration. The **human gate is API-only** in Phase 2 —
 `POST /jobs/{id}/approve`, no web UI.
 
-**What "Phase 1 done" does and does not mean.** The graph node that pauses for a reviewer exists and
-works: `interrupt()` holds the job, and a resume decision routes approve → export, reject → finalize,
-edit → one Synthesizer pass. What Phase 2 adds is everything around it — the authenticated endpoint,
-the identity on the decision, the durable checkpoint that lets a job survive a restart, and the audit
-row. Until then the gate is real control flow with nothing outside the process able to reach it, and
-`invariant 7` is a requirement Phase 2 has to satisfy rather than one the code satisfies today.
+**What Phase 2 added to the gate, and what it still does not do.** Phase 1 built the graph node that
+pauses for a reviewer: `interrupt()` holds the job, and a resume decision routes approve → export,
+reject → finalize, edit → one Synthesizer pass. Phase 2 built everything around it — the authenticated
+endpoint, the identity on every decision, the durable checkpoint that lets a job survive a restart, the
+audit rows, and one decision per gate visit. **`invariant 7` is satisfied by the code now, not by a
+plan.** What the gate still does not have is expiry: a job can wait at it indefinitely, because the
+7-day sweep is Phase 5's (step 32).
 
 **Known gaps carried forward, so they are not rediscovered as bugs:**
 
-- **`reviewer_edit_text` is written but never consumed.** The gate sets it on an `edit` decision, and
-  the state contract says the next Synthesizer pass consumes it and clears it. The Synthesizer does
-  neither today — it does not read the field, and `SynthesizerUpdate` has no such key. The reviewer's
-  text therefore reaches state and does not reach the prompt. It belongs with the gate's Phase 2 work.
-- **Whether reflection may start a cycle on the reviewer-`edit` path** is decided in
-  `docs/ARCHITECTURE.md` §12 and recorded as low-stakes-open in its §22.
+- **Nothing runs a job on its own yet.** `POST /jobs` writes the row and returns `202`; the queue and
+  the worker that would pick it up are Phase 3 (step 20). Until then a job is started by whatever
+  process holds the graph, and the API resumes it at the gate in-process rather than enqueuing a
+  resume message as `docs/ARCHITECTURE.md` §12 describes.
 - **The reflection rubric is uncalibrated.** Until the hand-scoring pass in Phase 4 runs, the pass
   threshold is a reasonable heuristic, not a measured one.
 - **Traces recorded before 2026-08-14 carry inflated token totals.** `scripts/measure_jobs.py` built
@@ -476,8 +534,8 @@ out in `docs/ARCHITECTURE.md` §22 item 4 and in ADR 0004's own future-work sect
 | How is state designed and persisted? | `docs/engineering-guidelines.md` §4 |
 | How do we defend against prompt injection, and what is the honest claim? | `docs/engineering-guidelines.md` §8 |
 | How is the system tested, and what is the FakeLLM? | `docs/engineering-guidelines.md` §18 |
-| What are the API endpoints and their contracts? | `docs/engineering-guidelines.md` §12 — planned |
-| Who is allowed to call what, and who may approve? | `docs/engineering-guidelines.md` §16 — planned |
+| What are the API endpoints and their contracts? | `docs/engineering-guidelines.md` §12 |
+| Who is allowed to call what, and who may approve? | `docs/engineering-guidelines.md` §16 |
 | How is research quality measured? | `docs/engineering-guidelines.md` §15 — planned |
 | How does a change get built, migrated, deployed, or rolled back? | `docs/engineering-guidelines.md` §19 — planned |
 | Why was a decision made this way? | `docs/ARCHITECTURE.md` §20 for decisions settled before implementation; `docs/adr/` for the ones taken since |
