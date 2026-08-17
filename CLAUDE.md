@@ -7,8 +7,10 @@ strategy"* — and five agents plan the research, search the web, write a report
 claim against its sources. A human approves the report before it is exported. Every claim in the
 exported report traces back to a URL.
 
-> **Status: Phases 1 and 2 are complete.** Phase 1 core on 2026-08-13 and its production-hardening
-> pass on 2026-08-15; **Phase 2 on 2026-08-16**. Phase 3 onwards is not built.
+> **Status: Phases 1 and 2 are complete, and Phase 3 is three stages in.** Phase 1 core on
+> 2026-08-13 and its production-hardening pass on 2026-08-15; **Phase 2 on 2026-08-16**; Phase 3
+> stages 1, 2 and 3 on **2026-08-17** — the local infrastructure, the queue and the worker, and
+> Redis. Steps 22 (the application image and S3) and 23 (CI) are not built.
 >
 > **Phase 1** put the graph on its feet locally, end to end, in memory — five agents, the reflection
 > node, the tool boundary, the LLM client, in-memory checkpointing, and a test suite that makes no
@@ -53,10 +55,52 @@ exported report traces back to a URL.
 > **Both durable stores stay injected and optional.** With neither, the graph behaves exactly as Phase
 > 1 did — which is what the offline suite and `scripts/measure_jobs.py` still run on.
 >
-> **Phase 3 onwards is not built:** no worker, no queue, no Redis, no S3, no AWS, no CI, no eval set.
-> Four Phase-2-adjacent items are **deliberately deferred and recorded**, not forgotten — the
-> real-PostgreSQL integration test (Phase 3, with Compose), gate expiry (Phase 5 sweep), Secrets
-> Manager (Phase 5), and a failed job's durable `failure_reason`
+> **Phase 3 is under way, and three of its stages are built.**
+>
+> **Stage 1 — the local infrastructure and the real-PostgreSQL verification** (2026-08-17).
+> `docker-compose.yml` starts PostgreSQL 16, Redis 7, and LocalStack for SQS and S3, and the
+> `postgres`-marked tests run the migration, every Phase 2 gate statement, two reviewers claiming one
+> gate at the same instant, and `PostgresSaver` across a real process restart.
+>
+> **Stage 2 — the queue and the worker** (2026-08-17). A job now runs on its own:
+>
+> | Capability | Record |
+> |---|---|
+> | `jobqueue.py`, the one place that talks to SQS: a **pointer message of three identifiers**, FIFO with `MessageGroupId = job_id`, and a deduplication id that is the job's idempotency key or ADR 0007's gate-visit key | [ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decisions 3 and 4 |
+> | `jobs.status` gains **`queued`**, written by `POST /jobs`; the worker is the only thing that moves it to `running`. Migration `rev_0002` widens the CHECK, verified against real PostgreSQL 16 | decisions 1 and 2 |
+> | `worker.py` — `python -m worker`. It discriminates **start, resume and continue from the checkpoint** rather than from the message, bounds one invocation by `MAX_JOB_RUNTIME`, deletes a message on exactly three outcomes, and finishes the message it is holding on SIGTERM | decisions 5, 6, 7, 9 |
+> | **The API no longer resumes the graph.** A gate decision records, claims, enqueues, and answers `200 {status: "running"}`; the worker reads the decision out of `audit_events` keyed by the visit, so the reviewer's own words never reach the queue | [ADR 0011](docs/adr/0011-the-human-gate-resume-moves-to-the-worker.md) |
+> | **The API constructs no graph and no `LLMClient`**, and starts with no LLM or Tavily credential in its environment at all | [ADR 0012](docs/adr/0012-the-api-stops-holding-a-compiled-graph.md) |
+> | A third test layer, marked `integration`: real LocalStack SQS, real FIFO groups, real deduplication, real redelivery, and a real dead-letter queue | `tests/test_queue_localstack.py` |
+>
+> **Stage 3 — Redis** (2026-08-17, step 21). The last of the four stores is wired:
+>
+> | Capability | Failure policy | Record |
+> |---|---|---|
+> | `cache:search:{hash}` and `cache:fetch:{hash}`, 24h, keyed by argument hash | **Fail open** — a miss costs one call, bounded by `MAX_LLM_CALLS_PER_JOB` | guidelines §7, §11 |
+> | `job:{id}:urls`, 6h — the per-job URL set that survives a process, so a redelivered message does not re-fetch what a dead invocation already read | **Fail open** — one wasted fetch and a duplicate finding | guidelines §7, §11 |
+> | `ratelimit:llm` — one sliding 60s window across **every** worker, taken before every request attempt | **FAIL CLOSED** — no token, no LLM call; the node fails with `rate_limiter_unavailable` after guidelines §17's two retries | guidelines §11, §17, ARCHITECTURE.md §20 row 29 |
+> | `/health` reports `checks.redis`, and a deployment that cannot reach Redis is `degraded` | — | guidelines §12 |
+>
+> `redisstore.py` is the one place that talks to Redis, the way `jobqueue.py` is the one place
+> that talks to SQS. The limiter is one Lua script rather than three commands, because the race
+> it closes is between *processes*: a read-then-write across two round trips is exactly how two
+> workers each politely limiting themselves to 40 requests per minute produce 80.
+>
+> **Nothing consumes S3 yet**, and there is no application image, no CI, no AWS, and no eval
+> set. Steps 22 and 23 stay open.
+>
+> **Two implementation defects were found by the Stage 2 tests and fixed, both in `worker.py`.** A
+> redelivered start message for a job waiting at the gate wrote `running` over `awaiting_approval` and
+> never put it back, which left the gate unanswerable — ADR 0007 invariant 4 broken in the one
+> direction nothing recovers from. And ADR 0010 decisions 7 and 9 describe finalising a job as
+> `update_state` then `invoke(None)`; measured, that runs one more node on the timeout path and
+> reaches `finalize` on neither, so the worker writes the terminal row itself. Both are recorded in
+> the code where the correction lives.
+>
+> That closes the first of four Phase-2-adjacent items which were **deliberately deferred and
+> recorded** rather than forgotten. Three remain: gate expiry (Phase 5 sweep), Secrets Manager
+> (Phase 5), and a failed job's durable `failure_reason`
 > ([ADR 0008](docs/adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md): it lives in
 > the checkpoint until Phase 3 gives it a row).
 > **Tracing is the one partial exception** — see the stack table below.
@@ -214,8 +258,8 @@ A row that cannot name the requirement it serves gets deleted.
 | Tool protocol | MCP | External research tools behind one interface |
 | Web search | Tavily, behind the tool boundary | Returns cleaned page content **and** the URL — the audit trail needs both |
 | API | FastAPI | Backend |
-| Async jobs | SQS | Research runs for minutes; a request cannot hold the connection |
-| Short-term state | Redis / ElastiCache | Cache, URL dedupe, rate limiting |
+| Async jobs | SQS, FIFO with `MessageGroupId = job_id` | Research runs for minutes; a request cannot hold the connection. FIFO is load-bearing rather than a preference: it is what keeps one job to one writer ([ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 4) |
+| Short-term state | Redis / ElastiCache | Cache, URL dedupe, and the **shared** rate limiter — the one that has to be shared, because two workers limiting themselves separately do not limit the tier |
 | Persistent data | PostgreSQL / RDS | Facts and the audit trail |
 | Artifacts | S3 | Exported reports |
 | Containers | Docker + ECR | Packaging |
@@ -231,12 +275,20 @@ A row that cannot name the requirement it serves gets deleted.
 
 **Built so far:** the LLM row, the agent framework row, the web-search row, the testing row, the
 **persistent-data row and the migrations row** (`database/`, steps 13–16, 2026-08-15), the **API row**
-and the **auth row** (`routes/`, `app.py`, step 18, 2026-08-16), plus **part of the AI-observability
-row**, which is the one entry that is neither fully built nor untouched. PostgreSQL now holds `jobs`,
-`findings`, `claims`, `claim_sources`, and `audit_events`, and LangGraph's checkpointer owns its own
-tables beside them. **Every remaining row is Phase 3 or later and has no code behind it yet** — async
-jobs, short-term state, artifacts, containers, compute, API entry, infra observability, evaluation,
-and CI/CD.
+and the **auth row** (`routes/`, `app.py`, step 18, 2026-08-16), the **async-jobs row**
+(`jobqueue.py`, `worker.py`, Phase 3 stage 2, 2026-08-17), the **short-term-state row**
+(`redisstore.py`, Phase 3 stage 3, 2026-08-17), plus **part of the AI-observability row**, which is
+the one entry that is neither fully built nor untouched. PostgreSQL now holds `jobs`, `findings`,
+`claims`, `claim_sources`, and `audit_events`, and LangGraph's checkpointer owns its own tables
+beside them; SQS holds one pointer message per job start and per reviewer decision; Redis holds two
+caches, a per-job URL set and the shared rate limiter. **Every remaining row is Phase 3 or later and
+has no code behind it yet** — artifacts, containers, compute, API entry, infra observability,
+evaluation, and CI/CD.
+
+**The async-jobs row is built against LocalStack, not against AWS.** `jobqueue.build_queue()` takes an
+`endpoint_url` and that is the only difference between the two, which is what makes the
+`integration`-marked tests worth running — but a real queue, a real IAM policy and a real DLQ alarm are
+Phase 5's, and nothing here has met them.
 
 **What "partially built" means for tracing, stated precisely, because the two halves ship in different
 phases.**
@@ -286,10 +338,17 @@ requirements, not polish. Details in `docs/engineering-guidelines.md` §13.
 **A job now holds more than one request open.** Since
 [ADR 0002](docs/adr/0002-concurrent-page-extraction-in-the-researcher.md) a subtopic's page
 extractions run concurrently, so a job can have up to `RESEARCHER_CONCURRENCY` (3) requests in
-flight. Everything else stays sequential — nodes run one at a time, one subtopic per Researcher
-visit, one job at a time. **The shared rate limiter does not exist yet** (it arrives with Redis in
-Phase 3), so that setting is currently the only bound on in-job concurrency, and two concurrent jobs
-against the development tier is the combination to avoid.
+flight. Everything else stays sequential *within* a job — nodes run one at a time, one subtopic per
+Researcher visit — and one worker takes one message at a time.
+
+**What Phase 3 stage 2 changed is that "one job at a time" is no longer a property of the system.**
+FIFO message groups guarantee one *worker* per job, not one job per deployment: run two workers and
+two jobs run at once, each with up to three requests in flight.
+
+**Stage 3 is what makes that safe.** The shared `ratelimit:llm` bucket is one sliding 60s window
+across every worker, and a token is taken before **every request attempt** — retries included,
+because a retried request is a real request against the same tier. So `LLM_RPM_LIMIT` now bounds the
+deployment rather than each process, and it fails closed: no token, no LLM call.
 
 ---
 
@@ -308,16 +367,38 @@ tools/           search (Tavily), fetch, argument validation, the untrusted-cont
                  the failure vocabulary and cache interfaces. Built — in-process, not MCP
 scripts/         check_model.py the preflight; measure_jobs.py the real-job measurement
                  harness. Both built
-tests/           pytest suite, plus harness.py — FakeLLM and the recorded web. Built
+tests/           pytest suite, plus harness.py — FakeLLM and the recorded web — dbharness.py and
+                 pgharness.py for the two database layers, and fakes.py, whose FakeQueue is the
+                 offline stand-in for SQS. Built
 docs/            ARCHITECTURE.md, adr/. Built. engineering-guidelines.md and interview-prep.md
                  exist locally but are gitignored — not published in this repository
 
 database/        schema.py the five tables, queries.py the statements, migrations/ Alembic.
                  Built (steps 13-16). The checkpointer is in graph/build.py, next to the
                  in-memory one it replaces
-app.py           the API entrypoint - `uvicorn app:app`. Built (step 18)
-routes/          api.py the five endpoints, auth.py the API keys and the two roles.
-                 Built (step 18)
+app.py           the API entrypoint - `uvicorn app:app`. Built (step 18). Since ADR 0012 it
+                 builds no graph and no LLM client: a config, an engine, a checkpoint
+                 *reader*, a queue, and the key table
+routes/          api.py the six endpoints, auth.py the API keys and the two roles.
+                 Built (step 18; the gate view added by ADR 0013)
+
+jobqueue.py      the one place that talks to SQS — the pointer message, the FIFO attributes,
+                 send, receive, delete, and the queue's own attributes. Built (Phase 3 stage 2).
+                 Nothing else imports boto3
+redisstore.py    the one place that talks to Redis — the two caches, the per-job URL set, and
+                 the shared rate limiter. Built (Phase 3 stage 3). Two failure policies in one
+                 file: the caches and the URL set fail open, the limiter fails closed. Nothing
+                 else imports redis
+worker.py        the job runner - `python -m worker`. Long-polls, discriminates start from
+                 resume from continue using the checkpoint, invokes the graph, and
+                 acknowledges. Built (Phase 3 stage 2). The only process that builds an
+                 LLMClient or executes a node
+
+docker-compose.yml   Postgres 16, Redis 7, LocalStack for SQS and S3. Built (Phase 3 stage 1).
+                 Infrastructure only — there is no application image, and step 22 is not closed
+docker/          the two bootstrap scripts Compose mounts: the test database, and the queue,
+                 its DLQ and the bucket. Built (Phase 3 stage 1)
+
 eval/            dataset, evaluators, run script — Phase 4
 observability/   LangSmith tracing setup, structured logging — Phase 4
 .github/         workflows — lint, types, tests, image build, conditional eval gate — Phase 3
@@ -353,7 +434,50 @@ alembic upgrade head
 replaced by the test harness, so it needs no credentials and no running service. **That includes the
 database tests:** they run the real migration and the real statements against a temporary SQLite file,
 which proves the columns, keys, foreign keys, CHECK constraints, and indexes, and proves nothing
-PostgreSQL-specific. Verifying those needs a PostgreSQL, which Compose provides in Phase 3.
+PostgreSQL-specific.
+
+**Since Phase 3 stage 1 there is a second layer that does.** The tests marked `postgres` run the same
+migration and the same statements against the real PostgreSQL 16 in `docker-compose.yml`, plus the
+things only a server can decide: JSONB, `timestamptz`, the statement timeout, two reviewers claiming
+one gate at the same instant, and `PostgresSaver` across a process restart. They **skip** unless
+`TEST_DATABASE_URL` is set, which is what keeps plain `pytest` offline:
+
+```bash
+docker compose up -d --wait
+```
+
+```bash
+TEST_DATABASE_URL=postgresql://research:research@localhost:5432/research_test pytest -m postgres
+```
+
+In PowerShell the variable is set first: `$env:TEST_DATABASE_URL = "..."` then `pytest -m postgres`.
+`pytest -m "not postgres"` is the offline layer on its own, so a failure always says which of the two
+broke. **Every case drops its schema before it runs**, which is why the harness refuses any URL whose
+database name does not contain `test` — Compose creates `research_test` beside `research` for it.
+
+**Since Phase 3 stage 2 there is a third layer, on the same terms.** The tests marked `integration`
+run against the real LocalStack SQS: the queue Compose declares, throwaway FIFO queues of their own,
+and the real worker driving a real message. They exist because four of
+[ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md)'s decisions are queue
+*attributes* rather than application code — FIFO message groups, deduplication ids,
+`ApproximateReceiveCount`, and the redrive policy — and a fake that models a guarantee is not the
+guarantee. They **skip** unless `SQS_ENDPOINT_URL` is set, and they need no AWS credentials and reach
+no AWS:
+
+```bash
+SQS_ENDPOINT_URL=http://localhost:4566 pytest -m integration
+```
+
+**And a fourth, for Redis** (Phase 3 stage 3), on identical terms. It proves what a broken client
+cannot: that a TTL is really kept, and above all that **two clients share one bucket** — the
+"two workers produce 80 requests per minute" failure is a statement about two connections against
+one key, and no single-process fake can be wrong about it in the right way. It **skips** unless
+`TEST_REDIS_URL` is set, and it **refuses database 0**, because every case flushes the database it
+is given and 0 is what `REDIS_URL` defaults to:
+
+```bash
+TEST_REDIS_URL=redis://localhost:6379/15 pytest -m redis
+```
 
 `alembic upgrade head` applies the migrations in `database/migrations/`. It reads `DATABASE_URL` — the
 ordinary libpq string, `postgresql://user:pw@host/db` — and nothing else, so a migration does not need
@@ -380,16 +504,96 @@ The lint, format, and type commands are what CI will run once CI exists in Phase
 uvicorn app:app --reload
 ```
 
-`uvicorn app:app` serves the five routes in `routes/api.py`. It needs `DATABASE_URL`, `AUTH_KEYS`, and
-the `LLM_*` credentials, because the API resumes the graph at the gate itself until the Phase 3 worker
-takes that over. **No job runs on its own yet:** `POST /jobs` records the job, and nothing dequeues it
-until Phase 3.
+`uvicorn app:app` serves the six routes in `routes/api.py`. It needs `DATABASE_URL`, `SQS_QUEUE_URL`
+and `AUTH_KEYS` — and **no LLM or Tavily credential**, since
+[ADR 0012](docs/adr/0012-the-api-stops-holding-a-compiled-graph.md) took the graph out of this
+process. What it does with a submission is write the row and enqueue a pointer message; the worker
+does the rest.
 
-These do **not** run yet — there is no worker, no compose file, and no eval set:
+```bash
+python -m worker
+```
+
+`python -m worker` is the process that runs jobs. It long-polls the queue, decides from the checkpoint
+what each message means, invokes the graph, and deletes the message only once the work is durable. It
+is the **only** process that constructs an `LLMClient` or executes a node, so it is the one that needs
+the `LLM_*` and `TAVILY_API_KEY` credentials — plus `DATABASE_URL`, `SQS_QUEUE_URL` and `REDIS_URL`.
+Run as many as you like: FIFO message groups keep one job to one worker, and since stage 3 the shared
+rate limiter bounds the whole deployment rather than each process.
+
+**It refuses to start when Redis does not answer**, and that is the fail-closed rule reaching
+startup: the shared limiter is what stands between a worker and the LLM endpoint, so a worker without
+one would take a message, fail its first node with `rate_limiter_unavailable`, leave the message, and
+repeat that until the job dead-lettered. One log line beats three deliveries.
+
+At startup it reads its queue's attributes and **refuses to run** against a queue that is not FIFO, or
+whose visibility timeout does not exceed `MAX_JOB_RUNTIME + 3 × LLM_MAIN_TIMEOUT_S + 10`
+([ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decisions 4 and 8).
+SIGTERM stops it taking new work and lets the invocation in flight finish, which is what leaves the
+checkpoint and the database agreeing.
+
+**One job's path across the two processes:**
 
 ```text
-docker compose up -d        # Phase 3
-python -m worker            # Phase 3
+POST /jobs            -> jobs.status = queued, one FIFO message  (identifiers only)
+worker receives       -> queued -> running, invoke(new_state(...))
+gate node interrupts  -> awaiting_approval, message deleted
+POST /approve         -> decision recorded, gate claimed, resume message enqueued, 200 {status: running}
+worker receives       -> reads the decision from audit_events, invoke(Command(resume=...))
+export + finalize     -> approved | rejected | failed, message deleted
+```
+
+**The response to a gate decision is `running`, not the outcome** ([ADR 0011](docs/adr/0011-the-human-gate-resume-moves-to-the-worker.md)
+decision 5): the gate is answered and the work is queued. A caller that needs the outcome polls
+`GET /jobs/{id}`, which is what `docs/engineering-guidelines.md` §12 already tells them to do.
+
+**Delivery is at-least-once and nothing here pretends otherwise.** The worker deletes a message on
+exactly three outcomes — the graph interrupted at the gate, the job reached a terminal status, or it
+was already terminal when the message arrived — and on nothing else, so an unhandled failure leaves
+the message and redelivery is the retry. The same node can therefore run twice, which is why every
+graph-time write is keyed to converge ([ADR 0005](docs/adr/0005-graph-time-persistence-semantics.md)).
+After three deliveries the message reaches the dead-letter queue; the worker's last delivery also ends
+the job `failed` with `failure_reason="job_dead_lettered"`, and still leaves the message, so the job
+stops being pollable **and** the DLQ alarm fires.
+
+```bash
+docker compose up -d --wait
+```
+
+`docker compose up -d --wait` starts the local infrastructure: **PostgreSQL 16, Redis 7, and
+LocalStack for SQS and S3**. `--wait` is not decoration — each service has a healthcheck, and
+LocalStack's checks for the queue and the bucket rather than for the process, so when the command
+returns the resources exist. Startup is idempotent: the bootstrap scripts in `docker/` converge
+rather than create, so running it again changes nothing.
+
+**PostgreSQL, SQS and Redis have application code behind them; S3 does not.** The API enqueues to
+the LocalStack queue and `python -m worker` consumes it (stage 2); the worker caches searches and
+fetches in Redis, deduplicates URLs per job there, and takes every LLM token from the shared bucket
+(stage 3). **S3 is still started only** — there is no `PutObject`, which is step 22.
+
+To point both processes at the local queue:
+
+```bash
+export SQS_QUEUE_URL=http://localhost:4566/000000000000/research-jobs.fifo AWS_ENDPOINT_URL=http://localhost:4566
+```
+
+`AWS_ENDPOINT_URL` is the only difference between LocalStack and real AWS. boto3 still wants
+credentials to sign with, and LocalStack ignores their values, so `AWS_ACCESS_KEY_ID=test` and
+`AWS_SECRET_ACCESS_KEY=test` are enough.
+
+There is **no application image**. Compose starts services only, so migrations run from the host:
+
+```bash
+DATABASE_URL=postgresql://research:research@localhost:5432/research alembic upgrade head
+```
+
+`docker compose down -v` resets everything, including the `research_test` database the integration
+suite uses — the next `up` recreates it. If port 5432 is already taken on your machine, set
+`POSTGRES_PORT` in `.env` (Compose reads it) and follow it in every URL above.
+
+This does **not** run yet — there is no eval set:
+
+```text
 python -m eval.run          # Phase 4
 ```
 
@@ -399,18 +603,19 @@ python -m eval.run          # Phase 4
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `LLM_BASE_URL` | LLM endpoint | *(required)* |
-| `LLM_MODEL` | Main model id | *(required)* |
-| `LLM_FAST_MODEL` | Routing and scoring model id | falls back to `LLM_MODEL` |
-| `LLM_API_KEY` | LLM credential | *(required)* |
-| `LLM_RPM_LIMIT` | Shared client-side rate limit | `40` |
+| `LLM_BASE_URL` | LLM endpoint. **Worker-only** since [ADR 0012](docs/adr/0012-the-api-stops-holding-a-compiled-graph.md) — see the note under this table | *(required by the worker)* |
+| `LLM_MODEL` | Main model id. Worker-only | *(required by the worker)* |
+| `LLM_FAST_MODEL` | Routing and scoring model id. Worker-only | falls back to `LLM_MODEL` |
+| `LLM_API_KEY` | LLM credential. Worker-only | *(required by the worker)* |
+| `LLM_RPM_LIMIT` | The shared client-side rate limit, and since stage 3 it really is shared: one `ratelimit:llm` window in Redis across every worker, not a ceiling each process keeps to itself | `40` |
 | `LLM_MAIN_TIMEOUT_S` | Request timeout for **every** main-tier caller — Planner, Researcher extraction, Synthesizer, Fact-Checker. There is no per-agent timeout. Raise only where the endpoint is slow — NIM development uses `180` | `60` |
-| `TAVILY_API_KEY` | Web search credential | *(required)* |
+| `TAVILY_API_KEY` | Web search credential. Worker-only | *(required by the worker)* |
 | `DATABASE_URL` | PostgreSQL connection string | *(required from Phase 2)* |
-| `REDIS_URL` | Redis connection string | `redis://localhost:6379/0` |
-| `SQS_QUEUE_URL` | Job queue | *(required from Phase 3)* |
+| `REDIS_URL` | Redis connection string. **Worker-required since Phase 3 stage 3** — it holds the two caches, the per-job URL set, and the shared rate limiter, and the worker refuses to start when it does not answer. The API reads it only to report `checks.redis` on `/health` | `redis://localhost:6379/0` |
+| `SQS_QUEUE_URL` | Job queue. **Required by both processes** since Phase 3 stage 2: the API enqueues, the worker receives. It must be FIFO and carry a redrive policy — the worker reads both at startup and refuses to run without them ([ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decisions 4 and 8) | *(required from Phase 3)* |
 | `S3_BUCKET` | Exported report storage | *(required from Phase 3)* |
 | `AWS_REGION` | AWS region | `ap-south-1` |
+| `AWS_ENDPOINT_URL` | Where the AWS APIs live when they are not AWS. Unset against real AWS; `http://localhost:4566` for the Compose LocalStack. The **only** difference between the two, which is what makes the `integration`-marked tests worth running | *(unset)* |
 | `LANGSMITH_TRACING` | Enable tracing | `false` |
 | `LANGSMITH_API_KEY` | LangSmith credential | *(required when tracing)* |
 | `LANGSMITH_PROJECT` | Trace project name | `competitive-research` |
@@ -418,7 +623,7 @@ python -m eval.run          # Phase 4
 | `MAX_SUPERVISOR_HOPS` | Routing loop guard. 20 is the automatic workflow's derived maximum; a reviewer edit legitimately costs +1 hop, so the bound of 3 edits accepted in [ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md) puts the ceiling at 23. **24 stays**, as the ceiling plus one | `24` |
 | `MAX_LLM_CALLS_PER_JOB` | Per-job call budget | `60` |
 | `MAX_REVIEWER_EDITS` | How many times a reviewer may send one job back for an edit ([ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md)). Each edit costs 3 calls and 1 hop. Enforced at `POST /jobs/{id}/approve` **before the graph is resumed**, so a refused edit spends nothing; counted from the audit trail, so a retried decision cannot spend one ([ADR 0007](docs/adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md)) | `3` |
-| `MAX_JOB_RUNTIME` | Whole-job runtime bound, seconds. **Configured only — nothing enforces it until the Phase 3 worker** | `1200` |
+| `MAX_JOB_RUNTIME` | How long **one worker invocation** may run, seconds — not a job's lifetime, so a job that waits three days at the gate does not fail on resume ([ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 7). **Enforced since Phase 3 stage 2**, checked between nodes; over it the job ends `failed` with `failure_reason="job_timeout"`. The `.env` override of `1800` was dropped by decision 8: the queue's visibility timeout has to exceed `MAX_JOB_RUNTIME + 3 × LLM_MAIN_TIMEOUT_S + 10`, so raising the job bound raises both sides. The development slack lives in the local queue's visibility timeout instead, and `tests/test_local_infrastructure.py` checks the arithmetic | `1200` |
 | `REFLECTION_PASS_THRESHOLD` | Weighted score needed to pass | `3.5` |
 | `MAX_FETCH_BYTES` | Response cap on a page fetch | `2097152` (2 MB) |
 | `MAX_PAGE_CHARS` | Cleaned text kept per page, ≈6k tokens | `24000` |
@@ -428,6 +633,24 @@ python -m eval.run          # Phase 4
 | `RETENTION_DAYS` | How long jobs, findings, and audit rows are kept | `365` |
 | `APP_ENV` | `local` \| `dev` \| `prod` | `local` |
 | `LOG_LEVEL` | Log verbosity | `INFO` |
+
+**"Required" now depends on which process is asking, and that is
+[ADR 0012](docs/adr/0012-the-api-stops-holding-a-compiled-graph.md) decision 4 rather than
+laxity.** `load_config()` refuses nothing: it builds a `Config` whose optional fields are
+`None`, and each entrypoint states what *it* cannot start without.
+
+| Process | Refuses to start without |
+|---|---|
+| `uvicorn app:app` | `DATABASE_URL`, `SQS_QUEUE_URL`, `AUTH_KEYS` |
+| `python -m worker` | those first two, plus `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `TAVILY_API_KEY` (`worker.required_credentials`) — **and a Redis that answers** (`worker.check_redis`), because the shared limiter fails closed |
+| `scripts/check_model.py`, `scripts/measure_jobs.py` | the `LLM_*` set |
+
+So **the API process starts, serves all six routes and passes its health check with no LLM or
+Tavily credential in its environment** — which is what makes `docs/engineering-guidelines.md`
+§13's least-privilege table a property of the code rather than of an intended deployment. It is
+driven as a test rather than asserted here: `tests/test_api.py` builds the application from
+`load_config({})` and exercises every route, and the smoke run of 2026-08-17 did the same
+against real PostgreSQL and real LocalStack.
 
 ---
 
@@ -465,7 +688,7 @@ These are the non-negotiables. If a change breaks one, the change is wrong.
 | 0 | Documentation — this file, engineering guidelines, architecture | **Done** |
 | 1 | Local graph: 5 agents + the reflection node, tool boundary, LLM client, in-memory state, no persistence | **Done.** Core on **2026-08-13** — twelve steps, plus the human-gate and export nodes, the test suite, and the 20-job reference baseline. **Production-hardening pass on 2026-08-15** — ADR 0002, ADR 0003, ADR 0004, the shared-`LLMClient` fix, the post-hardening n=20 run of 2026-08-14, and the LangSmith token reconciliation. Both are in the status block above |
 | 2 | Postgres checkpointer, Alembic migrations, audit tables, the gate's **API side** — `POST /jobs/{id}/approve`, the reviewer payload, expiry — FastAPI routes, **API-key auth on every route except `/health`** | **Done, 2026-08-16.** Steps 13–16 on **2026-08-15** ([ADR 0005](docs/adr/0005-graph-time-persistence-semantics.md)); steps 17–19 on **2026-08-16** — the reviewer-edit path ([ADR 0006](docs/adr/0006-reviewer-edit-returns-to-the-human-gate.md)), the five routes with API-key auth, gate-decision idempotency ([ADR 0007](docs/adr/0007-reviewer-decision-idempotency-and-gate-resume-failure.md)), and the §18 test set. Closed by a completion audit against the repository, which found and fixed two blockers: reviewer-text edge cleaning (ADR 0006 decision 8) and the undecided `failure_reason` ([ADR 0008](docs/adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md)). **Gate expiry is the one listed item deliberately not built** — it waits for the Phase 5 sweep |
-| 3 | Docker Compose (Postgres 16, Redis 7, LocalStack for SQS + S3), async worker, **CI: lint, types, tests, image build** | Planned |
+| 3 | Docker Compose (Postgres 16, Redis 7, LocalStack for SQS + S3), async worker, **CI: lint, types, tests, image build** | **In progress. Stages 1 and 2 done, both 2026-08-17.** Stage 1: the Compose infrastructure and the real-PostgreSQL verification of everything Phase 2 had only run on SQLite. Stage 2 (step 20): `jobqueue.py`, `worker.py`, `queued` and its migration, the API's enqueue, the asynchronous gate resume, and the LocalStack integration layer — [ADR 0010](docs/adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md), [ADR 0011](docs/adr/0011-the-human-gate-resume-moves-to-the-worker.md), [ADR 0012](docs/adr/0012-the-api-stops-holding-a-compiled-graph.md). Stage 3 (step 21): `redisstore.py` — the two caches, the per-job URL set, and the shared fail-closed rate limiter, with `checks.redis` on `/health`. **Still open: the application image and S3 (step 22), and CI (step 23).** |
 | 4 | LangSmith tracing, eval dataset of 30–50 questions, eval as a release gate | Planned |
 | 5 | AWS: ECS Fargate, RDS, ElastiCache, real SQS + S3, API Gateway, CloudWatch alarms, **Cognito JWT** | Planned |
 
@@ -481,12 +704,44 @@ audit rows, and one decision per gate visit. **`invariant 7` is satisfied by the
 plan.** What the gate still does not have is expiry: a job can wait at it indefinitely, because the
 7-day sweep is Phase 5's (step 32).
 
+**Phase 3 stage 2 moved the resume off the request, and changed what a decision answers with.** The
+endpoint cleans the reviewer's text, refuses an unaffordable edit, claims the gate, records the
+decision, enqueues a resume — and returns `200 {status: "running"}` rather than the outcome
+([ADR 0011](docs/adr/0011-the-human-gate-resume-moves-to-the-worker.md) decision 5). Every rule around
+it survives unchanged: one decision per visit, the same decision again is a retry that writes nothing,
+a different one is `409 gate_already_decided`, and an edit still costs one of three. What changed is
+that **redelivery, not the reviewer, is now the recovery path** when a resume dies — the message was
+never deleted, so it comes back on its own.
+
+**The reviewer can also read what they are approving, since 2026-08-17.** `GET /jobs/{id}/gate`
+returns the payload the gate node already builds, rebuilt from the checkpoint, with no graph
+execution and no write ([ADR 0013](docs/adr/0013-reviewer-gate-payload-view.md)). It is a **Phase 2
+correction found by the Phase 3 readiness review**: `reviewer_payload()` shipped with the gate node
+in step 17 and step 18's five routes never exposed it, so until now a reviewer had an authenticated
+endpoint that decides whether a report is exported and no way to read the report — `GET /jobs/{id}`'s
+`report` is the *exported* body and is `null` for the whole time a job waits at the gate. The API
+surface is six routes, not five.
+
 **Known gaps carried forward, so they are not rediscovered as bugs:**
 
-- **Nothing runs a job on its own yet.** `POST /jobs` writes the row and returns `202`; the queue and
-  the worker that would pick it up are Phase 3 (step 20). Until then a job is started by whatever
-  process holds the graph, and the API resumes it at the gate in-process rather than enqueuing a
-  resume message as `docs/ARCHITECTURE.md` §12 describes.
+- **A job runs on its own from Phase 3 stage 2, and `python -m worker` is what runs it.** What is
+  still missing around that is the operational half: there is no application image, no CI, and no AWS,
+  so the queue is LocalStack's and a DLQ alarm is a thing nobody is watching. A message that reaches
+  the dead-letter queue makes its job terminal (ADR 0010 decision 9) and otherwise sits there.
+- **A hard kill leaves a job `running` forever.** SIGTERM is handled; SIGKILL and OOM are not, and
+  cannot be — nothing gets to write. The message is redelivered and the worker recovers the job, but
+  if the failure is the job itself, the row stays non-terminal after the message reaches the DLQ.
+  ADR 0010 decision 9 assigns the recovery to Phase 5's retention-and-expiry sweep, which finds it as
+  `status = 'running' AND completed_at IS NULL` with no in-flight message.
+- **A job whose enqueue failed sits `queued` with nothing to pick it up.** `POST /jobs` answers
+  `503 enqueue_failed` and deliberately keeps the row, because it holds the `idempotency_key` a
+  re-enqueue would target — but nothing re-enqueues it yet. Also Phase 5's sweep
+  (`status = 'queued' AND created_at < now() - interval`).
+- **A Redis outage stops LLM work entirely, and that is the design rather than a gap.** The caches
+  and the URL set fail open, so they cost a call each; the rate limiter fails closed, because a
+  limiter that fails open is not a limiter (ARCHITECTURE.md §20 row 29). It is acceptable at 1–2
+  workers and it is loud rather than silent: the node fails with `rate_limiter_unavailable`, the
+  worker refuses to start, and `/health` reports `degraded` so the task leaves the target group.
 - **The reflection rubric is uncalibrated.** Until the hand-scoring pass in Phase 4 runs, the pass
   threshold is a reasonable heuristic, not a measured one.
 - **Traces recorded before 2026-08-14 carry inflated token totals.** `scripts/measure_jobs.py` built

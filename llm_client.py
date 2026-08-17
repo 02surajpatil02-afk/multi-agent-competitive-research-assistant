@@ -30,9 +30,12 @@ WHY THIS FILE EXISTS
         log line and to `measurements/requests.jsonl`; it is gone. LangSmith records the same
         four facts - node, latency, tokens, outcome - and two systems answering one question
         is the cost without the benefit (CLAUDE.md's observability rows).
-      * No shared rate limiter. That is one Redis token bucket across all workers and it
-        arrives with Redis in Phase 3. A per-process limiter would be a different thing
-        wearing the same name: two workers each politely limiting to 40 RPM produce 80.
+      * No rate limiter of its own. The shared bucket is one Redis key across every worker
+        (`redisstore.RedisRateLimiter`), injected as `limiter=` and declared here as a
+        Protocol, so this file needs no Redis dependency. A per-process limiter would be a
+        different thing wearing the same name: two workers each politely limiting to 40 RPM
+        produce 80. Passing none disables limiting entirely, which is what the offline suite
+        and `scripts/measure_jobs.py` run on.
       * No writes to ResearchState. A LangGraph node owns its state update, so this file
         counts calls into a CallBudget the node hands it and the node writes the total
         back to llm_calls_used.
@@ -42,11 +45,12 @@ WHY THIS FILE EXISTS
     Every failure arrives as LLMCallFailed carrying a reason, because the caller's
     correct response differs by reason (guidelines §17):
 
-      | reason           | caller's response                                    |
-      | rate_limited     | fail the JOB, failure_reason="rate_limited"          |
-      | budget_exceeded  | fail the JOB (CLAUDE.md invariant 3)                 |
-      | llm_call_failed  | fail the NODE, record the reason                     |
-      | invalid_output   | fail the NODE, record the reason (guidelines §3)     |
+      | reason                    | caller's response                                    |
+      | rate_limited              | fail the JOB, failure_reason="rate_limited"          |
+      | budget_exceeded           | fail the JOB (CLAUDE.md invariant 3)                 |
+      | llm_call_failed           | fail the NODE, record the reason                     |
+      | invalid_output            | fail the NODE, record the reason (guidelines §3)     |
+      | rate_limiter_unavailable  | fail the NODE, record the reason (guidelines §17)    |
 
     JOB_FATAL_REASONS is that first column, so the distinction is written down once
     rather than re-derived in five agent modules.
@@ -64,7 +68,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from time import sleep
-from typing import Literal, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 from langsmith.wrappers import wrap_openai
 from openai import (
@@ -78,7 +82,7 @@ from openai import (
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, ValidationError
 
-from config import Config
+from config import Config, required
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +96,17 @@ LLMFailureReason = Literal[
     "budget_exceeded",
     "llm_call_failed",
     "invalid_output",
+    "rate_limiter_unavailable",
 ]
 
 JOB_FATAL_REASONS: frozenset[LLMFailureReason] = frozenset({"rate_limited", "budget_exceeded"})
-"""Reasons that fail the whole job rather than one node. The other two fail the node,
-which lets the graph carry on and report the gap."""
+"""Reasons that fail the whole job rather than one node. The other three fail the node,
+which lets the graph carry on and report the gap.
+
+`rate_limiter_unavailable` is deliberately not here: guidelines §17's row says *"fail the
+node"*, and the node is the right blast radius because a limiter that is unreachable now may
+answer on the next node - whereas a rate-limited endpoint has already told us the whole job
+is over budget."""
 
 # guidelines §17, one row per tier. A retry count and its backoff list are the same
 # length in every row of that table, so the list length is the retry count.
@@ -109,6 +119,15 @@ _TRANSPORT_BACKOFF_S: dict[ModelTier, tuple[float, ...]] = {
     "fast": (1.0, 4.0),
 }
 _RATE_LIMIT_BACKOFF_S: tuple[float, ...] = (2.0, 8.0, 30.0)
+
+_LIMITER_BACKOFF_S: tuple[float, ...] = (2.0, 8.0)
+"""guidelines §17's rate-limiter row: two retries, at 2s and 8s. The 5s bound on each
+attempt belongs to the limiter's own client, because it is a socket timeout rather than
+something this file can impose on a call it does not make.
+
+It is a separate schedule from `_RATE_LIMIT_BACKOFF_S` above, which answers a 429 from the
+*endpoint*. The two look alike and mean opposite things: one is our own bucket saying "not
+yet", the other is the provider saying "you already did"."""
 
 _VALIDATION_ATTEMPTS = 2
 """One call plus one validation retry, then fail explicitly (guidelines §3, §17)."""
@@ -184,14 +203,50 @@ class CallBudget:
             self.used += 1
 
 
+class RateLimiter(Protocol):
+    """The shared `ratelimit:llm` bucket, as this file uses it (guidelines §11).
+
+    Declared here rather than imported, for the same reason `ToolCache` is declared in
+    `tools/contracts.py`: the consumer owns the contract, so this module needs no dependency
+    on Redis and a test can hand in a scripted one.
+
+    **`acquire()` answers, it does not wait.** A limiter that blocked would turn "the tier is
+    saturated" into a stall with no bound, and the bound belongs to the caller, which is what
+    guidelines §17's row gives it: 5s per attempt, two retries at 2s and 8s, then fail the
+    node with `rate_limiter_unavailable`.
+    """
+
+    def acquire(self) -> bool: ...
+
+
 class LLMClient:
     """The single client. One instance per process is enough; it holds no job state."""
 
-    def __init__(self, config: Config, client: OpenAI | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        client: OpenAI | None = None,
+        limiter: RateLimiter | None = None,
+    ) -> None:
         self._config = config
+        # None means no limiting at all, which is Phase 1's behaviour and what the offline
+        # suite runs on. The worker passes one, because it is the process that makes the
+        # calls; nothing falls back to a per-process limiter, because a per-process limiter
+        # would satisfy the type and not the requirement (guidelines §11).
+        self._limiter = limiter
+        # The two model names are narrowed here, once. `Config` carries them as optional so the
+        # API process can start with no LLM credential at all (ADR 0012 decision 4) - and this
+        # is the constructor of the thing that assumes one, so this is where the loud failure
+        # belongs rather than at the first request.
+        self._main_model = required(config.llm_model, "LLM_MODEL")
+        self._fast_model = required(config.llm_fast_model, "LLM_FAST_MODEL")
+        # The endpoint and the credential are narrowed on the same line as the models, and
+        # only when this builds its own client: an injected one brought its own. Without it
+        # the SDK raises `OpenAIError: Missing credentials`, which names `OPENAI_API_KEY` -
+        # a variable this project does not have - instead of the one that is actually unset.
         self._client = client or OpenAI(
-            base_url=config.llm_base_url,
-            api_key=config.llm_api_key,
+            base_url=required(config.llm_base_url, "LLM_BASE_URL"),
+            api_key=required(config.llm_api_key, "LLM_API_KEY"),
             # The SDK retries by default. Left on, it would multiply every schedule in
             # guidelines §17 and silently spend budget nothing counted.
             max_retries=0,
@@ -262,6 +317,49 @@ class LLMClient:
         """
         return self._config.llm_main_timeout_s if tier == "main" else _FAST_TIMEOUT_S
 
+    def _take_a_token(self, model: str) -> None:
+        """One token from the shared bucket, or fail the node. **Never call the LLM without
+        one** (guidelines §11, §17).
+
+        **It is called immediately after `budget.spend()`, and that placement is the answer to
+        "does a retry consume a token?" - yes.** A retried request is a real request against
+        the same 40 RPM tier, which is the argument `CallBudget` already makes for counting
+        every attempt: *"every request spends a token of the same tier"*. Putting the two
+        claims on adjacent lines is what keeps them from drifting apart, because a limiter that
+        counted logical calls while the budget counted attempts would let a job with three
+        transport retries send four requests on one token.
+
+        The bound is guidelines §17's rate-limiter row. Two retries at 2s and 8s, then the node
+        fails with `rate_limiter_unavailable` - loudly, rather than waiting on a bucket that
+        may never open. **A full bucket and an unreachable Redis end here identically**, on
+        purpose: §11's rule is "no token, no LLM call", and the limiter's own log line is what
+        says which of the two it was.
+
+        `None` is no limiter at all - Phase 1, the offline suite, and `scripts/measure_jobs.py`
+        - and it is the one path that sends a request without a token, because there is no
+        bucket for it to come from.
+        """
+        if self._limiter is None:
+            return
+
+        for attempt, delay in enumerate((*_LIMITER_BACKOFF_S, None)):
+            if self._limiter.acquire():
+                return
+            if delay is None:
+                break
+            logger.warning(
+                "no rate-limit token for %s (attempt %d), retrying in %.1fs",
+                model,
+                attempt + 1,
+                delay,
+            )
+            sleep(delay)
+
+        raise LLMCallFailed(
+            "rate_limiter_unavailable",
+            f"no rate-limit token for {model} after {len(_LIMITER_BACKOFF_S)} retries",
+        )
+
     def _send(
         self,
         messages: list[ChatCompletionMessageParam],
@@ -274,13 +372,14 @@ class LLMClient:
         The two retry counters are independent because their exhaustion behaviour differs:
         a rate-limited job fails, a flaky connection fails only the node.
         """
-        model = self._config.llm_model if tier == "main" else self._config.llm_fast_model
+        model = self._main_model if tier == "main" else self._fast_model
         transport_backoff = _TRANSPORT_BACKOFF_S[tier]
         transport_retries = 0
         rate_limit_retries = 0
 
         while True:
             budget.spend()
+            self._take_a_token(model)
             try:
                 response = self._client.chat.completions.create(
                     model=model,

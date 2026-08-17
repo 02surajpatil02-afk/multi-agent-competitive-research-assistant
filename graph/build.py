@@ -67,11 +67,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, TypedDict
 
-from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, interrupt
@@ -89,36 +87,26 @@ from agents.synthesizer import SynthesizerUpdate, write_report
 from config import Config
 from database import queries
 from graph.reflection import ReflectionOutcome, reflect
-from graph.state import ResearchState
+from graph.state import (
+    TERMINAL_STATUSES,
+    ResearchState,
+    reviewer_payload,
+    state_serde,
+    unresearched_subtopics,
+    unsupported_claims,
+)
 from llm_client import LLMClient
 from schemas import (
-    Finding,
     GateDecision,
     JobStatus,
     ReflectionRoute,
-    ReflectionScore,
     Report,
-    ResearchPlan,
     SubtopicStatus,
     SupervisorTarget,
-    Verdict,
 )
-from tools.contracts import ToolCache
+from tools.contracts import ToolCache, UrlDeduplicator
 
 logger = logging.getLogger(__name__)
-
-CHECKPOINTED_TYPES = (ResearchPlan, Finding, Report, Verdict, ReflectionScore)
-"""The Pydantic types that travel in `ResearchState`, and therefore into every checkpoint.
-
-LangGraph will not rebuild a class it was not told about. Left unregistered it hands back
-the field dict instead - and a `Finding` that came back as a dict fails on the next
-`.url`, or compares unequal to one that did not. Naming them is also least privilege: a
-checkpoint can reconstruct these five classes and the serializer's built-in safe types, and
-nothing else the process happens to be able to import (guidelines §16).
-
-Only top-level types belong here. `model_dump()` flattens nested models - `Section`,
-`Claim`, `Source`, `Subtopic` - into dicts that their parent re-validates on the way back.
-"""
 
 ResearchGraph = CompiledStateGraph[ResearchState, None, ResearchState, ResearchState]
 """What `build_graph()` hands back. Named because the four type parameters tell a reader
@@ -126,21 +114,6 @@ nothing, and repeating them at every call site would."""
 
 GateRoute = Literal["export", "synthesizer", "finalize"]
 """The gate's three outcomes, in ARCHITECTURE.md §12's order: approve, edit, reject."""
-
-EditRefusal = Literal["reviewer_edit_limit_reached", "insufficient_call_budget_for_edit"]
-"""Why a reviewer edit was not allowed to start. Each is a stable error code the step-18
-endpoint returns with a `409`, so a caller branches on the string rather than on prose."""
-
-EDIT_CALL_COST = 3
-"""Logical calls one reviewer edit needs: a Synthesizer pass, a Fact-Checker pass, and a
-reflection pass. The Supervisor hop it also costs is already inside `MAX_SUPERVISOR_HOPS`
-(guidelines §13's `1 + 24 + 45 + 3 × (3 + E)`), and this is the minimum - a validation retry
-buys a second request for the same logical call, which is what the budget guard still
-backstops (ADR 0006 decision 7)."""
-
-TERMINAL_STATUSES: frozenset[JobStatus] = frozenset({"approved", "rejected", "failed"})
-"""The three `status` values a job may end on (ARCHITECTURE.md §3). Reaching `finalize` on
-any other value is a wiring bug, and `finalize` says so rather than inventing an outcome."""
 
 
 @dataclass(frozen=True)
@@ -157,6 +130,14 @@ class NodeDeps:
     config: Config
     llm: LLMClient
     cache: ToolCache | None = None
+    urls: UrlDeduplicator | None = None
+    """The per-job `job:{id}:urls` set, or None to deduplicate within the process only.
+
+    None is Phase 1's behaviour: the Researcher's in-process `seen` set still stops one visit
+    reading a page twice. What is missing without it is the half that survives a process - a
+    redelivered message re-running a Researcher node whose findings were never checkpointed
+    (guidelines §7, §11).
+    """
     db: Engine | None = None
     """Where the audit trail is written, or None to run without one.
 
@@ -194,6 +175,7 @@ def build_graph(
     config: Config,
     llm: LLMClient,
     cache: ToolCache | None = None,
+    urls: UrlDeduplicator | None = None,
     db: Engine | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> ResearchGraph:
@@ -208,7 +190,7 @@ def build_graph(
     `database.queries.create_database_engine()`; the test suite and the measurement harness
     pass neither, which is why they still run with no service behind them.
     """
-    deps = NodeDeps(config=config, llm=llm, cache=cache, db=db)
+    deps = NodeDeps(config=config, llm=llm, cache=cache, urls=urls, db=db)
     builder = StateGraph(ResearchState)
 
     # The five agents. Each node hands the state to one agent function and returns that
@@ -251,25 +233,6 @@ def build_graph(
     builder.add_edge("finalize", END)
 
     return builder.compile(checkpointer=checkpointer or InMemorySaver(serde=state_serde()))
-
-
-def run_config(job_id: str) -> RunnableConfig:
-    """Which thread this run belongs to, and nothing else.
-
-    `thread_id = job_id` is the pairing that gives one job one checkpoint history, and it is
-    what makes the human gate resumable across a restart (guidelines §4).
-    """
-    return {"configurable": {"thread_id": job_id}}
-
-
-def state_serde() -> JsonPlusSerializer:
-    """What a checkpoint may rebuild, wherever it is stored.
-
-    Both savers take this one, because the answer does not depend on where the bytes go: the
-    five state models and the serializer's own safe types, and nothing else this process
-    happens to be able to import (guidelines §16).
-    """
-    return JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINTED_TYPES)
 
 
 @contextmanager
@@ -337,7 +300,9 @@ def researcher_node(state: ResearchState, *, deps: NodeDeps) -> ResearcherUpdate
     """Findings for one pending subtopic. `findings` carries only the new ones; the
     operator.add reducer on the state appends them, and the same list is what reaches the
     `findings` table."""
-    update = research_subtopic(state, config=deps.config, llm=deps.llm, cache=deps.cache)
+    update = research_subtopic(
+        state, config=deps.config, llm=deps.llm, cache=deps.cache, urls=deps.urls
+    )
     if deps.db is not None:
         subtopic, status = _resolved_subtopic(state, update)
         queries.record_research(
@@ -458,29 +423,6 @@ def human_gate_node(state: ResearchState, *, deps: NodeDeps) -> Command[GateRout
     return Command(goto="synthesizer", update=GateUpdate(reviewer_edit_text=decision.edits))
 
 
-def refuse_edit(*, config: Config, llm_calls_used: int, edits_made: int) -> EditRefusal | None:
-    """May a reviewer edit start? `None` means yes (ADR 0006 decisions 6 and 7).
-
-    Decided **before** the graph is resumed, so a refused edit spends nothing. Both bounds
-    protect the same thing: a reviewer holding an approvable report, who asks for a change
-    and gets a failed job instead - which is what happens today when the Supervisor's budget
-    guard trips halfway through the edit pass, because `export` then never runs.
-
-    `llm_calls_used` is the **live** count, from the checkpoint by way of the gate payload.
-    It is never `jobs.llm_calls_used`: that column is written by `finalize` and reads `0` for
-    the whole time a job waits at the gate, so a check against it would compute a full budget
-    every time and allow every edit silently.
-
-    The endpoint in step 18 turns each answer into a `409` with the reason as its stable
-    error code. This function is the decision; the HTTP shape is not.
-    """
-    if edits_made >= config.max_reviewer_edits:
-        return "reviewer_edit_limit_reached"
-    if config.max_llm_calls_per_job - llm_calls_used < EDIT_CALL_COST:
-        return "insufficient_call_budget_for_edit"
-    return None
-
-
 def export_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
     """The claim-to-URL gate, and Phase 2's artifact write.
 
@@ -586,97 +528,19 @@ def _job_already_failed(state: ResearchState, node: str) -> bool:
     return True
 
 
-def reviewer_payload(state: ResearchState) -> dict[str, Any]:
-    """What the reviewer is shown, in the order ARCHITECTURE.md §12 puts it.
-
-    **The order is the contract, not a preference.** Unsupported claims and unresearched
-    subtopics come first, then `quality_flag`, then the score breakdown, then the report, and
-    the per-claim sources last - because a reviewer who has to hunt for the problems will
-    approve past them. Python keeps insertion order, so the keys below are that order and a
-    test asserts it.
-
-    `llm_calls_used` is here for one concrete reason: it is the live number `refuse_edit()`
-    needs, and the gate is where a caller can read it without loading the checkpoint itself.
-    """
-    report = state["report"]
-    scores = state["reflection_scores"]
-    latest = scores[-1] if scores else None
-    return {
-        "job_id": state["job_id"],
-        "unsupported_claims": _unsupported_claims(state),
-        "unresearched_subtopics": _unresearched_subtopics(state),
-        # None means the rubric ran and the report passed. "unscored" means it never ran, and
-        # a client that reads an empty `failed_dimensions` as "no problems" without reading
-        # this flag has a bug (ARCHITECTURE.md §12).
-        "quality_flag": state["quality_flag"],
-        "score": latest.model_dump(mode="json") if latest is not None else None,
-        "failed_dimensions": list(state["failed_dimensions"]),
-        "revision_count": state["revision_count"],
-        "llm_calls_used": state["llm_calls_used"],
-        "report": report.model_dump(mode="json") if report is not None else None,
-        "claims": _claims_with_sources(state),
-    }
-
-
 def _gate_summary(state: ResearchState) -> dict[str, Any]:
-    """The counts that make a `gate_opened` row worth reading, without the report in it."""
+    """The counts that make a `gate_opened` row worth reading, without the report in it.
+
+    The payload itself is `graph.state.reviewer_payload()`, which this node interrupts with
+    and `GET /jobs/{id}/gate` rebuilds from the checkpoint (ADR 0013). It lives there rather
+    than here because it is a pure projection of state, and the API must be able to reach it
+    without importing an agent.
+    """
     return {
-        "unsupported_claims": len(_unsupported_claims(state)),
-        "unresearched_subtopics": len(_unresearched_subtopics(state)),
+        "unsupported_claims": len(unsupported_claims(state)),
+        "unresearched_subtopics": len(unresearched_subtopics(state)),
         "quality_flag": state["quality_flag"],
     }
-
-
-def _unsupported_claims(state: ResearchState) -> list[str]:
-    """Claim ids in the *current* draft the Fact-Checker did not support.
-
-    Verdicts accumulate across passes (guidelines §4), so the current draft's claim ids are
-    what filters them - an earlier draft's unsupported claim is not this draft's problem.
-    """
-    report = state["report"]
-    if report is None:
-        return []
-    current = {claim.claim_id for claim in report.claims}
-    return [
-        verdict.claim_id
-        for verdict in state["verdicts"]
-        if verdict.claim_id in current and not verdict.supported
-    ]
-
-
-def _unresearched_subtopics(state: ResearchState) -> list[str]:
-    return [
-        subtopic
-        for subtopic, status in state["subtopic_status"].items()
-        if status == "unresearched"
-    ]
-
-
-def _claims_with_sources(state: ResearchState) -> list[dict[str, Any]]:
-    """Every claim with the URLs it rests on and the quote the Fact-Checker found.
-
-    This is the part of the payload that makes an approval a judgement rather than a
-    formality: the reviewer sees what each sentence is standing on.
-    """
-    report = state["report"]
-    if report is None:
-        return []
-    urls = {finding.finding_id: str(finding.url) for finding in state["findings"]}
-    verdicts = {verdict.claim_id: verdict for verdict in state["verdicts"]}
-    claims = []
-    for claim in report.claims:
-        verdict = verdicts.get(claim.claim_id)
-        claims.append(
-            {
-                "claim_id": claim.claim_id,
-                "text": claim.text,
-                "sources": [urls[fid] for fid in claim.finding_ids if fid in urls],
-                "supported": None if verdict is None else verdict.supported,
-                "quote": None if verdict is None else verdict.quote,
-                "note": None if verdict is None else verdict.note,
-            }
-        )
-    return claims
 
 
 def _resolved_subtopic(

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 from openai.types.chat import ChatCompletionFunctionToolParam
 
-from config import Config, load_config
+from config import Config, load_config, required
 
 _PREFLIGHT_TIMEOUT_S = 30.0
 """Guidelines §17's fast-tier LLM timeout. Every prompt below is a few tokens."""
@@ -180,8 +180,10 @@ def measure_throughput(client: OpenAI, model: str, configured_rpm: int) -> Check
 
 def run_checks(client: OpenAI, config: Config) -> list[CheckResult]:
     """Capability checks for every distinct configured model, then one measurement."""
-    models = [config.llm_model]
-    if config.llm_fast_model != config.llm_model:
+    # The preflight is a process that assumes an LLM, so it narrows loudly (ADR 0012 dec 4).
+    main_model = required(config.llm_model, "LLM_MODEL")
+    models = [main_model]
+    if config.llm_fast_model and config.llm_fast_model != main_model:
         models.append(config.llm_fast_model)
 
     results: list[CheckResult] = []
@@ -189,13 +191,19 @@ def run_checks(client: OpenAI, config: Config) -> list[CheckResult]:
         results.append(check_endpoint_answers(client, model))
         results.append(check_json_mode(client, model))
         results.append(check_tool_calling(client, model))
-    results.append(measure_throughput(client, config.llm_model, config.llm_rpm_limit))
+    results.append(measure_throughput(client, main_model, config.llm_rpm_limit))
     return results
 
 
 def main() -> int:
     try:
         config = load_config()
+        # The preflight is a process that assumes an LLM, so it narrows the four variables it
+        # cannot run without before it builds anything (ADR 0012 decision 4). `load_config`
+        # itself no longer refuses them - the API starts with none of them set.
+        base_url = required(config.llm_base_url, "LLM_BASE_URL")
+        api_key = required(config.llm_api_key, "LLM_API_KEY")
+        required(config.llm_model, "LLM_MODEL")
     except ValueError as error:
         # The first thing an operator hits after editing .env. A named variable beats a
         # traceback, and it keeps the exit code meaningful.
@@ -203,8 +211,8 @@ def main() -> int:
         return 1
 
     client = OpenAI(
-        base_url=config.llm_base_url,
-        api_key=config.llm_api_key,
+        base_url=base_url,
+        api_key=api_key,
         max_retries=0,  # the preflight reports what happened; it does not paper over it
     )
 

@@ -60,10 +60,22 @@ class Config:
 
     # LLM. One OpenAI-compatible client covers development and production, so there is no
     # provider class and no provider abstraction (ARCHITECTURE.md §20 row 4).
-    llm_base_url: str
-    llm_model: str
-    llm_fast_model: str  # routing and reflection scoring only; falls back to llm_model
-    llm_api_key: str = field(repr=False)
+    llm_base_url: str | None
+    llm_model: str | None
+    llm_fast_model: str | None  # routing and reflection scoring only; falls back to llm_model
+    llm_api_key: str | None = field(repr=False)
+    """The four LLM fields are optional, and that is ADR 0012 decision 4 rather than laxity.
+
+    The API process must start, serve every route and pass its health check with **no LLM or
+    Tavily credential in its environment** - that is what makes guidelines §13's least-privilege
+    table describe the code rather than an intention. So `load_config()` stops requiring them,
+    and the process that needs them - the worker, and the two scripts - refuses to start without
+    them instead, with the same loud failure a missing variable has always given.
+
+    The cost is admitted rather than hidden: `mypy --strict` now demands narrowing at every
+    consumer, which is a handful of places and is also the point - it names each one that
+    assumes an LLM.
+    """
     llm_rpm_limit: int  # shared client-side limit; the NIM free tier is ~40 RPM
     llm_main_timeout_s: float
     """How long one main-model request may take, in seconds.
@@ -81,8 +93,9 @@ class Config:
     receive a handful of tokens, so no plausible generation speed makes 30s tight.
     """
 
-    # External research tool.
-    tavily_api_key: str = field(repr=False)
+    # External research tool. Optional for the same reason the four above are: the API never
+    # fetches a page, so it never needs this credential (ADR 0012 decision 4).
+    tavily_api_key: str | None = field(repr=False)
 
     # Data stores. DATABASE_URL is required from Phase 2, when the Postgres checkpointer
     # and the audit tables arrive; Phase 1 runs a single process with in-memory state and
@@ -94,6 +107,14 @@ class Config:
     sqs_queue_url: str | None
     s3_bucket: str | None
     aws_region: str
+
+    aws_endpoint_url: str | None
+    """Where the AWS APIs live, when they are not AWS.
+
+    None against real AWS, and the LocalStack address locally. It is the only difference
+    between the two, which is what makes the local integration tests worth running at all -
+    the same client, the same calls, a different address.
+    """
 
     # Observability.
     langsmith_tracing: bool
@@ -189,28 +210,29 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         load_dotenv(_DOTENV_PATH)
     source = os.environ if env is None else env
 
-    llm_model = _required(source, "LLM_MODEL")
+    llm_model = _optional(source, "LLM_MODEL")
     langsmith_tracing = _bool(source, "LANGSMITH_TRACING", default=False)
     langsmith_api_key = _optional(source, "LANGSMITH_API_KEY")
     if langsmith_tracing and langsmith_api_key is None:
         raise ValueError("LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true")
 
     return Config(
-        llm_base_url=_required(source, "LLM_BASE_URL"),
+        llm_base_url=_optional(source, "LLM_BASE_URL"),
         llm_model=llm_model,
         # CLAUDE.md: falls back to LLM_MODEL. The two-tier split is an optimisation, so a
         # missing fast model must not stop the job.
         llm_fast_model=_optional(source, "LLM_FAST_MODEL") or llm_model,
-        llm_api_key=_required(source, "LLM_API_KEY"),
+        llm_api_key=_optional(source, "LLM_API_KEY"),
         llm_rpm_limit=_int(source, "LLM_RPM_LIMIT", default=40),
         # guidelines §17's main-tier row. Overridden only where the endpoint is slow.
         llm_main_timeout_s=_float(source, "LLM_MAIN_TIMEOUT_S", default=60.0),
-        tavily_api_key=_required(source, "TAVILY_API_KEY"),
+        tavily_api_key=_optional(source, "TAVILY_API_KEY"),
         database_url=_optional(source, "DATABASE_URL"),
         redis_url=_optional(source, "REDIS_URL") or "redis://localhost:6379/0",
         sqs_queue_url=_optional(source, "SQS_QUEUE_URL"),
         s3_bucket=_optional(source, "S3_BUCKET"),
         aws_region=_optional(source, "AWS_REGION") or "ap-south-1",
+        aws_endpoint_url=_optional(source, "AWS_ENDPOINT_URL"),
         langsmith_tracing=langsmith_tracing,
         langsmith_api_key=langsmith_api_key,
         langsmith_project=_optional(source, "LANGSMITH_PROJECT") or "competitive-research",
@@ -238,8 +260,18 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     )
 
 
-def _required(env: Mapping[str, str], name: str) -> str:
-    value = env.get(name, "").strip()
+def required(value: str | None, name: str) -> str:
+    """A configured value the caller cannot run without, narrowed loudly.
+
+    The four LLM fields and `tavily_api_key` are optional on `Config` so the API can start
+    without them (ADR 0012 decision 4). The processes that *do* need them - the worker, the
+    preflight, the measurement harness - call this at startup, which keeps the failure exactly
+    where it has always been: fatal, at startup, naming the variable.
+
+    It replaces the private `_required` that read the environment directly. Nothing reads a
+    required environment variable any more; what is required now depends on which process is
+    asking, and only that process knows.
+    """
     if not value:
         raise ValueError(f"{name} is required and is not set")
     return value

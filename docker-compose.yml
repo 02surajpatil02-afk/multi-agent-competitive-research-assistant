@@ -1,0 +1,112 @@
+# WHY THIS FILE EXISTS
+#     The local shape of Phase 3's infrastructure: PostgreSQL 16, Redis 7, and LocalStack
+#     standing in for SQS and S3 (ARCHITECTURE.md §17). It starts services and nothing else -
+#     there is no application image here, because the API and the worker are not containerised
+#     yet and a Dockerfile that nothing runs would be a file to maintain for no requirement.
+#
+#     **PostgreSQL, SQS and Redis have application code behind them; S3 does not.** The API
+#     enqueues to the queue and `python -m worker` consumes it (step 20); the worker caches
+#     searches and fetches in Redis, deduplicates URLs per job there, and takes every LLM token
+#     from the shared bucket (step 21). S3 is started so step 22 has something to build against.
+#
+#     `docker compose up -d --wait` is the whole bootstrap. Each service's healthcheck is what
+#     `--wait` waits on, and LocalStack's deliberately checks for the queue and the bucket
+#     rather than for the process - so when the command returns, the resources exist. Startup is
+#     idempotent: the init script converges rather than creating, so running it again is a
+#     no-op.
+#
+#     Credentials come from the environment with development defaults. They are local-container
+#     values, not secrets: nothing outside this machine can reach these ports, and anything that
+#     is not a local container sets its own (global CLAUDE.md §8).
+#
+#     The three host ports are overridable for one measured reason: a developer machine that
+#     already runs a PostgreSQL - another project's container is enough - refuses the whole
+#     `up` with `Bind for 0.0.0.0:5432 failed`. Set `POSTGRES_PORT` in `.env` and the rest of
+#     the stack is unaffected, because only `DATABASE_URL` names the port.
+
+name: competitive-research
+
+services:
+  # The database Phase 2 already writes to: the five application tables, and the
+  # checkpointer's own tables beside them (guidelines §19).
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-research}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-research}
+      POSTGRES_DB: ${POSTGRES_DB:-research}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs once, when the data volume is empty. It creates the second database the
+      # integration tests use, so a test run cannot destroy the one `uvicorn app:app` points
+      # at - those tests drop and recreate their schema between cases.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # `-d` matters: without it `pg_isready` reports ready during the init scripts' own
+      # bootstrap pass, and a migration would race them.
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-research} -d ${POSTGRES_DB:-research}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # The shared rate limiter, the per-job URL dedupe set, and the search and fetch caches
+  # (guidelines §11). **Used since step 21** - `redisstore.py` is the one module that talks to
+  # it, and the worker refuses to start when it does not answer, because the limiter fails
+  # closed. The `redis`-marked test layer runs against this container on database 15.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # SQS and S3, locally. The queue is consumed by `python -m worker` (step 20); the export
+  # node's `PutObject` into the bucket is step 22 and is not built.
+  localstack:
+    image: localstack/localstack:4.11
+    environment:
+      SERVICES: sqs,s3
+      AWS_DEFAULT_REGION: ${AWS_REGION:-ap-south-1}
+      # The shape of the local queue, read by the init script below. Declared here so the
+      # compose file is the one place that says what the local infrastructure looks like.
+      #
+      # 1800s is ADR 0010 decision 8's number for local development, and it is derived rather
+      # than chosen: the invariant is
+      #     visibility > MAX_JOB_RUNTIME + 3 x LLM_MAIN_TIMEOUT_S + 10
+      # which at the production job bound (1200s) and this project's slow development endpoint
+      # (LLM_MAIN_TIMEOUT_S=180) requires more than 1750s. `tests/test_local_infrastructure.py`
+      # asserts that arithmetic against `config.py`, so the number cannot drift from the rule
+      # that produced it.
+      JOBS_QUEUE_NAME: research-jobs.fifo
+      JOBS_DLQ_NAME: research-jobs-dlq.fifo
+      JOBS_QUEUE_VISIBILITY_TIMEOUT: 1800
+      # ARCHITECTURE.md §11's "three deliveries, then the dead-letter queue".
+      JOBS_QUEUE_MAX_RECEIVE_COUNT: 3
+      REPORTS_BUCKET: research-reports
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      # LocalStack runs everything in `ready.d` once the service answers.
+      - ./docker/localstack-init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      # Deliberately not `/_localstack/health`: that reports the process, and what a caller
+      # needs to know is whether the queue and the bucket are there. The init hook runs after
+      # LocalStack is ready, so this is the only check that makes `--wait` mean "bootstrapped".
+      test:
+        - CMD-SHELL
+        - >
+          awslocal sqs get-queue-url --queue-name "$$JOBS_QUEUE_NAME" &&
+          awslocal s3api head-bucket --bucket "$$REPORTS_BUCKET"
+      interval: 3s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+volumes:
+  postgres-data:

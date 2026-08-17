@@ -12,6 +12,20 @@ quote those numbers from the record and leaving a known-wrong figure in the sour
 It is corrected in place, with a dated audit note that keeps the original value and says what was
 wrong. [ADR 0002](0002-concurrent-page-extraction-in-the-researcher.md) carries one.
 
+**A record is indexed once it is accepted.** Every row below has been; a record still under
+discussion carries `Status: Proposed` and stays out of the table until it is not.
+
+**Accepted is not the same as built.** `0009`–`0012` were Phase 3 decisions taken before the code that
+implements them, which is the point of taking them. **`0010`, `0011` and `0012` were built on
+2026-08-17** (Phase 3 stage 2); `0009` waits for the S3 write in step 22. The `Status` line on each
+record says which it is, and the Status column here repeats it.
+
+**Two of ADR 0010's mechanisms were corrected by building them, and the corrections live in the code
+rather than in an edit to the record.** `worker.py::_finalise` explains both: `update_state` followed
+by `invoke(None)` runs one further node on the timeout path and reaches `finalize` on neither, so the
+worker writes the terminal row itself. The requirement each decision states — a terminal job with a
+`failure_reason`, and a message left for the DLQ — is met exactly.
+
 | # | Decision | Status | Date |
 |---|---|---|---|
 | [0001](0001-supervisor-llm-routing-is-advisory.md) | The Supervisor's LLM routing call is advisory; `allowed_target(state)` is authoritative | Accepted | 2026-08-12 |
@@ -22,3 +36,9 @@ wrong. [ADR 0002](0002-concurrent-page-extraction-in-the-researcher.md) carries 
 | [0006](0006-reviewer-edit-returns-to-the-human-gate.md) | A reviewer `edit` is one Synthesizer pass **over existing evidence** and returns to the gate: scored, never a revision, never research. Bounded at 3 edits, refused when the live budget cannot fund it, and grounding is not relaxed for a reviewer | Accepted, built in step 17 | 2026-08-16 |
 | [0007](0007-reviewer-decision-idempotency-and-gate-resume-failure.md) | One gate visit takes one decision, keyed on `(job_id, calls_used)`. Re-sending it is a retry that continues the graph and writes nothing; a different decision is `409 gate_already_decided`. `jobs.status` is derived from the checkpoint on both paths, and an unexpected failure leaves in the documented error envelope | Accepted, built | 2026-08-16 |
 | [0008](0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md) | A failed job's `failure_reason` gets no column and no API field in Phase 2: it lives in the durable checkpoint, and `GET /jobs/{id}` answers `status=failed`, `phase=failed`, `report=null`. The durable `job_finished` audit row is Phase 3's, with the two reasons that need it. Closes ADR 0005's recorded gap | Accepted | 2026-08-16 |
+| [0009](0009-recovering-an-export-that-failed-after-approval.md) | An S3 write that fails after approval stays terminal. `exported_at` comes to mean "the artifact exists", which makes the recoverable set a query; recovery is an operator-run re-export of the durable body, not a route and not a new job. `job_finished` is built in Phase 3, which is what makes the reason durable | Accepted, not built | 2026-08-17 |
+| [0010](0010-job-dispatch-and-status-across-api-queue-and-worker.md) | `JobStatus` gains `queued`; the worker moves it to `running` on receipt. The message is three identifiers and `attempt` is dropped, because a body cannot count redeliveries. The queue is **FIFO on `MessageGroupId = job_id`**, which is what keeps ADR 0005's single-writer rule true. `MAX_JOB_RUNTIME` is per invocation, checked between nodes, and the visibility timeout is derived and checked at startup. A DLQ'd job is finalized and its message still reaches the DLQ | Accepted, **built** — `jobqueue.py`, `worker.py`, `rev_0002`; the finalise mechanism corrected in code | 2026-08-17 |
+| [0011](0011-the-human-gate-resume-moves-to-the-worker.md) | `POST /jobs/{id}/approve` records the decision and enqueues; the worker resumes. The full decision is read back from `audit_events`, status reconciliation moves to the worker, and the endpoint returns `running`. ADR 0006's and ADR 0007's semantics are preserved exactly — only where the resume executes changes | Accepted, **built** — `routes/api.py`, `worker.py` | 2026-08-17 |
+| [0012](0012-the-api-stops-holding-a-compiled-graph.md) | The API constructs no graph and no LLM client, and `LLM_*` leaves its environment. `phase` is derived from `jobs.status`; two checkpoint reads remain — the gate-visit key and the gate view — and reading durable state is not executing a graph | Accepted, **built** — `app.py`, `routes/api.py`, `config.py`, `worker.required_credentials` | 2026-08-17 |
+| [0013](0013-reviewer-gate-payload-view.md) | The reviewer's gate view is its own route, `GET /jobs/{job_id}/gate`, returning `reviewer_payload()` verbatim from the checkpoint. No new schema, no new gate-visit identifier, no graph execution. The projection moves to `graph/state.py` so the API can reach it without the agent stack | Accepted, built | 2026-08-17 |
+| [0014](0014-gate-review-history-is-not-snapshotted.md) | No `gate_snapshots` table and no full payload in `audit_events`. Historical gate-payload preservation is **not required** — four fields are lost when a checkpoint is pruned, and nothing prunes yet. Phase 5's retention design owns the trade; the fallback, if one is ever needed, is a snapshot at sweep time rather than at every gate visit | Accepted | 2026-08-17 |

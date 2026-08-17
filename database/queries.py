@@ -71,10 +71,10 @@ def create_database_engine(url: str) -> Engine:
     PostgreSQL gets §17's statement timeout. SQLAlchemy retries nothing by default, which
     is the same row's "0 retries", so there is nothing to switch off.
 
-    SQLite gets `PRAGMA foreign_keys=ON`. It is what the offline test suite runs against -
-    Phase 2 has no PostgreSQL to run against until Compose arrives in Phase 3 - and SQLite
-    ignores foreign keys unless asked. A test suite that cannot see a broken foreign key
-    would prove nothing about the audit trail's shape.
+    SQLite gets `PRAGMA foreign_keys=ON`. It is what the offline test suite runs against, and
+    SQLite ignores foreign keys unless asked. A test suite that cannot see a broken foreign key
+    would prove nothing about the audit trail's shape. The `postgres`-marked suite runs these
+    same statements through the PostgreSQL branch above, so the timeout is exercised too.
     """
     if url.startswith("sqlite"):
         engine = sa.create_engine(url)
@@ -128,6 +128,11 @@ def create_job(
     A duplicate `idempotency_key` raises `IntegrityError`. That is the design: the unique
     constraint is the arbiter, and `POST /jobs` turns the violation into a `409` carrying
     the existing `job_id` rather than checking first and racing (ARCHITECTURE.md §9).
+
+    **The row starts `queued`, and the worker is the only thing that moves it to `running`**
+    (ADR 0010 decisions 1 and 2). Before the queue existed this wrote `running` for a job
+    nothing was running, which made "how many jobs are actually executing?" unanswerable -
+    the first question anyone asks during an incident.
     """
     with engine.begin() as conn:
         conn.execute(
@@ -136,7 +141,7 @@ def create_job(
                 user_id=user_id,
                 question=question,
                 idempotency_key=idempotency_key,
-                status="running",
+                status="queued",
             )
         )
         _audit(conn, job_id=job_id, actor=actor, action="job_created", detail={})
@@ -407,7 +412,7 @@ def record_reviewer_decision(
     edit that never happened.
     """
     with engine.begin() as conn:
-        if _decision_for_visit(conn, job_id=job_id, calls_used=calls_used) is not None:
+        if _detail_for_visit(conn, job_id=job_id, calls_used=calls_used) is not None:
             return
         _audit(
             conn,
@@ -418,16 +423,22 @@ def record_reviewer_decision(
         )
 
 
-def read_gate_decision(engine: Engine, job_id: str, *, calls_used: int) -> str | None:
-    """What this gate visit has already been answered with, or None if nobody has.
+def read_gate_decision(engine: Engine, job_id: str, *, calls_used: int) -> Mapping[str, Any] | None:
+    """The whole decision on record for one gate visit - `{decision, note, edits, calls_used}` -
+    or None if nobody has answered it.
 
-    `POST /jobs/{id}/approve` reads it before it decides anything, which is what makes the
-    endpoint idempotent per visit (ADR 0007): the same decision again is a retry that
-    continues the job, a different one is refused, and only an unanswered visit claims the
-    gate and records a decision.
+    **One query, two readers** (ADR 0011 decision 2). `POST /jobs/{id}/approve` compares
+    `["decision"]` for ADR 0007's four cases - the same decision again is a retry, a different
+    one is refused, and only an unanswered visit claims the gate. The **worker** rebuilds a
+    `GateDecision` from the same mapping to resume the graph with, which is what keeps the
+    reviewer's text out of the queue message entirely.
+
+    It returns the detail rather than the decision string because a second near-identical query
+    beside this one would be two statements answering one question over one row, and they would
+    drift - and then ADR 0007's four-case table would depend on which one a reader called.
     """
     with engine.connect() as conn:
-        return _decision_for_visit(conn, job_id=job_id, calls_used=calls_used)
+        return _detail_for_visit(conn, job_id=job_id, calls_used=calls_used)
 
 
 def count_reviewer_edits(engine: Engine, job_id: str) -> int:
@@ -609,15 +620,16 @@ def _audit(
     )
 
 
-def _decision_for_visit(conn: sa.Connection, *, job_id: str, calls_used: int) -> str | None:
-    """The decision already on record for one gate visit, inside the caller's transaction.
+def _detail_for_visit(conn: sa.Connection, *, job_id: str, calls_used: int) -> Any | None:
+    """The `reviewer_decision` detail on record for one gate visit, inside the caller's
+    transaction - the whole mapping rather than a projection of it (ADR 0011 decision 2).
 
     The predicate is ADR 0007's gate-visit key - `(job_id, calls_used)` - and it is the same
     one `record_gate_opened` finds its own row with, deliberately: one key, two rows, and a
     join between them.
     """
     return conn.execute(
-        sa.select(audit_events.c.detail["decision"].as_string())
+        sa.select(audit_events.c.detail)
         .where(
             audit_events.c.job_id == job_id,
             audit_events.c.action == "reviewer_decision",

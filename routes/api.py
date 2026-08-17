@@ -1,10 +1,10 @@
 """
 WHY THIS FILE EXISTS
-    The five endpoints in guidelines §12 and ARCHITECTURE.md §10, and nothing else. This is
+    The six endpoints in guidelines §12 and ARCHITECTURE.md §10, and nothing else. This is
     the outermost boundary in the system, so it gets the same typed treatment as every
     internal one: a model in, a model out, and one error shape for every failure.
 
-    Five things here are decisions rather than plumbing.
+    Six things here are decisions rather than plumbing.
 
     **One endpoint owns all three gate outcomes.** There is no `/reject` route and no `/edit`
     route: `POST /jobs/{id}/approve` takes `{decision: "approve" | "reject" | "edit"}`,
@@ -36,15 +36,23 @@ WHY THIS FILE EXISTS
     maps to, never a name in the body. An approval that cannot say who made it is
     accountability theatre (guidelines §9, §16).
 
-    Two Phase-2 shapes worth knowing before reading:
+    **The gate is read on its own route, not on `GET /jobs/{id}`** (ADR 0013). A reviewer
+    must be able to see what they are approving, and none of the six fields the status route
+    carries is the draft: `report` there means the *exported* body, which is null until the
+    export gate passes. `GET /jobs/{id}/gate` answers with the payload the gate node already
+    builds, rebuilt from the checkpoint. Keeping it off the status route is deliberate - that
+    one is polled every few seconds for twenty minutes, and a full report on every poll is
+    the cost of a rare read paid by the common one.
 
-      * `POST /jobs` inserts the job row and returns `202`. **It enqueues nothing**, because
-        SQS and the worker are Phase 3 (§21 step 20). The row and its `job_created` audit
-        event are real; what is missing is the thing that would pick the job up.
-      * The gate decision **resumes the graph in-process**. ARCHITECTURE.md §12 has the
-        endpoint enqueue a resume message for the worker instead, and that is what the
-        marked line below becomes in Phase 3 - the queue does not exist yet, and a decision
-        that recorded itself and then did nothing would be worse than one that runs.
+    **Both write routes end in an enqueue, and neither runs a graph** (ADR 0010, ADR 0011).
+    `POST /jobs` commits the row and then sends a start message; `POST /jobs/{id}/approve`
+    records the decision, claims the gate, and sends a resume. That is what makes both of
+    them return in milliseconds, and it is why the second one answers `running` rather than
+    the outcome - a caller that needs the outcome polls `GET /jobs/{id}`.
+
+    **A send that fails is a `503`, never a `202` or a `200`.** The row and the decision are
+    already committed by then, so the honest answer is that the work is not moving yet; the
+    fix is the same request again, which ADR 0007 makes a retry that writes nothing.
 
 WHO CALLS IT
     app.py mounts the router. Tests drive it through Starlette's TestClient.
@@ -57,21 +65,21 @@ import logging
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
-from langgraph.types import Command
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from config import Config
 from database import queries
-from graph.build import TERMINAL_STATUSES, ResearchGraph, refuse_edit, run_config
-from graph.state import ResearchState
+from graph.state import TERMINAL_STATUSES, ResearchState, refuse_edit, reviewer_payload, run_config
+from jobqueue import JobQueue, QueueError
 from routes.auth import Identity, identity_from
 from schemas import GateDecision, JobStatus, QualityFlag
 
@@ -134,19 +142,37 @@ class DecisionResponse(BaseModel):
     status: JobStatus
 
 
+class RedisProbe(Protocol):
+    """The one Redis question the API asks: does it answer?
+
+    Declared here rather than imported for the reason ADR 0012 gives: the route layer imports
+    no agent, no tool, and nothing it does not need. It needs one boolean for `/health`, so
+    that is the whole contract - no `get`, no `set`, no bucket.
+    """
+
+    def reachable(self) -> bool: ...
+
+
 @dataclass(frozen=True)
 class RouteDeps:
     """Everything the routes need, built once at startup and read from `app.state`.
 
-    `graph` is the compiled graph the API resumes at the gate and reads live state from. In
-    Phase 3 the resume becomes an enqueue and the worker holds the graph; the read stays,
-    because the reviewer payload's call count comes from the checkpoint either way.
+    **There is no graph and no LLM client here** (ADR 0012). `checkpoints` is a checkpoint
+    *reader* on the API's own pool: two routes read durable state through it - the gate-visit
+    key and the gate view - and neither needs the topology, an agent, or a credential. The
+    worker owns `setup()`, execution, and every LLM call.
+
+    `redis` is a health probe and nothing more (step 21). The API never caches, never
+    deduplicates a URL, and never takes a rate-limit token - those are the worker's, because
+    the worker is what fetches pages and calls models.
     """
 
     config: Config
     engine: Engine
-    graph: ResearchGraph
+    checkpoints: BaseCheckpointSaver[Any]
+    queue: JobQueue
     keys: dict[str, Identity]
+    redis: RedisProbe | None = None
 
 
 class ApiError(Exception):
@@ -221,8 +247,11 @@ def _owned(job: sa.Row[Any], identity: Identity) -> None:
 
 @router.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
 def submit_job(body: SubmitRequest, request: Request) -> SubmitResponse:
-    """Create the job row and accept the question. **Nothing runs it yet** - the queue and
-    the worker are Phase 3, so this is where a job starts and waits.
+    """Create the job row, then enqueue the pointer that makes a worker pick it up.
+
+    The row is written and committed first, and only then is the message sent. That order is
+    the one that can be recovered from: a row with no message is queryable and re-enqueueable,
+    while a message with no row would name a job that does not exist.
 
     The idempotency key is derived here, server-side, from the caller's own identity: a
     client cannot weaken it by sending a random value, and the database - not an
@@ -258,7 +287,22 @@ def submit_job(body: SubmitRequest, request: Request) -> SubmitResponse:
             job_id=existing.job_id,
         ) from None
 
-    return SubmitResponse(job_id=job_id, status="running")
+    # The insert is committed and the send is a separate call - they cannot share a
+    # transaction, so ADR 0010 decision 10 chooses which half is allowed to be true alone. The
+    # row stays: it holds the `idempotency_key` that makes a resubmission converge on this same
+    # job rather than creating a second one, and it is what a re-enqueue would target.
+    try:
+        deps.queue.send_start(job_id=job_id, user_id=identity.user_id, idempotency_key=key)
+    except QueueError:
+        logger.exception("job %s: recorded but not enqueued", job_id)
+        raise ApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "enqueue_failed",
+            "The job was recorded but could not be queued",
+            job_id=job_id,
+        ) from None
+
+    return SubmitResponse(job_id=job_id, status="queued")
 
 
 # --- 2. Poll status, and read the report once it exists -----------------------------
@@ -274,14 +318,68 @@ def read_job(job_id: str, request: Request) -> JobResponse:
     return JobResponse(
         job_id=job.job_id,
         status=job.status,
-        phase=_phase(deps.graph, job),
+        phase=_phase(job),
         revision_count=job.revision_count,
         quality_flag=job.quality_flag,
         report=job.report_json,
     )
 
 
-# --- 3. Decide at the human gate ----------------------------------------------------
+# --- 3. Read what the gate is asking about, then decide -----------------------------
+
+
+@router.get("/jobs/{job_id}/gate")
+def read_gate(job_id: str, request: Request) -> JSONResponse:
+    """What the reviewer is being asked to approve (ADR 0013).
+
+    The body is `graph.state.reviewer_payload()` **verbatim**, keys and order unchanged -
+    the same value the gate node passes to `interrupt()`. It is deliberately not a Pydantic
+    model here: a second definition of that shape would be a second thing to keep in step
+    with §12's ordering, and the ordering is the contract.
+
+    **It is rebuilt from the checkpoint, not from the job row**, because five of its values
+    exist nowhere else: `score`, `failed_dimensions`, `revision_count`, the report's section
+    bodies, and each claim's quote. `jobs.report_json` is null until export, `revision_count`
+    and `quality_flag` are written by `finalize`, and no table holds a section body or a
+    verdict quote. A route built from Postgres rows would answer with a report the reviewer
+    cannot read.
+
+    **Rebuilding reproduces the payload exactly.** `interrupt()` discards the node's writes
+    and LangGraph re-runs the node from the top on resume, so the checkpoint holds the state
+    the gate node was invoked with - the same property ADR 0007 relies on for its visit key.
+    Nothing has to be persisted to make this work, and nothing is.
+
+    **Reading is not deciding.** No write, no audit row, no gate claim, no status change, no
+    LLM call, no node execution. `get_state` loads a checkpoint; it does not run a graph.
+    """
+    deps = _deps(request)
+    identity = _caller(request)
+    job = _job_or_404(deps.engine, job_id)
+    _owned(job, identity)
+
+    if job.status != "awaiting_approval":
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "job_not_awaiting_approval",
+            f"This job is {job.status} and has no gate open",
+            job_id=job_id,
+        )
+
+    live = _live_state(deps.checkpoints, job_id)
+    if live is None:
+        # The row says a human is holding this job and the checkpoint has never heard of it,
+        # which contradicts ADR 0007 invariant 4. There is genuinely no gate to show, so the
+        # caller gets the code that says that; the contradiction goes to the log, where an
+        # explanation an anonymous caller must not see belongs (guidelines §16).
+        logger.error("job %s is awaiting_approval with no checkpoint behind it", job_id)
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "job_not_awaiting_approval",
+            "This job has no gate open",
+            job_id=job_id,
+        )
+
+    return JSONResponse(status_code=status.HTTP_200_OK, content=reviewer_payload(live))
 
 
 @router.post("/jobs/{job_id}/approve")
@@ -315,24 +413,26 @@ def decide(job_id: str, body: GateDecision, request: Request) -> DecisionRespons
             job_id=job_id,
         )
 
-    calls_used = _gate_visit(deps.graph, job_id)
+    calls_used = _gate_visit(deps.checkpoints, job_id)
     recorded = queries.read_gate_decision(deps.engine, job_id, calls_used=calls_used)
 
     if recorded is None:
         _accept(deps, job, identity, body, calls_used=calls_used)
-    elif recorded != body.decision:
+    elif recorded["decision"] != body.decision:
         # A reviewer who changes their mind waits for the job to come back to the gate, which
         # is the only point at which a new decision is a new decision (ADR 0007 invariant 3).
         raise ApiError(
             status.HTTP_409_CONFLICT,
             "gate_already_decided",
-            f"This gate visit was already answered with {recorded}",
+            f"This gate visit was already answered with {recorded['decision']}",
             job_id=job_id,
         )
     else:
         logger.info("job %s: %s retried by %s", job_id, body.decision, identity.user_id)
 
-    _resume(deps, job_id, body)
+    # ADR 0011 decision 3: a retried decision writes nothing, counts nothing, and enqueues -
+    # which is what "continues the graph" means in a process that no longer runs one.
+    _enqueue_resume(deps, job, calls_used=calls_used)
 
     decided = _job_or_404(deps.engine, job_id)
     return DecisionResponse(job_id=job_id, status=decided.status)
@@ -385,43 +485,39 @@ def _accept(
     logger.info("job %s: %s by %s", job_id, body.decision, identity.user_id)
 
 
-def _resume(deps: RouteDeps, job_id: str, body: GateDecision) -> None:
-    """Run the graph on from the gate, and reconcile the row with the checkpoint either way.
+def _enqueue_resume(deps: RouteDeps, job: sa.Row[Any], *, calls_used: int) -> None:
+    """Hand the job back to a worker. **The decision does not travel with it** (ADR 0011).
 
-    Phase 3 replaces the invoke with an enqueue and lets the worker resume (ARCHITECTURE.md
-    §12). Until the queue exists, the decision runs here rather than going nowhere.
+    It is already durable in `audit_events`, keyed by the same `(job_id, calls_used)` the
+    message deduplicates on, and the worker reads it from there - so the reviewer's own words
+    never reach the queue, and §20 row 8's "identifiers only, never state" survives.
 
-    A retry invokes the same thread - `thread_id = job_id` - so LangGraph replays from the
-    last checkpoint and the Planner, the Researcher and any finished Synthesizer pass do not
-    run again. The cost of a retry is the single node that was in flight, which re-executes
-    and converges because ADR 0005 keys every graph-time write. There is nothing to undo here,
-    only something to finish.
+    A failed send answers the same `503` `POST /jobs` uses, for the same reason: the decision is
+    recorded and the gate is claimed, so the honest answer is that the work is not moving yet.
+    Re-sending the identical decision is the fix, and ADR 0007 makes that a retry that writes
+    nothing and counts nothing.
 
-    The reconcile is in a `finally` because the failure path is the one that needed it: a
-    resume that raised used to leave the row claiming a human still held a job the checkpoint
-    had already moved past (ADR 0007). It is not wrapped in its own `try`: if it fails too,
-    that is a database the request cannot reach at all, and Python keeps the original
-    exception on the chain for the log.
+    **`_reconcile_status` is deliberately gone.** After ADR 0011 there is no resume here for it
+    to bracket, and a second writer of that column with nothing to bracket is a hazard rather
+    than a safety net (decision 4). `claim_gate` has already written `running`, which is true:
+    the gate is answered and the work is queued. The worker owns the reconcile from now on.
     """
+    job_id = cast(str, job.job_id)
     try:
-        deps.graph.invoke(Command(resume=body.model_dump()), run_config(job_id))
-    finally:
-        _reconcile_status(deps, job_id)
-
-
-def _reconcile_status(deps: RouteDeps, job_id: str) -> None:
-    """`jobs.status`, derived from the checkpoint rather than asserted beside it.
-
-    **The predicate is the pending interrupt, not `next`.** A job that has not yet entered the
-    gate also reports `next == ("human_gate",)` while no human is being waited on; only an
-    interrupt recorded against that task means the graph has actually stopped for a person.
-
-    A job `finalize` has already ended is left alone - `set_job_status` refuses to touch a
-    finished row - so the two transitions the graph owns stay the graph's.
-    """
-    waiting = bool(deps.graph.get_state(run_config(job_id)).interrupts)
-    status: JobStatus = "awaiting_approval" if waiting else "running"
-    queries.set_job_status(deps.engine, job_id=job_id, status=status)
+        deps.queue.send_resume(
+            job_id=job_id,
+            user_id=cast(str, job.user_id),
+            idempotency_key=cast(str, job.idempotency_key),
+            calls_used=calls_used,
+        )
+    except QueueError:
+        logger.exception("job %s: decision recorded but the resume was not enqueued", job_id)
+        raise ApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "enqueue_failed",
+            "The decision was recorded but the job could not be queued",
+            job_id=job_id,
+        ) from None
 
 
 def _refuse_unaffordable_edit(deps: RouteDeps, job_id: str, *, llm_calls_used: int) -> None:
@@ -479,15 +575,24 @@ def health(request: Request) -> JSONResponse:
     no version, no job data, no counts, no error text. If a check needs to explain itself,
     that explanation goes to the logs (guidelines §16).
 
-    **Redis is absent rather than false.** It arrives in Phase 3 and nothing reaches for it
-    yet, so reporting it unhealthy would fail every health check and mean an unhealthy task
-    is never replaced - the exact failure this route exists to avoid. The key appears when
-    the dependency does.
+    **`redis` appeared with step 21, which is when the dependency became real.** Until then
+    the key was deliberately absent rather than `false`, because reporting a dependency
+    nothing reaches for would have failed every health check forever - and an unhealthy task
+    is never replaced, which is the exact failure this route exists to avoid.
+
+    **An unreachable Redis is `degraded`, not a detail.** The API itself does not need Redis:
+    it makes no LLM call and fetches no page. What it is reporting is whether the *workers*
+    can work - the shared rate limiter fails closed, so with Redis gone no LLM call can be
+    made anywhere in the deployment. Failing this check is what takes the task out of the
+    target group so new jobs stop arriving in the first place (ARCHITECTURE.md §8), which
+    beats accepting jobs that would sit `queued` while every worker fails its first node.
     """
-    healthy = _database_reachable(_deps(request).engine)
+    deps = _deps(request)
+    checks = {"db": _database_reachable(deps.engine), "redis": _redis_reachable(deps.redis)}
+    healthy = all(checks.values())
     return JSONResponse(
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"status": "ok" if healthy else "degraded", "checks": {"db": healthy}},
+        content={"status": "ok" if healthy else "degraded", "checks": checks},
     )
 
 
@@ -587,15 +692,21 @@ def _job_or_404(engine: Engine, job_id: str) -> sa.Row[Any]:
     return job
 
 
-def _live_state(graph: ResearchGraph, job_id: str) -> ResearchState | None:
-    """The job's state as the checkpoint holds it right now, or None if it has never run."""
-    values = graph.get_state(run_config(job_id)).values
-    if not values:
+def _live_state(checkpoints: BaseCheckpointSaver[Any], job_id: str) -> ResearchState | None:
+    """The job's durable state, or None if it has never run. No graph, no topology, no LLM.
+
+    ADR 0012 decision 3. `get_tuple` loads a checkpoint the worker wrote, and reading durable
+    state is not executing a graph - which is why this route layer needs neither the agent stack
+    nor an LLM credential to serve the gate view.
+    """
+    stored = checkpoints.get_tuple(run_config(job_id))
+    if stored is None:
         return None
-    return cast(ResearchState, values)
+    values = stored.checkpoint["channel_values"]
+    return cast(ResearchState, values) if values else None
 
 
-def _gate_visit(graph: ResearchGraph, job_id: str) -> int:
+def _gate_visit(checkpoints: BaseCheckpointSaver[Any], job_id: str) -> int:
     """Which gate visit a decision answers: the job's live call count (ADR 0007).
 
     One read serves two purposes, which is why it happens for all three decisions rather than
@@ -608,21 +719,27 @@ def _gate_visit(graph: ResearchGraph, job_id: str) -> int:
     costs at least a Planner call - so it matches nothing, and the status check refuses the
     request a moment later anyway.
     """
-    live = _live_state(graph, job_id)
+    live = _live_state(checkpoints, job_id)
     return 0 if live is None else live["llm_calls_used"]
 
 
-def _phase(graph: ResearchGraph, job: sa.Row[Any]) -> str:
+def _phase(job: sa.Row[Any]) -> str:
     """A coarse progress label, not a stream (guidelines §12).
 
-    It is read off the checkpoint's next node, which is the one place that knows where a job
-    actually is. A job that has ended reports how it ended, and a job that has not started
-    reports that it is queued - which in Phase 2 is every job, because nothing dequeues yet.
+    **Derived from `jobs.status`, not from the checkpoint** (ADR 0012 decision 2). That is sound
+    because ADR 0007 invariant 4 is an *if and only if*: the row says `awaiting_approval`
+    exactly when the checkpoint holds a pending interrupt at the gate, and it is written by the
+    process that holds the checkpoint. Reading the projection **removes** a duplicated
+    derivation rather than adding one - and it makes `GET /jobs/{id}` a single-row read.
+
+    `awaiting_approval` renders as its node name because that is the one node a caller can act
+    on, which keeps a node name in the vocabulary guidelines §12 documents.
+
+    The trade is admitted rather than hidden: the API can no longer say *which* node a running
+    job is in. That was never actionable - the three states a caller can act on are "not
+    started", "waiting for me" and "ended" - and per-node progress belongs to Phase 4's trace.
     """
-    if job.status in ("approved", "rejected", "failed"):
-        return cast(str, job.status)
-    following = graph.get_state(run_config(job.job_id)).next
-    return following[0] if following else "queued"
+    return "human_gate" if job.status == "awaiting_approval" else cast(str, job.status)
 
 
 def _database_reachable(engine: Engine) -> bool:
@@ -633,3 +750,23 @@ def _database_reachable(engine: Engine) -> bool:
         logger.exception("health check could not reach the database")
         return False
     return True
+
+
+def _redis_reachable(redis: RedisProbe | None) -> bool:
+    """Whether Redis answers, for `/health` and for nothing else.
+
+    `None` means this process was built without one, which is what every API test that is not
+    about health does - and it reports `True`, because a check that was never configured is
+    not a failing dependency. The production wiring in `app.py` always passes one.
+
+    The probe is a Protocol rather than a `Redis`, so the route layer keeps its ADR 0012
+    property of importing nothing it does not need: `redis` is a worker dependency, and the
+    API borrows one method of it.
+    """
+    if redis is None:
+        return True
+    try:
+        return redis.reachable()
+    except Exception:  # noqa: BLE001 - the reason goes to the log, never to the caller
+        logger.exception("health check could not reach redis")
+        return False

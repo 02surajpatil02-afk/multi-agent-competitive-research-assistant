@@ -301,3 +301,132 @@ def pdf_bytes(*pages: str, title: str = "") -> bytes:
     buffer = BytesIO()
     writer.write(buffer)
     return buffer.getvalue()
+
+
+@dataclass
+class SentMessage:
+    """One message a fake queue accepted, with the two FIFO attributes that carry ADR 0010."""
+
+    body: dict[str, str]
+    group_id: str
+    deduplication_id: str
+
+
+class FakeQueue:
+    """`jobqueue.JobQueue`'s surface, in memory, including at-least-once delivery.
+
+    It exists so the offline suite can assert what the API *enqueued* without LocalStack: that
+    exactly one message was produced, that its group id is the job id, that its deduplication id
+    is the documented key, and above all that the body carries identifiers and nothing else.
+    The same properties are re-asserted against real SQS in the `integration` layer.
+
+    **A received message is in flight, not gone.** That is the property the worker is written
+    against (ADR 0010 decision 6): it deletes on three outcomes and on nothing else, so every
+    other path has to leave a message that comes back. `redeliver()` is what the visibility
+    timeout does, made explicit - a test says when it lapses, because a fake that redelivered on
+    its own would turn a failing message into an infinite loop in the drain helpers.
+
+    `receive_count` counts deliveries of the same message, which is what `ApproximateReceiveCount`
+    carries and what tells the worker a delivery is the last one before the dead-letter queue.
+
+    `fail_next` makes the next send raise, which is the only way to reach ADR 0010 decision
+    10's `503 enqueue_failed` from a test.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[SentMessage] = []
+        self.deleted: list[str] = []
+        self.fail_next = False
+        self._inbox: list[SentMessage] = []
+        self._in_flight: list[SentMessage] = []
+        self._receives: dict[str, int] = {}
+
+    # --- what the API calls ---
+
+    def send_start(self, *, job_id: str, user_id: str, idempotency_key: str) -> None:
+        self._accept(
+            {"job_id": job_id, "user_id": user_id, "idempotency_key": idempotency_key},
+            group_id=job_id,
+            deduplication_id=idempotency_key,
+        )
+
+    def send_resume(
+        self, *, job_id: str, user_id: str, idempotency_key: str, calls_used: int
+    ) -> None:
+        self._accept(
+            {"job_id": job_id, "user_id": user_id, "idempotency_key": idempotency_key},
+            group_id=job_id,
+            deduplication_id=f"{job_id}:{calls_used}",
+        )
+
+    def _accept(self, body: dict[str, str], *, group_id: str, deduplication_id: str) -> None:
+        from jobqueue import QueueError
+
+        if self.fail_next:
+            self.fail_next = False
+            raise QueueError("the fake queue was told to fail this send")
+
+        # SQS's own deduplication window, in its simplest honest form: a message with a
+        # deduplication id already seen is accepted and discarded (ADR 0010 decision 4). SQS
+        # forgets after five minutes and this never does, which is deliberate - a test that
+        # depended on the window reopening would be a test of the clock.
+        if any(message.deduplication_id == deduplication_id for message in self.sent):
+            return
+        message = SentMessage(body=body, group_id=group_id, deduplication_id=deduplication_id)
+        self.sent.append(message)
+        self._inbox.append(message)
+
+    # --- what the worker calls ---
+
+    def receive(self) -> Any:
+        from jobqueue import JobMessage
+
+        if not self._inbox:
+            return None
+        message = self._inbox.pop(0)
+        self._in_flight.append(message)
+        self._receives[message.deduplication_id] = (
+            self._receives.get(message.deduplication_id, 0) + 1
+        )
+        return JobMessage(
+            job_id=message.body["job_id"],
+            user_id=message.body["user_id"],
+            idempotency_key=message.body["idempotency_key"],
+            # One receipt handle per message rather than per delivery. Real SQS issues a new
+            # one each time; nothing here distinguishes them, and the deduplication id is the
+            # name a test can recognise a message by.
+            receipt_handle=message.deduplication_id,
+            receive_count=self._receives[message.deduplication_id],
+        )
+
+    def delete(self, message: Any) -> None:
+        self.deleted.append(message.receipt_handle)
+        self._in_flight = [
+            held for held in self._in_flight if held.deduplication_id != message.receipt_handle
+        ]
+
+    # --- what a test asks ---
+
+    def redeliver(self) -> int:
+        """The visibility timeout lapsing: everything received and not deleted becomes visible
+        again. Answers how many messages came back, so a test can assert that a failure left
+        one rather than merely that the next receive found something."""
+        returning = self._in_flight
+        self._in_flight = []
+        self._inbox.extend(returning)
+        return len(returning)
+
+    def in_flight(self) -> list[SentMessage]:
+        """Received, not deleted, and not yet redelivered - the messages SQS would give back."""
+        return list(self._in_flight)
+
+    def pending(self) -> list[SentMessage]:
+        """Waiting to be received. What a worker would pick up next."""
+        return list(self._inbox)
+
+    def bodies(self) -> list[dict[str, str]]:
+        return [message.body for message in self.sent]
+
+    def only(self) -> SentMessage:
+        assert len(self.sent) == 1, f"expected one message, got {len(self.sent)}"
+        return self.sent[0]

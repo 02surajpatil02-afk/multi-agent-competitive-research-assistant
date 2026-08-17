@@ -66,13 +66,25 @@ dependencies = [
     # The server behind `uvicorn app:app --reload` (CLAUDE.md commands). Nothing imports it;
     # it is how the application is run, in development and in the API container.
     "uvicorn[standard]==0.52.3",
+    # SQS, for the job queue (implementation step 20). It earns its place by being the only
+    # client for the FIFO attributes ADR 0010 depends on - MessageGroupId, the deduplication id
+    # and the redrive policy - and by working unchanged against LocalStack, which is what makes
+    # the local integration tests worth running. `jobqueue.py` is the only module that imports
+    # it; S3 joins the same client in a later stage.
+    "boto3==1.43.72",
+    # Short-term state, for the job queue's other half (implementation step 21). It earns its
+    # place by being the only way the rate limiter can be *shared*: two workers each politely
+    # limiting themselves to 40 requests per minute produce 80 (guidelines §11), and the
+    # process-local alternative is a different thing wearing the same name. The caches and the
+    # per-job URL set ride the same client. `redisstore.py` is the only module that imports it.
+    "redis==8.1.0",
 ]
 
 # Deliberately absent until something imports them:
-#   boto3, redis - Phase 3, and Secrets Manager in Phase 5.
+#   Secrets Manager (boto3 already covers the client) - Phase 5.
 #
 # langchain-core arrives transitively under langgraph and is imported directly in exactly
-# one place, for the RunnableConfig type that graph/build.run_config() returns. It is not
+# one place, for the RunnableConfig type that graph/state.run_config() returns. It is not
 # pinned here because nothing chooses its version: langgraph does.
 
 [project.optional-dependencies]
@@ -90,12 +102,21 @@ build-backend = "setuptools.build_meta"
 # `python -m eval.run` all run from here (CLAUDE.md commands). Listed explicitly because
 # the layout is flat, so setuptools cannot auto-discover it.
 [tool.setuptools]
-py-modules = ["app", "config", "schemas", "llm_client"]
+py-modules = ["app", "config", "schemas", "llm_client", "jobqueue", "redisstore", "worker"]
 packages = ["agents", "database", "graph", "routes", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Three markers, so a failure says which layer broke. Everything unmarked is the offline
+# suite: no service, no network (guidelines §18). Each marked layer needs one Compose service
+# and skips when its own variable is unset, so `pytest` stays offline by default and
+# `pytest -m <marker>` runs exactly that layer.
+markers = [
+    "postgres: needs the real PostgreSQL 16 from docker-compose.yml, via TEST_DATABASE_URL",
+    "integration: needs LocalStack SQS from docker-compose.yml, via SQS_ENDPOINT_URL",
+    "redis: needs the real Redis 7 from docker-compose.yml, via TEST_REDIS_URL",
+]
 
 [tool.ruff]
 line-length = 100
@@ -123,4 +144,11 @@ strict = true
 # immediately, so the untyped surface stops at that one function.
 [[tool.mypy.overrides]]
 module = "tavily.*"
+ignore_missing_imports = true
+
+# boto3 and botocore ship no py.typed marker either. jobqueue.py is the only module that
+# imports them, and it converts every response into a JobMessage or a plain dict immediately,
+# so the untyped surface stops at that one boundary - the same argument as tavily above.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
 ignore_missing_imports = true

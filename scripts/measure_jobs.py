@@ -77,9 +77,16 @@ from typing import Any, cast
 
 from langgraph.types import Command
 
-from config import Config, load_config
-from graph.build import ResearchGraph, build_graph, run_config
-from graph.state import ResearchState, new_state
+from config import Config, load_config, required
+from graph.build import (
+    ResearchGraph,
+    build_graph,
+)
+from graph.state import (
+    ResearchState,
+    new_state,
+    run_config,
+)
 from llm_client import LLMClient
 from schemas import Report, Verdict
 
@@ -422,7 +429,7 @@ def _to_result(
         status="crashed" if crash else (state["status"] if state else "unknown"),
         failure_reason=crash or (state["failure_reason"] if state else "no final state"),
         recorded_at=datetime.now(UTC).isoformat(timespec="seconds"),
-        model=config.llm_model,
+        model=required(config.llm_model, "LLM_MODEL"),
         wall_seconds=round(progress.wall_seconds, 1),
         node_seconds={name: round(value, 1) for name, value in progress.node_seconds.items()},
         # State is the authority while there is one - it is the number invariant 3 is

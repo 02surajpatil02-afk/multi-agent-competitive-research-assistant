@@ -58,7 +58,7 @@ from llm_client import (
     LLMFailureReason,
 )
 from schemas import FetchedPage, Finding, JobStatus, SearchResult, Subtopic, SubtopicStatus
-from tools.contracts import ToolCache, ToolCallFailed, Unreachable
+from tools.contracts import ToolCache, ToolCallFailed, Unreachable, UrlDeduplicator
 from tools.fetch import fetch
 from tools.search import search
 from tools.untrusted import as_untrusted_block
@@ -122,6 +122,7 @@ def research_subtopic(
     config: Config,
     llm: LLMClient,
     cache: ToolCache | None = None,
+    urls: UrlDeduplicator | None = None,
 ) -> ResearcherUpdate:
     """Research the first pending subtopic and return the findings it produced.
 
@@ -141,7 +142,9 @@ def research_subtopic(
     deadline = monotonic() + SUBTOPIC_TIMEOUT_S
     budget = CallBudget(limit=config.max_llm_calls_per_job, used=state["llm_calls_used"])
 
-    pages = _pages_to_read(subtopic, state, config=config, cache=cache, deadline=deadline)
+    pages = _pages_to_read(
+        subtopic, state, config=config, cache=cache, urls=urls, deadline=deadline
+    )
     findings, fatal = _extract(
         pages,
         subtopic,
@@ -181,6 +184,7 @@ def _pages_to_read(
     *,
     config: Config,
     cache: ToolCache | None,
+    urls: UrlDeduplicator | None,
     deadline: float,
 ) -> list[FetchedPage]:
     """Choose and fetch the pages this subtopic will extract from, one at a time.
@@ -189,6 +193,14 @@ def _pages_to_read(
     keeps one page from being read twice, and the deadline is checked between sources
     because that is the only place a bound on "how many tools may this subtopic spend" can
     honestly sit - the tools own their own timeouts.
+
+    **Two deduplication gates, and they cover different failures.** `seen` is in-process and
+    is seeded from the findings this job already holds, so it is free and always correct for
+    the run in front of it. `urls` is the shared `job:{id}:urls` set (guidelines §7, §11),
+    and it is what survives a process: a redelivered message re-runs a Researcher node whose
+    findings were never checkpointed, and without it that node re-fetches every page it
+    already read. Neither replaces the other, and the local one is checked first because it
+    costs nothing.
     """
     seen = {normalize_url(str(finding.url)) for finding in state["findings"]}
     pages: list[FetchedPage] = []
@@ -202,9 +214,10 @@ def _pages_to_read(
 
         url = normalize_url(str(result.url))
         if url in seen:
-            # The same page twice is wasted budget and double-counted evidence. This covers
-            # one job in one process; the shared job:{id}:urls set arrives with Redis.
+            # The same page twice is wasted budget and double-counted evidence.
             logger.info("skipping %s, already used by this job", url)
+            continue
+        if not _unseen_across_the_job(urls, state["job_id"], url):
             continue
         seen.add(url)
 
@@ -212,11 +225,33 @@ def _pages_to_read(
         if page is None:
             continue
         # The URL a redirect chain actually landed on, so a second candidate pointing at
-        # the same page does not fetch it again.
-        seen.add(normalize_url(str(page.url)))
+        # the same page does not fetch it again. Recorded in both gates, because a redirect
+        # target reached by one job is exactly what a later visit should skip.
+        landed = normalize_url(str(page.url))
+        seen.add(landed)
+        if landed != url:
+            _unseen_across_the_job(urls, state["job_id"], landed)
         pages.append(page)
 
     return pages
+
+
+def _unseen_across_the_job(urls: UrlDeduplicator | None, job_id: str, url: str) -> bool:
+    """Whether this job has not fetched `url` before, and record that it now has.
+
+    **Absent or broken means yes** (guidelines §11's fail-open rule). No deduplicator at all
+    is Phase 1's behaviour and is what the offline suite runs on; a deduplicator that cannot
+    reach Redis answers True itself, which is what its protocol promises. Either way the cost
+    is one wasted fetch and a duplicate finding, both bounded by `MAX_LLM_CALLS_PER_JOB` -
+    and refusing to research because a deduplication cache is down would trade a real outage
+    for an optimisation.
+    """
+    if urls is None:
+        return True
+    if urls.add_if_new(job_id, url):
+        return True
+    logger.info("skipping %s, already fetched by this job in an earlier pass", url)
+    return False
 
 
 def _extract(

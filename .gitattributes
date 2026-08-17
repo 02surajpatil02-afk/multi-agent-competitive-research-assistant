@@ -1,0 +1,5 @@
+# The bootstrap scripts are mounted into Linux containers and run by their shells. A CRLF
+# checkout on Windows makes the shebang line unparseable, and the container fails with
+# `no such file or directory` naming a file that is plainly there - so the line endings are
+# pinned rather than left to the developer's core.autocrlf.
+*.sh text eol=lf

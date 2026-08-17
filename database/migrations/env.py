@@ -20,6 +20,15 @@ WHY THIS FILE EXISTS
     migrations against database/schema.py. A test does exactly that, so the two cannot
     drift apart quietly.
 
+    **`include_name` is what stops that comparison being destructive.** Two things own tables
+    in this database: Alembic owns the five application tables, and LangGraph's
+    `PostgresSaver.setup()` owns four checkpoint tables that `metadata` deliberately does not
+    describe (guidelines §19). Autogenerate proposes dropping anything it finds and
+    `metadata` does not name, so against any database a worker has run - measured: four
+    `DropTableOp` and three `remove_index` - it would offer to delete the state every paused
+    job resumes from. The hook excludes exactly those four by name and nothing else, so a
+    genuine application-schema difference is still reported.
+
 WHO CALLS IT
     Alembic, when a migration command runs. Nothing imports it.
 """
@@ -32,7 +41,7 @@ from alembic import context
 from sqlalchemy import create_engine
 
 from database.queries import sqlalchemy_url
-from database.schema import metadata
+from database.schema import alembic_include_name, metadata
 
 target_metadata = metadata
 
@@ -57,7 +66,14 @@ def run_migrations() -> None:
     engine = create_engine(_database_url())
     try:
         with engine.connect() as connection:
-            context.configure(connection=connection, target_metadata=target_metadata)
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                # Without this, autogenerate against any database a worker has started
+                # against proposes dropping LangGraph's four checkpoint tables - see the
+                # hook and `CHECKPOINTER_TABLES` in database/schema.py.
+                include_name=alembic_include_name,
+            )
             with context.begin_transaction():
                 context.run_migrations()
     finally:

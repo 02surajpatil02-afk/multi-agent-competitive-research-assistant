@@ -37,15 +37,44 @@ WHO CALLS IT
 
 from __future__ import annotations
 
-from typing import Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from schemas import JobStatus, QualityFlag
 
+if TYPE_CHECKING:
+    # Only for the two hook argument types below. Kept out of the runtime imports because
+    # database.schema is on the API's and the graph's import path, and neither needs Alembic
+    # loaded to read a table definition.
+    from alembic.runtime.environment import NameFilterParentNames, NameFilterType
+
 metadata = sa.MetaData()
 """Every application table. The checkpointer's tables are not in here (guidelines §19)."""
+
+CHECKPOINTER_TABLES = frozenset(
+    {"checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"}
+)
+"""The tables LangGraph's `PostgresSaver.setup()` owns, named here so Alembic can be told to
+leave them alone. **This is the complement of `metadata`, not an addition to it** - nothing here
+is a `sa.Table`, and adding one would hand Alembic a second owner for a schema it does not
+manage.
+
+**Why the list has to exist at all.** Autogenerate compares the database against `metadata` and
+proposes dropping whatever it finds that `metadata` does not describe. In a database where a
+worker has run - which is every database from Phase 3 onwards - that is these four tables, and
+the proposal is `DropTableOp` on the state every paused job depends on.
+
+**It is a deny-list rather than an allow-list, deliberately.** "Ignore everything `metadata`
+does not name" would be shorter and would also silence the case Alembic is *supposed* to catch:
+a table dropped from this file that still exists in the database. Naming the four keeps that
+detection intact for everything else.
+
+The cost of naming them is that the list can go stale if LangGraph adds a fifth.
+`tests/test_checkpointer_postgres.py` runs the real `setup()` and fails if it creates a table
+this set does not name, so the staleness is loud rather than silent.
+"""
 
 SYSTEM_ACTOR = "system"
 """`audit_events.actor` for a transition the graph made on its own. Anything that happened
@@ -70,6 +99,28 @@ when the scoring call fails and the report is kept, and §9's list simply does n
 Both are in the specification, so the vocabulary follows the requirement rather than the
 list, and the discrepancy is worth correcting in §9 rather than silently working around.
 """
+
+
+def alembic_include_name(
+    name: str | None, type_: NameFilterType, parent_names: NameFilterParentNames
+) -> bool:
+    """Whether autogenerate may consider a reflected object. Alembic's `include_name` hook.
+
+    Excluding a table here stops it being reflected at all, so its indexes and constraints go
+    with it - which is why this one predicate covers the whole table rather than needing a
+    matching rule per object type.
+
+    **It answers for tables and nothing else.** An index or a constraint that happens to share
+    a name with one of these tables is still compared, because the boundary being defended is
+    ownership of a table, not of a string.
+
+    Wired up in database/migrations/env.py, which is the only place that runs a real
+    autogenerate. The tests pass it to `compare_metadata` directly so they check this function
+    rather than a copy of it.
+    """
+    if type_ == "table":
+        return name not in CHECKPOINTER_TABLES
+    return True
 
 
 def _json() -> sa.types.TypeEngine[Any]:

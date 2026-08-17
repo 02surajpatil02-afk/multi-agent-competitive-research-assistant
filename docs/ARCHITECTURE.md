@@ -1,12 +1,15 @@
 # ARCHITECTURE — Multi-Agent Competitive Research Assistant
 
-> **Status: Phase 1 is built.** The graph runs locally, end to end, in memory: `config.py`,
-> `schemas.py`, `llm_client.py`, `tools/`, the five agents in `agents/`, the reflection node and the
-> LangGraph wiring in `graph/`, `scripts/check_model.py`, and the `tests/` suite all exist and pass.
+> **Status: Phases 1 and 2 are built, and Phase 3 is under way.** The graph runs end to end
+> (`config.py`, `schemas.py`, `llm_client.py`, `tools/`, `agents/`, `graph/`); PostgreSQL holds the
+> five application tables and the checkpointer's own (`database/`); the six routes and API-key auth
+> are up (`routes/`, `app.py`); and since **2026-08-17** a job is dispatched through **SQS and run by
+> `python -m worker`** (`jobqueue.py`, `worker.py`), with the Compose stack behind it.
 >
-> **Phases 2–5 are not built.** No database, no API, no worker, no Redis, no S3, no container, no
-> migration, no AWS. §1's "built vs planned" table is the per-capability answer, and every section
-> below marks what is implemented where the distinction matters.
+> **What is not built:** Redis has no application code (step 21), there is no S3 write, no application
+> image and no CI (steps 22–23), no AWS at all (Phase 5), and no eval set (Phase 4). §1's "built vs
+> planned" table is the per-capability answer, and every section below marks what is implemented where
+> the distinction matters.
 >
 > This document is the **blueprint the implementation is written against**. If code exists and this
 > document disagrees with it, this document is wrong and must be corrected.
@@ -102,6 +105,11 @@ intake → plan → research (per subtopic) → synthesize → fact-check → re
 
 ### Phase 1 today
 
+> **Superseded for the API and the worker as of 2026-08-17.** Phase 3 stage 2 made a job's execution a
+> **two-process** affair: `uvicorn app:app` writes a row and enqueues a pointer, and `python -m worker`
+> is what invokes the graph. The paragraph below still describes what the offline suite and
+> `scripts/measure_jobs.py` do — one process, both durable stores absent — and that is why it stays.
+
 **One Python process, no infrastructure.** A job is a call to `build_graph()` and `invoke()`: the
 Supervisor routes, the five agents run, the reflection node scores, the graph pauses at the human
 gate with `interrupt()`, and a resume decision carries it through the export gate to `finalize`.
@@ -110,8 +118,10 @@ parameter:** a process that has to survive a restart passes the Postgres one, an
 the offline suite, `scripts/measure_jobs.py` - gets the in-memory one and dies with the process, which
 is acceptable there because neither is what durability is for (CLAUDE.md phase plan).
 
-The lifecycle above is the Phase 3+ shape. Steps 1–2 and 5–8 of it — the API, the queue, the
-database, and the presigned URL — do not exist yet; the graph in the middle does.
+The lifecycle above is the Phase 3+ shape, and most of it now exists: the API (step 18), the database
+(steps 13–16), and the queue and worker (stage 2, step 20). **The presigned URL is what is still
+missing** — `GET /jobs/{id}/report` answers `404 not_exported` until the S3 write lands in step 22, and
+the approved body is read from `GET /jobs/{id}` until then.
 
 ### Eventual AWS production shape (Phase 5)
 
@@ -132,9 +142,12 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | Test suite: unit, agent contract, graph, integration, injection | 1 | **Built** — `tests/`, zero network calls |
 | MCP protocol client or server | — | **Not built, and not scheduled.** The boundary is in-process (§7) |
 | Postgres checkpointer; `jobs` / `findings` / `claims` / `claim_sources` / `audit_events` and their Alembic migration; the audit trail written as the graph runs; the export gate's write to `jobs.report_json` | 2 | **Built** (2026-08-15, steps 13–16) — `database/`, `graph/build.py`. Both stores are injected: the graph runs exactly as it did in Phase 1 without them ([ADR 0005](adr/0005-graph-time-persistence-semantics.md)) |
-| `POST /jobs/{id}/approve`, the reviewer payload, the API and API-key auth | 2 | **Built** (2026-08-16, steps 17–18) — `routes/`, `app.py`. The gate resumes in-process; the enqueue in §12 arrives with the Phase 3 worker |
-| Docker Compose, async worker, SQS/S3 via LocalStack, CI | 3 | Planned |
-| Redis: shared rate limiter, caches, URL dedupe | 3 | Planned — the interfaces exist and are wired (§7) |
+| `POST /jobs/{id}/approve`, the reviewer payload, the API and API-key auth | 2 | **Built** (2026-08-16, steps 17–18) — `routes/`, `app.py`. The gate's resume moved to the worker on 2026-08-17 ([ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md)) |
+| Docker Compose: PostgreSQL 16, Redis 7, LocalStack for SQS + S3 | 3 | **Built** (2026-08-17, stage 1) — `docker-compose.yml`, `docker/`. Services only; there is no application image |
+| The queue and the async worker: pointer messages, FIFO groups, `queued`, the worker's start/resume/continue, the runtime bound, the DLQ path | 3 | **Built** (2026-08-17, stage 2, step 20) — `jobqueue.py`, `worker.py`, `rev_0002`. Against LocalStack, not AWS |
+| The API stops holding a graph or an LLM client | 3 | **Built** (2026-08-17) — [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). `uvicorn app:app` starts with no LLM or Tavily credential |
+| S3 export write, the application image, CI | 3 | Planned — steps 22 and 23 |
+| Redis: shared rate limiter, caches, URL dedupe | 3 | **Built** (2026-08-17, step 21) — `redisstore.py`. Fail-open caches and URL set, fail-closed limiter (§20 row 29), verified against a real Redis 7 |
 | LangSmith tracing, eval dataset, eval as a release gate | 4 | Planned |
 | AWS deployment, Cognito JWT, CloudWatch alarms | 5 | Planned |
 
@@ -692,7 +705,7 @@ state, and the Supervisor decides who runs next (CLAUDE.md invariant 5).
 | `hop_count` | `int` | Supervisor | Current (counter) | Compared against `MAX_SUPERVISOR_HOPS` |
 | `llm_calls_used` | `int` | Every LLM caller | Current (counter) | Compared against `MAX_LLM_CALLS_PER_JOB` |
 | `reviewer_edit_text` | `str \| None` | **The gate sets it and the gate clears it** (ADR 0006) | Current (**set once, consumed once**) | The `edit` decision's text. It reaches the Synthesizer's prompt, and reflection reads it as the edit pass's marker — so the clear waits for the next gate decision rather than happening mid-pass |
-| `status` | `Literal["running","awaiting_approval","approved","rejected","failed"]` | Gate, finalize | Current | The externally visible job state |
+| `status` | `Literal["queued","running","awaiting_approval","approved","rejected","failed"]` | Gate, finalize | Current | The externally visible job state. `queued` was added by [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 1: it is what `POST /jobs` writes, and the worker is the only thing that moves it to `running`. **On state it is never seen** — `new_state()` starts a job `running`, because state exists only once a worker is invoking |
 | `failure_reason` | `str \| None` | Whichever guard trips | Current | Set whenever `status=failed`; never left `None` on a failure |
 
 **Reducers.** Exactly two fields use `operator.add`: `findings` and `verdicts`. Everything else is
@@ -1233,13 +1246,20 @@ an `audit_events` row**.
 
 ### Redis — short-lived operational state
 
+> **Built, 2026-08-17 (step 21)** — `redisstore.py`, wired by `worker.py`.
+
 | Key | Contents | TTL |
 |---|---|---|
-| `job:{id}:scratch` | Working state for the running job | 6h |
 | `job:{id}:urls` | URLs already fetched, for dedupe | 6h |
 | `ratelimit:llm` | **Shared** token bucket across all workers | rolling 60s |
 | `cache:search:{hash}` | Search results by argument hash | 24h |
 | `cache:fetch:{hash}` | Fetched page text by URL hash | 24h |
+
+**A `job:{id}:scratch` row was listed here and is gone.** It described "working state for the running
+job" at a 6h TTL and had no writer, no reader and no design; the working state of a running job is
+`ResearchState` in the checkpoint (§5), which is durable and authoritative. A TTL'd copy would be a
+second source of truth for the one thing the paragraph below forbids. Removed at step 21 rather than
+implemented (gl §11).
 
 The rate limiter is **shared and global, not per worker**. Two workers each politely limiting
 themselves to 40 requests per minute produce 80 (gl §11).
@@ -1372,7 +1392,7 @@ audit_events  (event_id PK, job_id FK, actor, action, detail JSONB, created_at)
 | `user_id` | Owner. Single tenant today; every table carries it so tenant scoping is additive |
 | `question` | The original text, validated and length-capped at the API |
 | `idempotency_key` | **UNIQUE, NOT NULL.** `sha256(user_id + question + date)`, derived server-side. See below |
-| `status` | Lifecycle: `running` → `awaiting_approval` → `approved` / `rejected` / `failed` |
+| `status` | Lifecycle: `queued` → `running` → `awaiting_approval` → `approved` / `rejected` / `failed`. **Three transitions, three owners:** the API writes `queued` on insert and `running` at `claim_gate`; the worker writes `running` on receipt and reconciles on exit; the gate node writes `awaiting_approval`; `finalize` writes the terminal status ([ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md)) |
 | `quality_flag` | `NULL`, `below_threshold` (a failing score no automatic cycle can fix: the revision cap, or every subtopic already `unresearched` — ADR 0004), or `unscored` (the scoring call failed and the report was kept) |
 | `revision_count`, `llm_calls_used` | Persisted so budget behaviour is auditable after the job ends. **Written by `finalize` only**, so both read `0` while a job waits at the gate — anything needing the live count reads the checkpoint, never this row (ADR 0005; [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md) decision 7) |
 | `report_json` | **JSONB, nullable.** The approved `Report` body, written by the export node **only after the gate passes**. `NULL` means nothing was ever exported. This is what makes the report retrievable in Phase 2, before S3 exists (§8) |
@@ -1496,16 +1516,17 @@ writes its own row saying so.
 
 ## 10. API Architecture
 
-Five routes. This is the outermost contract in the system, so it gets the same typed treatment as
+Six routes. This is the outermost contract in the system, so it gets the same typed treatment as
 every internal boundary. **Every route except `/health` requires authentication** (gl §12, gl §16).
 
 | # | Method | Path | Purpose |
 |---|---|---|---|
 | 1 | `POST` | `/jobs` | Submit a research question |
 | 2 | `GET` | `/jobs/{id}` | Poll status, and read the report once it exists |
-| 3 | `POST` | `/jobs/{id}/approve` | Decide at the human gate — approve, reject, or edit |
-| 4 | `GET` | `/jobs/{id}/report` | Get a presigned URL for the exported artifact |
-| 5 | `GET` | `/health` | Liveness and dependency check |
+| 3 | `GET` | `/jobs/{id}/gate` | Read what the gate is asking about, before deciding |
+| 4 | `POST` | `/jobs/{id}/approve` | Decide at the human gate — approve, reject, or edit |
+| 5 | `GET` | `/jobs/{id}/report` | Get a presigned URL for the exported artifact |
+| 6 | `GET` | `/health` | Liveness and dependency check |
 
 ### 1. `POST /jobs`
 
@@ -1533,16 +1554,55 @@ every internal boundary. **Every route except `/health` requires authentication*
 
 | Value | Meaning |
 |---|---|
-| `queued` | The checkpoint has no next node — the job has not started. **In Phase 2 that is every job until something runs it**, because `POST /jobs` enqueues nothing |
-| `supervisor` · `planner` · `researcher` · `synthesizer` · `fact_checker` · `reflection` · `human_gate` · `export` · `finalize` | The next node in the checkpoint. These are the graph's node names (§3), which is what makes the field widen cheaply rather than needing a second vocabulary |
-| `approved` · `rejected` · `failed` | The job has ended; `phase` repeats the terminal `status` rather than naming a node |
+| `queued` | Submitted, and no worker has received its message yet |
+| `running` | A worker is invoking the graph |
+| `human_gate` | Stopped at the gate, waiting for a reviewer — the one node a caller can act on, which is why it keeps a node name in the vocabulary |
+| `approved` · `rejected` · `failed` | The job has ended; `phase` repeats the terminal `status` |
+
+**`phase` is derived from `jobs.status`** ([ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md)
+decision 2), which is what makes `GET /jobs/{id}` a single-row read. That is sound because ADR 0007
+invariant 4 is an *if and only if*: the row says `awaiting_approval` exactly when the checkpoint holds
+a pending interrupt at the gate, and it is written by the process that holds the checkpoint.
+
+**The trade is admitted rather than hidden.** The API can no longer name the individual node a running
+job is in — the field used to carry every node name from §3. Nothing consumed that, the three states a
+caller can act on are "not started", "waiting for me" and "ended", and per-node progress belongs to
+Phase 4's trace. If a UI ever needs it, decision 6 says the shape is a `jobs.phase` column the worker
+writes, not a graph in the API.
 
 **A failed job reads `status: "failed"`, `phase: "failed"`, `report: null`.** There is deliberately no
 reason field: the reason lives in the durable checkpoint for Phase 2, and
 [ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md) records why and which
 phase owns the durable one.
 
-### 3. `POST /jobs/{id}/approve`
+### 3. `GET /jobs/{id}/gate`
+
+- **Response:** `reviewer_payload()`'s dict, verbatim and in §12's order — `job_id`,
+  `unsupported_claims`, `unresearched_subtopics`, `quality_flag`, `score`, `failed_dimensions`,
+  `revision_count`, `llm_calls_used`, `report`, `claims`
+- **Codes:** `200` · `401` · `403` not the owner · `404` · `409` job is not `awaiting_approval`
+- **Auth:** required. **Authz:** identical to `GET /jobs/{id}` — a `submitter` must own the job; a
+  `reviewer` may read any.
+- **Behaviour:** rebuilt from the durable checkpoint for `thread_id = job_id`. **No graph
+  execution, no node execution, no LLM call, no tool call, and no write of any kind** — no audit
+  row, no gate claim, no status change. Reading is not deciding
+  ([ADR 0013](adr/0013-reviewer-gate-payload-view.md)).
+
+**This is the route that makes an approval a judgement.** Route 2's `report` is the *exported* body
+and is `null` until the export gate passes, and `revision_count` and `quality_flag` are written by
+`finalize` — so a reviewer polling route 2 at the gate sees nothing they could judge. Five of this
+payload's values exist **only** in the checkpoint: `score`, `failed_dimensions`, `revision_count`,
+the report's section bodies, and each claim's quote.
+
+**It is deliberately not part of route 2.** That one is designed to be polled every few seconds for
+twenty minutes; a full report on every poll makes the common case pay for the rare one, and `report`
+would have to mean both "the exported artifact" and "a draft that may never be exported".
+
+**Only an open gate has a payload.** Approved, rejected, failed and never-run jobs answer `409`: the
+route is a decision surface, not a history API, and a closed job's checkpoint may be pruned while its
+row lives out the retention window (ADR 0008).
+
+### 4. `POST /jobs/{id}/approve`
 
 - **Request:** `{decision: "approve" | "reject" | "edit", note?, edits?}`
 - **Response:** `{job_id, status}`
@@ -1559,7 +1619,7 @@ phase owns the durable one.
 defines it. Approving a report is an authorization decision and it is the backstop the whole
 injection defense leans on, so one authenticated endpoint owns all three outcomes (gl §16).
 
-### 4. `GET /jobs/{id}/report`
+### 5. `GET /jobs/{id}/report`
 
 - **Response:** `{url, expires_at}` — presigned S3 URL, 15-minute expiry
 - **Codes:** `200` · `401` · `403` · `404` not exported
@@ -1569,7 +1629,7 @@ injection defense leans on, so one authenticated endpoint owns all three outcome
 - **Phase 2:** always `404 not exported`, because there is no artifact until S3 arrives in Phase 3.
   The approved report body is read from `GET /jobs/{id}`, which already carries `report?` (§8).
 
-### 5. `GET /health`
+### 6. `GET /health`
 
 - **Response:** `{status, checks}` — booleans only, one key per dependency the process actually
   reaches. **Phase 2 checks `db` and nothing else; `redis` appears when Phase 3 provides it.** A
@@ -1603,14 +1663,21 @@ searches and fetches each, three LLM-heavy stages, possibly three passes. An HTT
 that connection (gl §12). The caller polls `GET /jobs/{id}`.
 
 ```text
-POST /jobs  → validate, persist, enqueue, return 202 + job_id
+POST /jobs  → validate, persist (status = queued), enqueue, return 202 + job_id
                                  ↓
-                         SQS (LocalStack locally)
+                         SQS FIFO (LocalStack locally)
                                  ↓
-                         worker: run the graph
+                worker: queued → running, run the graph
                                  ↓
 GET /jobs/{id} → status, and the report when it exists
 ```
+
+**A gate decision is asynchronous on the same terms, and this is the part a client feels**
+([ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md) decision 5).
+`POST /jobs/{id}/approve` records the decision, claims the gate, enqueues a resume, and answers
+`200 {job_id, status: "running"}` — **not** the outcome of the resume. Polling `GET /jobs/{id}` is how
+a caller learns whether the export passed, which is what this section already asks them to do for a
+job that takes minutes.
 
 ### Error response shape
 
@@ -1646,27 +1713,39 @@ approved" into "this person approved it", which is the only version worth auditi
 
 ## 11. Async Worker Architecture
 
+> **Built, 2026-08-17 (Phase 3 stage 2)** - `jobqueue.py` and `worker.py`, against LocalStack SQS.
+> Three things in this section were corrected by
+> [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) as it was implemented,
+> and the text below now carries the corrected ones: the message has **no `attempt` field**, the
+> visibility timeout is **derived rather than asserted**, and `MAX_JOB_RUNTIME` bounds **one
+> invocation** rather than a job's lifetime. Where this section and an ADR still disagree, the ADR
+> wins and this section is the thing to fix.
+>
+> What is **not** built: the DLQ alarm (there is no CloudWatch), the S3 write in the flow below
+> (step 22), and any worker on AWS. The queue is LocalStack's.
+
 ### The flow
 
 ```mermaid
 flowchart TD
     A["POST /jobs - API container"] --> B["validate question<br/>derive idempotency_key"]
-    B --> C["insert jobs row<br/>unique on idempotency_key"]
+    B --> C["insert jobs row - status = queued<br/>unique on idempotency_key"]
     C -->|"duplicate key"| DUP["409 - return the existing job_id"]
     C -->|"inserted"| D["enqueue pointer message"]
-    D --> E["202 + job_id to the caller"]
-    D --> Q["SQS - visibility 25 min"]
+    D -->|"send failed"| FAIL503["503 enqueue_failed<br/>the row stays queued"]
+    D --> E["202 + job_id, status queued"]
+    D --> Q["SQS FIFO - group = job_id<br/>visibility > runtime bound + one node"]
     Q --> W["worker: receive message"]
-    W --> LOAD["load checkpoint for thread_id = job_id"]
-    LOAD --> RUN["run the LangGraph graph<br/>checkpoint written per node"]
+    W --> LOAD["load checkpoint for thread_id = job_id<br/>start / resume / continue"]
+    LOAD --> RUN["queued -> running<br/>run the graph, checkpoint per node"]
     RUN --> INT["interrupt at human_gate<br/>status = awaiting_approval"]
     INT --> DEL["delete the message - worker released"]
-    DEL --> APPROVE["POST /jobs/id/approve<br/>records actor + decision"]
-    APPROVE --> Q2["enqueue resume message"]
-    Q2 --> W2["worker: resume from checkpoint"]
-    W2 --> EXPORT["export gate, then S3 write"]
+    DEL --> APPROVE["POST /jobs/id/approve<br/>records actor + decision, claims the gate"]
+    APPROVE --> Q2["enqueue resume message<br/>200, status = running"]
+    Q2 --> W2["worker: resume with the recorded decision"]
+    W2 --> EXPORT["export gate, then S3 write - step 22"]
     EXPORT --> FINAL["finalize - terminal status"]
-    Q -->|"3 failed deliveries"| DLQ["dead-letter queue<br/>CloudWatch alarm on depth > 0"]
+    Q -->|"3 failed deliveries"| DLQ["dead-letter queue<br/>job -> failed, job_dead_lettered<br/>alarm on depth > 0 - Phase 5"]
 ```
 
 ### Message structure
@@ -1675,14 +1754,37 @@ flowchart TD
 {
   "job_id": "uuid",
   "user_id": "uuid",
-  "idempotency_key": "sha256(user_id + question + date)",
-  "attempt": 1
+  "idempotency_key": "sha256(user_id + question + date)"
 }
 ```
 
 **Identifiers only, never the state** (gl §12). State lives in Postgres. A message is a pointer, so a
 redelivered message resumes rather than restarts. It also keeps the question — untrusted user text —
-out of the queue payload.
+out of the queue payload, and the reviewer's `edits` and `note` with it
+([ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md) decision 2).
+
+**`attempt` was removed** ([ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md)
+decision 3). An SQS body is immutable once sent, so a field inside it cannot count redeliveries; the
+number that can is `ApproximateReceiveCount`, read at receive time.
+
+**Two FIFO attributes travel beside the body, and both are load-bearing:**
+
+| Attribute | Value | What it buys |
+|---|---|---|
+| `MessageGroupId` | `job_id` | At most one message per job in flight, whatever mix of starts, resumes, retries and redeliveries produced them — which is ADR 0005's single-writer precondition, provided by the queue rather than by application code |
+| `MessageDeduplicationId` | the job's `idempotency_key` for a start; `f"{job_id}:{calls_used}"` for a resume | A resubmission, or a gate decision retried inside SQS's window, collapses to one message. The resume key is ADR 0007's gate-visit key — one key, three places |
+
+**There is no message type.** The message says *which job*; the checkpoint says what to do with it:
+
+```text
+jobs.completed_at IS NOT NULL   -> terminal: delete the message, do nothing
+no checkpoint for thread_id     -> start:    invoke(new_state(...))
+checkpoint, pending interrupt   -> resume:   invoke(Command(resume=<the visit's decision>))
+checkpoint, no interrupt        -> continue: invoke(None)   # a delivery died mid-run
+```
+
+A field that can disagree with the checkpoint is a field that eventually will — and the last branch is
+the one no message shape could have captured.
 
 ### Idempotency and duplicate delivery
 
@@ -1705,17 +1807,46 @@ spent to produce a duplicate the reviewer then has to read twice.
 
 ### Visibility timeout vs job runtime
 
-Visibility timeout **25 minutes**; hard job limit **20 minutes**. The timeout must exceed the job
-limit, or SQS redelivers a job that is still running and two workers process it at once. The 5-minute
-margin covers worker startup and checkpoint writes.
+**The invariant is not `visibility > MAX_JOB_RUNTIME`**
+([ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 8). The runtime
+bound can only be checked *between* nodes — a node in flight is inside a blocking LLM request — so the
+queue has to cover the bound plus the longest a single node can take:
 
-> **If the job limit ever rises, the visibility timeout rises first** (gl §12).
+```text
+visibility_timeout  >  MAX_JOB_RUNTIME + 3 x LLM_MAIN_TIMEOUT_S + 10
+```
+
+| Environment | `LLM_MAIN_TIMEOUT_S` | `MAX_JOB_RUNTIME` | Required | Set to |
+|---|---:|---:|---:|---:|
+| Production defaults | 60s | 1200s | > 1390s | **1500s** |
+| Local Compose | 180s | 1200s | > 1750s | **1800s** |
+
+**`MAX_JOB_RUNTIME` bounds one worker invocation, not a job's lifetime** (decision 7). A job that
+waits three days at the gate must not fail on resume, and the bound exists to protect a *per-delivery*
+visibility timeout. Three deliveries can therefore spend up to `3 x MAX_JOB_RUNTIME` in total; each
+resumes from a checkpoint rather than repeating work, and `MAX_LLM_CALLS_PER_JOB` still bounds the
+spend. Over the bound, the worker ends the job `failed` with `failure_reason="job_timeout"`.
+
+> **The worker reads its queue's attributes at startup and refuses to run** when the inequality fails,
+> or when the queue is not FIFO. A derived number that nothing checks is a number that drifts.
+> `tests/test_local_infrastructure.py` checks the same arithmetic against `docker-compose.yml`, and
+> the `integration` layer checks it against the queue LocalStack actually created.
 
 ### Retries and the DLQ
 
 Three deliveries, then the dead-letter queue. A DLQ message means something is broken that a retry
 will not fix, and a CloudWatch alarm on `ApproximateNumberOfMessagesVisible > 0` on the DLQ says so
-(gl §12, gl §14).
+(gl §12, gl §14). **The alarm is Phase 5's; the queue behaviour is built.**
+
+**The worker deletes a message on exactly three outcomes and on nothing else** (ADR 0010 decision 6):
+the graph interrupted at the gate, the job reached a terminal status, or the job was already terminal
+when the message arrived. Every other path leaves the message, which is what makes redelivery the
+retry rather than something the worker has to remember to arrange.
+
+**The final delivery is the exception that proves the rule.** On it, an unhandled failure ends the job
+`failed` with `failure_reason="job_dead_lettered"` **and still leaves the message** (decision 9), so
+the job stops being pollable *and* the DLQ alarm fires. Those are two requirements, not one: an alarm
+tells an operator, and it does not tell `GET /jobs/{id}`.
 
 ### Worker crash — what happens if a worker dies halfway
 
@@ -1730,9 +1861,16 @@ will not fix, and a CloudWatch alarm on `ApproximateNumberOfMessagesVisible > 0`
 
 ### Graceful shutdown
 
-On SIGTERM the worker stops taking new messages, **finishes the current node**, writes the
-checkpoint, and exits. Fargate's 30-second grace period is enough for a node, not for a whole job —
-which is exactly why checkpointing is per-node (gl §12).
+On SIGTERM the worker stops taking new messages and **lets the invocation in flight return**, which
+leaves the checkpoint and the database agreeing. The signal sets a flag rather than raising: raising
+out of a handler could unwind the middle of a graph invocation and leave the checkpoint behind the
+database, which is the one thing ADR 0005 decision 2 says to avoid.
+
+A second signal is **not** escalated to a hard exit. The container runtime already escalates — SIGTERM,
+then SIGKILL after its grace period — and a worker that killed itself faster would only lose the
+checkpoint the first signal was trying to protect. Fargate's 30-second grace period is enough for a
+node, not for a whole job, so a worker killed harder than SIGTERM leaves its message undeleted; that is
+the recovery path rather than a hole (gl §12).
 
 ### Worker concurrency
 
@@ -1743,7 +1881,7 @@ have finished (gl §12, gl §13).
 
 | Environment | Workers | Bound |
 |---|---|---|
-| Local / dev | 1 | The free tier. A second worker mostly waits on the shared Redis bucket |
+| Local / dev | 1 | The free tier. Since step 21 a second worker really does wait on the shared Redis bucket rather than doubling the request rate |
 | AWS (Phase 5) | 2, fixed | Raise only after the production tier's real RPM has been measured |
 
 **The queue-depth alarm is not an autoscaling trigger.** It means "demand exceeds what the rate limit
@@ -1769,6 +1907,13 @@ and **the worker is free**. A job can sit at the gate for days without holding a
 ### What the reviewer sees
 
 Phase 2 is **API-only. The reviewer gets JSON, not a web UI** (CLAUDE.md phase plan).
+
+**They read it at `GET /jobs/{id}/gate`** (§10 route 3,
+[ADR 0013](adr/0013-reviewer-gate-payload-view.md)). The route returns `reviewer_payload()` verbatim
+— the same value this node passes to `interrupt()`, rebuilt from the checkpoint — so what a reviewer
+is shown and what the graph built are one definition rather than two. Before it existed the payload
+had no reader at all: `interrupt()` hands its value to whichever process is invoking, and no route
+asked for it afterwards.
 
 Ordered deliberately (gl §10):
 
@@ -1839,17 +1984,47 @@ two days costs nothing beyond the export.** This is the concrete reason for the 
 checkpointer — without it, every approval would re-run the entire research pipeline and re-bill every
 LLM call (gl §4, gl §10).
 
-**[derived] The approval endpoint records the decision and enqueues a resume message; the worker
-resumes the graph.** The API stays a control plane and there is one resume path for all three
-decisions. This matters because `edit` is not cheap — it is a Synthesizer pass on the main-tier timeout
-(`LLM_MAIN_TIMEOUT_S`, 180s in development) plus a fact-check, which must not run inside an HTTP
-request. The alternative (resume inline for
-`approve`, enqueue only for `edit`) is faster for the common case but gives the system two resume
-paths to test. Confirmed at architecture review; recorded in §20.
+**[built, 2026-08-17] The approval endpoint records the decision and enqueues a resume message; the
+worker resumes the graph** ([ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md)). The API
+stays a control plane and there is one resume path for all three decisions. This matters because
+`edit` is not cheap — it is a Synthesizer pass on the main-tier timeout (`LLM_MAIN_TIMEOUT_S`, 180s in
+development) plus a fact-check, which must not run inside an HTTP request. The alternative (resume
+inline for `approve`, enqueue only for `edit`) is faster for the common case but gives the system two
+resume paths to test. Confirmed at architecture review; recorded in §20.
+
+```text
+POST /jobs/{id}/approve
+  clean the reviewer's text                       (ADR 0006 decision 8)
+  load the job row, refuse a terminal job         (409 job_not_awaiting_approval)
+  read calls_used from the checkpoint             (the gate-visit key)
+  read the decision already on record for it
+     none      -> require awaiting_approval, refuse_edit(), claim_gate(), record the decision
+     same      -> retry: write nothing, count nothing
+     different -> 409 gate_already_decided
+  enqueue a resume message
+  return 200 {job_id, status: "running"}
+```
+
+**The response says `running`, not the outcome** (ADR 0011 decision 5). The gate is answered and the
+work is queued, which is what `running` means here; a caller that needs the outcome polls
+`GET /jobs/{id}`, which §12 already tells them to do for a job that takes minutes. Before Phase 3
+stage 2 this route answered `approved`, `rejected` or `awaiting_approval` — a real contract change,
+recorded so a client is not written against the behaviour that was always going to move.
+
+**The decision does not travel with the message.** It is already durable in `audit_events`, keyed by
+the same `(job_id, calls_used)` the message deduplicates on, and the worker reads it from there — so
+the reviewer's own words never reach the queue, and §20 row 8's "identifiers only, never state"
+survives (ADR 0011 decision 2).
+
+**`refuse_edit()` stays in the API, before the claim.** ADR 0006's whole point is that a refused edit
+spends nothing, and an edit refused after an enqueue would have spent a worker.
 
 A resume message reuses the job's existing `idempotency_key` and `job_id`, so it is subject to exactly
 the same at-least-once handling as the original — a redelivered resume replays from the checkpoint
-rather than approving twice (§11).
+rather than approving twice (§11). If two resume messages for one visit are ever processed in
+sequence, the second is harmless: the first consumed the interrupt, so the second falls into §11's
+`continue` branch, which either finds a terminal job or carries a mid-run one forward. Neither
+re-applies the decision.
 
 ### One decision per gate visit, and what a failed resume does
 
@@ -1865,35 +2040,62 @@ spending a call.
 
 | Situation | `POST /jobs/{id}/approve` |
 |---|---|
-| No decision for the current visit | Require `awaiting_approval`, claim the gate, record the decision, resume |
-| The **same** decision already recorded for this visit, job not terminal | **Retry:** write nothing, count nothing, continue the graph from the checkpoint |
+| No decision for the current visit | Require `awaiting_approval`, claim the gate, record the decision, enqueue |
+| The **same** decision already recorded for this visit, job not terminal | **Retry:** write nothing, count nothing, enqueue |
 | A **different** decision on a visit that already has one | `409 gate_already_decided` |
 | Job already terminal | `409 job_not_awaiting_approval` — unchanged |
 
-**The retry path is the recovery path.** A reviewer who gets a `500` sends the same request again;
-there is no operator route and no unwind step. The retry invokes the same thread, so LangGraph
-replays from the last checkpoint and the cost is bounded by the single node that was in flight —
-the same bound §11 gives a redelivered SQS message. Crucially it costs no second edit:
+**Since Phase 3 stage 2 the recovery path is redelivery, and the retry is what stays safe.** A resume
+that dies now dies in the worker, which never deleted the message — so SQS brings it back and the job
+carries on with nobody asking. A reviewer who resends the identical decision still gets `200`, still
+writes no second row, and still costs no second edit; what they no longer have to be is the fix. And
+`MessageDeduplicationId` is the visit key, so the retry collapses onto the message already queued
+instead of adding one.
+
+Either way the cost is bounded by the single node that was in flight, because both paths invoke the
+same thread and LangGraph replays from the last checkpoint. Crucially neither costs a second edit:
 `count_reviewer_edits` counts rows, and the key is what stops an infrastructure failure spending one
 of the three edits ADR 0006 allows.
 
 **`jobs.status = 'awaiting_approval'` if and only if the checkpoint holds a pending interrupt at
 `human_gate`.** The gate node writes it only when it is genuinely opening a visit — the same guard
 that protects its audit row, so its replay can no longer hand back a gate `claim_gate` has just
-claimed — and the endpoint reconciles the row from the checkpoint in a `finally` around the resume:
-a pending interrupt means `awaiting_approval`, an active graph without one means `running`, and a
-job `finalize` has ended is left alone. The predicate is the **pending interrupt, not `next`**: a job
-that has not yet entered the gate also reports `next == ("human_gate",)` while nobody is being
-waited on.
+claimed — and **the worker** reconciles the row from the checkpoint in a `finally` around its
+invocation: a pending interrupt means `awaiting_approval`, an active graph without one means
+`running`, and a job `finalize` has ended is left alone. The predicate is the **pending interrupt, not
+`next`**: a job that has not yet entered the gate also reports `next == ("human_gate",)` while nobody
+is being waited on.
+
+**The rule is ADR 0007's, unchanged; what moved is which process owns the `finally`**
+([ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md) decision 4). `_reconcile_status`
+was deleted from the API rather than kept: with no resume there to bracket, a second writer of that
+column could only assert a value it did not derive. What the endpoint leaves behind is already
+correct — `claim_gate` wrote `running`, and the gate is answered and the work is queued.
+
+**Nothing writes that column on a path that does not invoke.** A start message redelivered while a job
+waits at the gate is a resume with no decision on record: the worker leaves it for redelivery and
+touches neither the row nor the graph. Writing `running` there — which the first implementation did —
+left the row saying nobody was waiting while the checkpoint said somebody was, and both
+`GET /jobs/{id}/gate` and `POST /jobs/{id}/approve` refuse a job that is not `awaiting_approval`, so
+the gate became unanswerable. At-least-once delivery makes that an ordinary event, not an exotic one.
 
 **An unexpected failure uses the error envelope too.** A catch-all handler answers
 `{"error": {"code": "internal_error", "message", "job_id"}}`, because "one shape, everywhere" is only
-true if the framework's default `500` cannot leak through it.
+true if the framework's default `500` cannot leak through it. Since the resume moved to the worker the
+failure it covers is a different one — the database write that records the decision, rather than a
+graph invocation — but the envelope is the same and so is the reason for it.
+
+**A send that fails answers `503 enqueue_failed`, carrying the `job_id`** (ADR 0010 decision 10). The
+decision is recorded and the gate is claimed, so `200` would be a lie: the work is not moving. The fix
+is the same request again, which the retry row above makes free.
 
 ### Expiry
 
 A gate with no decision after **7 days** is closed by the sweep job with `status=rejected`, reason
-`gate_expired`. State is retained (gl §10, gl §17).
+`gate_expired`. State is retained **on gl §9's schedule, which is not one number**: the `jobs` row,
+the claims, `claim_sources` and the audit trail for 12 months, and the checkpoint for 30 days after
+close. Closing a gate never deletes anything early; what it starts is the closed-job clock
+([ADR 0014](adr/0014-gate-review-history-is-not-snapshotted.md)).
 
 ### How approval identity enters the audit trail
 
@@ -2152,7 +2354,7 @@ still live in exactly one place.
 | **Redis failure — rate limiter** | Connection error on `ratelimit:llm` | 5s timeout, 2 retries at 2s, 8s (gl §17) | **Fail closed.** No token, no LLM call → `finalize`, `status=failed`, reason `rate_limiter_unavailable`. A limiter that fails open is not a limiter |
 | **S3 write fails at export** | Error from the artifact write **after** the gate passed | 10s timeout, 2 retries at 2s, 8s (gl §17) | `finalize`, `status=failed`, reason `export_write_failed`. **Report, claims, `claim_sources`, and audit trail preserved. Research and synthesis are never re-run** — the report was already correct |
 | **Export gate blocks** | Any claim with zero `claim_sources` rows | none — this is an invariant, not an error | **Export fails, listing the uncited claims.** Runs even when the reviewer approved, because approval is a judgement about quality and this is a structural invariant |
-| **Human rejection** | `decision="reject"` | none | `finalize`, `status=rejected`, reason recorded, nothing exported, state retained |
+| **Human rejection** | `decision="reject"` | none | `finalize`, `status=rejected`, reason recorded, nothing exported, state retained **on gl §9's schedule** — the row, the claims and the audit trail for 12 months, the checkpoint for 30 days after close ([ADR 0014](adr/0014-gate-review-history-is-not-snapshotted.md)) |
 | **Gate expiry** | No decision in 7 days | none | Sweep job closes it: `status=rejected`, reason `gate_expired` |
 
 Every row has an exhaustion behaviour. **A retry policy without one is an infinite loop with extra
@@ -2314,8 +2516,9 @@ raise 60 or lower a component cap — a decision to take when it is observed, no
 | `python scripts/check_model.py` | The preflight: does the configured endpoint answer, support JSON mode and tool calling, and what throughput does it show | Real `LLM_*` credentials |
 | A graph run | `build_graph()` then `invoke()`, from a Python session or a test | Real `LLM_*` and `TAVILY_API_KEY` |
 
-There is no `uvicorn app:app` and no `python -m worker` yet — those arrive with Phase 2 and Phase 3.
-`docker compose up` has nothing to start.
+There was no `uvicorn app:app` and no `python -m worker`, and `docker compose up` had nothing to
+start. **All three have changed**: `uvicorn app:app` arrived with Phase 2, Compose with Phase 3
+stage 1, and `python -m worker` with Phase 3 stage 2 — see "What Compose starts today" below.
 
 ### What actually needs to run, phase by phase
 
@@ -2323,7 +2526,7 @@ There is no `uvicorn app:app` and no `python -m worker` yet — those arrive wit
 |---|---|---|
 | **1** (today) | Python process only. In-memory checkpointer, in-memory state. Needs `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` and `TAVILY_API_KEY` | No Postgres, no Redis, no queue, no S3, no API. The gate node exists and pauses, but nothing outside the process can resume it yet |
 | **2** | + PostgreSQL 16 (checkpointer, audit tables, Alembic) and the FastAPI app via `uvicorn` | No queue and no S3 yet. The export gate writes the approved body to `jobs.report_json` until Phase 3 wires S3 (§8) |
-| **3** | + Redis 7, + LocalStack (SQS and S3), + the worker process, all via Docker Compose | Nothing else. This is the full local shape |
+| **3** | + Redis 7, + LocalStack (SQS and S3), + the worker process, all via Docker Compose | Nothing else. This is the full local shape. **Stages 1 and 2 are built**: the services, the queue, and `python -m worker`. Redis and S3 have no application code behind them yet (steps 21 and 22) |
 
 ### Logical component → local mapping (Phase 3)
 
@@ -2349,7 +2552,55 @@ most needs to get right. For **tests**, the opposite is true, and this is built:
 answers, supports tool calling and JSON mode, and reports the observed rate limit. Run it after any
 model change (CLAUDE.md).
 
-Container files are **not** written yet. Docker Compose arrives in Phase 3.
+### What Compose starts today — Phase 3 stage 1, 2026-08-17
+
+`docker-compose.yml` exists and `docker compose up -d --wait` starts three services. **It is
+infrastructure only.** There is no application image and no application container: the API and the
+worker are not containerised yet, and a Dockerfile nothing runs would be a file to maintain for no
+requirement. That, and step 21, are why **step 22 is not closed** — step 20 closed on 2026-08-17, and
+the worker it added runs from the host like everything else here.
+
+| Service | Image | Status in the application |
+|---|---|---|
+| `postgres` | `postgres:16-alpine` | **Used.** The five application tables, the checkpointer's own tables, and the `research_test` database the integration suite runs on |
+| `redis` | `redis:7-alpine` | **Used** since step 21. The worker caches searches and fetches here, deduplicates URLs per job, and takes every LLM token from the shared bucket; the API reads it only to answer `checks.redis` |
+| `localstack` | SQS + S3 | **SQS is used; S3 is started only.** `POST /jobs` and `POST /jobs/{id}/approve` enqueue to the job queue, `python -m worker` consumes it, and the dead-letter queue is where a message goes after three failed deliveries (stage 2, step 20). Nothing writes an object to the bucket yet — step 22 |
+
+**Bootstrap is a healthcheck, not a sleep.** Each service declares one, and `--wait` blocks on all
+three. LocalStack's deliberately checks that the queue and the bucket answer rather than that the
+process is up, because its init hook runs *after* it becomes ready — so when the command returns, the
+resources are there. The two scripts in `docker/` converge rather than create: each resource is
+checked, created if absent, and then has its attributes set unconditionally, so repeated startup is
+safe and a changed number in `docker-compose.yml` actually lands.
+
+**Migrations run from the host**, since there is no application image to run them in:
+`DATABASE_URL=... alembic upgrade head`. The deployment ordering in gl §19 — its own task, exit 0
+before the new revision starts — is unchanged and arrives with the image.
+
+**The queue is declared with the shape ADR 0010 decided**, and the worker now checks it: FIFO,
+`maxReceiveCount = 3` onto a FIFO dead-letter queue, and a visibility timeout of 1800s. That last
+number is derived, not chosen — decision 8's inequality is
+`visibility > MAX_JOB_RUNTIME + 3 × LLM_MAIN_TIMEOUT_S + 10`, which at the 1200s job bound and this
+project's 180s development timeout requires more than 1750s.
+
+The arithmetic is checked in three places, deliberately, because each catches a different drift:
+`tests/test_local_infrastructure.py` compares `docker-compose.yml` against `config.py` offline; the
+`integration` layer compares the queue LocalStack actually created against the same rule; and
+`python -m worker` refuses to start when the queue it is attached to fails it.
+
+**Two ways to reach the queue locally.** `SQS_QUEUE_URL=http://localhost:4566/000000000000/research-jobs.fifo`
+with `AWS_ENDPOINT_URL=http://localhost:4566` points the API and the worker at it; `SQS_ENDPOINT_URL`
+alone is what opts the `integration`-marked tests in. Neither needs an AWS account, and boto3's
+placeholder credentials are enough for LocalStack.
+
+**Real PostgreSQL is now verified rather than assumed** (§21's step 13–16 note). 41 `postgres`-marked
+tests run `alembic upgrade head` against an empty PostgreSQL 16, compare the result to
+`database/schema.py` with `compare_type=True`, and exercise what SQLite cannot decide: JSONB and the
+gate's keyed JSON reads, `timestamptz`, the 5-second statement timeout, `ON DELETE CASCADE` without a
+per-connection pragma, two reviewers claiming one gate with both provably blocked on the same row,
+two simultaneous submissions of one question, and `PostgresSaver` — `setup()`, `setup()` again, and a
+checkpoint loaded by a genuinely separate process. They skip unless `TEST_DATABASE_URL` is set, which
+keeps `pytest` itself offline.
 
 ---
 
@@ -2450,7 +2701,7 @@ scan, and the tag bookkeeping to separate code that is already separated by modu
 | **Talks to** | SQS (receive/delete), Postgres (read/write), Redis, MCP/Tavily, the LLM endpoint, S3 (write), LangSmith, Secrets Manager |
 | **Never** | Serves HTTP or makes an authorization decision |
 | **Scaling** | **Fixed.** 1 locally, 2 in AWS, bounded by the LLM rate limit |
-| **Shutdown** | SIGTERM → finish the current node → checkpoint → exit |
+| **Shutdown** | SIGTERM → stop taking new messages → let the invocation in flight return (checkpointing per node as it goes) → exit. A worker killed harder leaves its message undeleted, which is the recovery path |
 
 ### Why they must be separate
 
@@ -2549,8 +2800,9 @@ reconciliation** that made its token figures publishable. That run **supplements
 reference baseline and never replaces it; gl §13–§14 maintains both, with the DNS-outage,
 p95-contamination, derived-cost and measurement-override caveats attached.
 
-Phase 2 followed and is also complete (steps 13–19, closed 2026-08-16). **The next work is Phase 3,
-starting at step 20.**
+Phase 2 followed and is also complete (steps 13–19, closed 2026-08-16). **Phase 3 is under way: stage
+1 (the Compose infrastructure) and stage 2 (step 20, the queue and the worker) both closed on
+2026-08-17. The next work is step 21.**
 
 | # | Step | Depends on | Status · why here |
 |---|---|---|---|
@@ -2594,10 +2846,19 @@ edge cleaning of the reviewer's `edits` and `note` had never been built; and ADR
 ([ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md)). **Step 19** is
 gl §18's shipping list, and every row on it now has an executing test.
 
-**Two Phase-3 seams stay visible in the route layer** and are marked at their call sites: `POST /jobs`
-records a job without enqueuing one, and a gate decision resumes the graph in-process rather than
-through the queue §12 describes. **Nothing here runs against a real PostgreSQL** — the database tests
-use a temporary SQLite file, and Compose provides the real one at step 22.
+**Both Phase-3 seams in the route layer closed on 2026-08-17.** `POST /jobs` now enqueues a pointer
+message after committing the row, and a gate decision records, claims and enqueues rather than
+resuming the graph in-process — [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md),
+[ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md). The route layer also stopped
+holding a graph and an `LLMClient` altogether
+([ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md)).
+
+**Corrected on 2026-08-17:** this paragraph used to end "Nothing here runs against a real PostgreSQL —
+the database tests use a temporary SQLite file, and Compose provides the real one at step 22." The
+SQLite half is still true and still the offline suite. The rest is not: Phase 3 stage 1 brought the
+Compose PostgreSQL 16 forward on its own, and everything steps 13–18 built is now verified against it
+as well (§17). **Step 22 is still open** — it also owns the application image and the two
+entrypoints, and neither exists.
 
 | # | Step | Depends on | Why here |
 |---|---|---|---|
@@ -2606,16 +2867,16 @@ use a temporary SQLite file, and Compose provides the real one at step 22.
 | 15 | **Persistence integration** — findings, claims, `claim_sources`, and audit events written as the graph runs | 13, 10 | **Done.** The nodes write through `database/queries.py`; routing is untouched. The audit trail must be written *during* the job, not reconstructed after |
 | 16 | **Export gate + export node** — the claim-to-URL check, the write to `jobs.report_json`, and the test that an uncited claim blocks it | 15 | **Done.** The check itself is unchanged — it is the project's first invariant, and it gates everything after it. The S3 write and its bounded retry join this same node in Phase 3 (§8) |
 | 17 | **Human gate** — `interrupt()` before export, the reviewer payload with problems first, approve / reject / edit | 14, 16 | **Done (2026-08-16).** The payload, `gate_opened`, `awaiting_approval` on the job row, and [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md)'s whole edit path. `refuse_edit()` decides the two edit refusals; the endpoint that returns them is step 18 |
-| 18 | **FastAPI routes + API-key auth on every route** — all five endpoints, two roles, the one error shape | 13, 17 | **Done (2026-08-16).** `routes/api.py`, `routes/auth.py`, `app.py`. `POST /jobs` records but does not enqueue, and the gate decision resumes in-process — both become the worker's in Phase 3 |
+| 18 | **FastAPI routes + API-key auth on every route** — all five endpoints, two roles, the one error shape | 13, 17 | **Done (2026-08-16).** `routes/api.py`, `routes/auth.py`, `app.py`. Six routes since [ADR 0013](adr/0013-reviewer-gate-payload-view.md). `POST /jobs` recorded but did not enqueue, and the gate decision resumed in-process; **both became the worker's on 2026-08-17** (ADR 0010, ADR 0011, ADR 0012) |
 | 19 | **Phase 2 test set** — every item in gl §18's "must have a test before Phase 2 ships" list | 11, 16, 17, 18 | **Done (2026-08-16).** It is a shipping condition, not a follow-up. Every row on that list has an executing test, and the suite additionally covers what Phase 2 added after the list was written — persistence and replay convergence, the reviewer-edit bounds, gate-decision idempotency, status reconciliation, reviewer-text cleaning, and the error envelope on every status code. Still no network calls. **CI is step 23 and depends on this step**, so an unimplemented pipeline does not leave this one open |
 
 ### Phase 3 — async, Redis, containers, CI
 
 | # | Step | Depends on | Why here |
 |---|---|---|---|
-| 20 | **SQS worker** — pointer message, idempotency key unique in `jobs`, visibility timeout, DLQ, graceful shutdown | 18 | Needs the job row and the checkpoint to resume against |
-| 21 | **Redis** — shared rate limiter, URL dedupe set, search and fetch caches, with hit/miss logging | 7, 20 | The shared bucket only matters once more than one process makes LLM calls |
-| 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists |
+| 20 | **SQS worker** — pointer message, idempotency key unique in `jobs`, visibility timeout, DLQ, graceful shutdown | 18 | Needs the job row and the checkpoint to resume against. **Done (2026-08-17).** `jobqueue.py`, `worker.py`, `rev_0002`'s `queued`, the API's enqueue on both write routes, and the gate resume moved off the request — [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md), [ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md), [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). Verified offline against a `FakeQueue` and again against real LocalStack SQS (`pytest -m integration`), and `rev_0002` against real PostgreSQL 16 |
+| 21 | **Redis** — shared rate limiter, URL dedupe set, search and fetch caches, with hit/miss logging | 7, 20 | The shared bucket only matters once more than one process makes LLM calls. **Done (2026-08-17).** `redisstore.py`, wired through `worker.py`; two failure policies in one file (gl §11, §20 row 29), `checks.redis` on `/health`, and a fourth test layer against the real Redis 7 |
+| 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists. **Partly done, 2026-08-17:** the three services, their healthchecks, and the queue/DLQ/bucket bootstrap are built, and both the real-PostgreSQL and the LocalStack SQS suites run on them. **The image and the two entrypoints are not**, and the S3 export write is not either, so the step stays open |
 | 23 | **CI** — ruff, mypy, pytest, gitleaks, image build to ECR | 19, 22 | Every later step ships through it |
 
 ### Phase 4 — observability and evaluation
@@ -2647,8 +2908,10 @@ recorded in §20 and applied in the sections they affect; where a decision made 
 `CLAUDE.md` or `docs/engineering-guidelines.md` untrue, that statement was corrected rather than left
 to drift.
 
-**No open question blocks implementation.** One item remains open — exposed by the export-failure
-decision, and needed before Phase 3. **Question 2 is no longer open: it was decided on 2026-08-16 by
+**No open question blocks implementation.** **Item 1 is no longer open either: it was decided on
+2026-08-17 by [ADR 0009](adr/0009-recovering-an-export-that-failed-after-approval.md)**, which is kept
+below with what was decided, because the code does not implement it until Phase 3 ships S3.
+**Question 2 is no longer open: it was decided on 2026-08-16 by
 [ADR 0006](adr/0006-reviewer-edit-returns-to-the-human-gate.md)**, which also amends question 3's
 mechanism; both are kept below with what was decided, because the code does not implement either
 until step 17. Four further items are listed as **deferred**: one whose design is settled and whose
@@ -2696,6 +2959,20 @@ authorization question as much as an operational one (gl §16).
 *Not blocking:* the failure path itself is fully specified and safe — bounded, loud, and
 non-destructive. Only the recovery ergonomics are undecided. **Needed before Phase 3 ships S3**, which
 is also when `export_write_failed` first becomes reachable (§8).
+
+> **Decided on 2026-08-17 by
+> [ADR 0009](adr/0009-recovering-an-export-that-failed-after-approval.md), accepted.** The paragraphs
+> above describe the question as it stood, and are kept because the three options and the
+> authorization framing are what the answer was chosen against. What was decided: the failure stays
+> terminal as §20 row 30 already settled; the export node writes `report_json` **before** the
+> `PutObject` and stamps `exported_at` only once the artifact exists, so *"which approved reports have
+> no artifact?"* becomes the query `status='failed' AND report_json IS NOT NULL AND exported_at IS
+> NULL`; `GET /jobs/{id}/report` keys on `exported_at` rather than on the status; and recovery is an
+> **operator-run re-export of the durable body** — no new route, no new-job policy, and an actor the
+> script refuses to run without. `job_finished` is built in Phase 3, carrying
+> [ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md) decision 5's shape,
+> because recovery is the first operation that has to read a failure reason from somewhere durable.
+> **This item is closed.**
 
 #### 2. Low stakes — may reflection start a cycle on the reviewer-`edit` path?
 
@@ -2885,8 +3162,8 @@ main tier. That is correct for the two that are genuinely transient, and it is w
 **It is a cost question, not a correctness one.** Every episode was bounded, loud, recorded its
 reason, and finalized the job exactly as §15 specifies. What it costs is ~9 minutes and 3 of the
 60-call budget per episode — and that cost is also what pushes a job toward the `MAX_JOB_RUNTIME`
-bound that `CLAUDE.md`'s environment table already records as configured-but-unenforced until the
-Phase 3 worker owns it (smoke run 2 ran 1557s against the configured 1800s).
+bound — which the Phase 3 worker now enforces per invocation (smoke run 2 ran 1557s against the
+1800s then configured, and would be stopped at the 1200s default today).
 
 **The four episodes are NIM free-tier degradation, not a property of the client.** The same
 fact-check-shaped call — 20 claims, ~12,000 prompt tokens — completed in 66.2s once the endpoint

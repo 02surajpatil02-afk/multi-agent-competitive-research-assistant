@@ -54,7 +54,10 @@ ReflectionRoute = Literal["researcher", "synthesizer", "fact_checker", "human_ga
 
 SubtopicStatus = Literal["pending", "done", "unresearched"]
 
-JobStatus = Literal["running", "awaiting_approval", "approved", "rejected", "failed"]
+JobStatus = Literal["queued", "running", "awaiting_approval", "approved", "rejected", "failed"]
+"""`queued` is first because it is first in time: `POST /jobs` writes the row and the worker
+is what moves it on (ADR 0010 decision 1). Before the queue existed, `create_job` wrote
+`running` for a job nothing was running, which was simply false."""
 
 QualityFlag = Literal["below_threshold", "unscored"]
 """Carried alongside ``None``, which means the rubric ran and the report passed.
