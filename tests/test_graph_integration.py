@@ -63,8 +63,15 @@ from openai import OpenAI
 
 import llm_client
 from config import load_config
-from graph.build import ResearchGraph, build_graph, run_config
-from graph.state import ResearchState, new_state
+from graph.build import (
+    ResearchGraph,
+    build_graph,
+)
+from graph.state import (
+    ResearchState,
+    new_state,
+    run_config,
+)
 from llm_client import LLMClient
 from tools.contracts import ToolCache
 

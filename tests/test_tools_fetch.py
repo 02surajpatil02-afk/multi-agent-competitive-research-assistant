@@ -20,13 +20,17 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from typing import cast
 
 import httpx
 import pytest
 from fakes import FakeCache, mock_http, patch_dns, pdf_bytes
+from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 import tools.fetch
 from config import Config, load_config
+from redisstore import RedisCache
 from schemas import FetchedPage
 from tools.contracts import ToolCallFailed, Unreachable
 from tools.fetch import fetch
@@ -562,3 +566,29 @@ def test_an_unreachable_page_is_not_cached() -> None:
     fetch(_PAGE, config=_config(), client=site.client(), cache=cache)
 
     assert cache.sets == []
+
+
+def test_a_dead_redis_costs_one_fetch_and_not_the_page() -> None:
+    """The other half of the fail-open rule, composed the same way (guidelines §11).
+
+    `fetch` is the more expensive of the two to lose - a page that cannot be read becomes an
+    `unreachable` source and a claim the Fact-Checker cannot support - so a Redis outage must
+    cost a repeated request and nothing else.
+    """
+    site = _Site(_html_response())
+    cache = RedisCache(cast(Redis, _UnreachableRedis()))
+
+    page = fetch(_PAGE, config=_config(), client=site.client(), cache=cache)
+
+    assert isinstance(page, FetchedPage)
+    assert site.requests  # the page was really fetched, because the cache could not answer
+
+
+class _UnreachableRedis:
+    """Every command raises, the way redis-py reports a host that will not answer."""
+
+    def get(self, _key: str) -> str | None:
+        raise RedisConnectionError("redis is not answering")
+
+    def set(self, _key: str, _value: str, ex: int | None = None) -> None:
+        raise RedisConnectionError("redis is not answering")

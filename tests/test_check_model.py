@@ -181,9 +181,14 @@ def test_a_missing_variable_exits_with_a_message_not_a_traceback(
     # The first thing an operator hits after editing .env, and the reason main() reads
     # the environment itself instead of taking a Config. Run from an empty directory so
     # the repository's own .env cannot answer the question for it.
+    #
+    # Since ADR 0012 decision 4 `load_config()` accepts an environment with no LLM variable in
+    # it - that is what lets the API process start without one - so the loud failure belongs to
+    # the process that assumes an LLM. This preflight is one of the three, and the message has
+    # to name the project's own variable rather than the SDK's `OPENAI_API_KEY`.
     for name in _ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
 
     assert main() == 1
-    assert "LLM_MODEL is required" in capsys.readouterr().out
+    assert "LLM_BASE_URL is required" in capsys.readouterr().out

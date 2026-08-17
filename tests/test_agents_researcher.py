@@ -1012,3 +1012,83 @@ def test_extraction_runs_on_the_main_model(monkeypatch: pytest.MonkeyPatch) -> N
     research_subtopic(_state(), config=_config(), llm=llm)
 
     assert fake.completions.calls[0]["model"] == "main-model"
+
+
+# --- The per-job URL set (guidelines §7, §11) ----------------------------------------
+#
+# The Researcher keeps an in-process `seen` set seeded from the findings the job already
+# holds. What the shared `job:{id}:urls` set adds is the half that survives a process: a
+# redelivered message re-runs a Researcher node whose findings were never checkpointed, and
+# without it that node re-fetches every page it already read.
+
+
+class _Deduplicator:
+    """A `UrlDeduplicator` that remembers, or one that is broken."""
+
+    def __init__(self, *, seen: set[str] | None = None, broken: bool = False) -> None:
+        self.seen = seen or set()
+        self.broken = broken
+        self.asked: list[tuple[str, str]] = []
+
+    def add_if_new(self, job_id: str, url: str) -> bool:
+        self.asked.append((job_id, url))
+        if self.broken:
+            # What `RedisUrlDeduplicator` answers when Redis is unreachable: allow it.
+            return True
+        if url in self.seen:
+            return False
+        self.seen.add(url)
+        return True
+
+
+def test_a_url_this_job_already_fetched_is_not_fetched_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure the shared set exists for: a page read by an earlier visit whose findings
+    are not in this state, so the in-process `seen` set cannot know about it."""
+    tools = _tools(monkeypatch, "https://example.com/a", "https://example.com/b")
+    urls = _Deduplicator(seen={"https://example.com/a"})
+    llm, _ = _llm(_ONE_FINDING)
+
+    research_subtopic(_state(), config=_config(), llm=llm, urls=urls)
+
+    assert tools.fetched == ["https://example.com/b"]
+
+
+def test_the_url_set_is_asked_with_the_jobs_own_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `job:{id}:urls` is per job, so a URL one job read must not hide it from another.
+    _tools(monkeypatch, "https://example.com/a")
+    urls = _Deduplicator()
+    llm, _ = _llm(_ONE_FINDING)
+
+    research_subtopic(_state(), config=_config(), llm=llm, urls=urls)
+
+    assert urls.asked == [("job-1", "https://example.com/a")]
+
+
+def test_a_broken_url_set_does_not_fail_the_researcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail open (guidelines §11). The cost of a deduplicator that cannot answer is one
+    wasted fetch and a duplicate finding, both bounded by `MAX_LLM_CALLS_PER_JOB` - and
+    refusing to research because a cache is down would trade a real outage for an
+    optimisation."""
+    tools = _tools(monkeypatch, "https://example.com/a")
+    urls = _Deduplicator(broken=True)
+    llm, _ = _llm(_ONE_FINDING)
+
+    update = research_subtopic(_state(), config=_config(), llm=llm, urls=urls)
+
+    assert len(update["findings"]) == 1
+    assert tools.fetched == ["https://example.com/a"]
+    assert update.get("status") != "failed"
+
+
+def test_no_url_set_at_all_researches_normally(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Phase 1's behaviour, and what the rest of this file runs on: the in-process set still
+    # stops one visit reading a page twice.
+    tools = _tools(monkeypatch, "https://example.com/a")
+    llm, _ = _llm(_ONE_FINDING)
+
+    update = research_subtopic(_state(), config=_config(), llm=llm, urls=None)
+
+    assert len(update["findings"]) == 1
+    assert tools.fetched == ["https://example.com/a"]

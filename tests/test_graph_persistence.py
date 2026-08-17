@@ -69,9 +69,12 @@ from graph.build import (
     build_graph,
     export_node,
     researcher_node,
+)
+from graph.state import (
+    ResearchState,
+    new_state,
     run_config,
 )
-from graph.state import ResearchState, new_state
 from llm_client import LLMClient
 from schemas import Claim, Report, Section, Source
 
@@ -415,7 +418,11 @@ def test_the_graph_writes_nothing_when_no_database_is_configured(
     assert queries.read_claim_sources(db, job) == []
     assert [e.action for e in queries.read_audit_events(db, job)] == ["job_created"]
     assert row is not None
-    assert row.status == "running" and row.report_json is None
+    # `queued` is what `create_job` wrote and nothing moved it: the worker is the only thing
+    # that writes `running` (ADR 0010 decision 2), and this graph has no database to write
+    # through at all. A row still saying `queued` after a job ran to `approved` in state is
+    # exactly the disconnection this test is about.
+    assert row.status == "queued" and row.report_json is None
 
 
 # --- Helpers ------------------------------------------------------------------------

@@ -48,17 +48,25 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config as AlembicConfig
 from alembic.migration import MigrationContext
-from dbharness import a_finding, a_report, migrated_engine, new_job_id
+from dbharness import AUTOGENERATE_OPTS, a_finding, a_report, migrated_engine, new_job_id
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from database import queries
-from database.schema import audit_events, findings, jobs, metadata
+from database.schema import (
+    CHECKPOINTER_TABLES,
+    alembic_include_name,
+    audit_events,
+    findings,
+    jobs,
+    metadata,
+)
 from schemas import Claim, Report, ResearchPlan, Section, Source, Subtopic, Verdict
 
 _ROOT = Path(__file__).resolve().parent.parent
 
 _TABLES = ("jobs", "findings", "claims", "claim_sources", "audit_events")
+
 
 _INDEXES: dict[str, set[tuple[str, tuple[str, ...]]]] = {
     "jobs": {
@@ -118,8 +126,13 @@ def test_the_migration_and_the_schema_definition_agree(db: Engine) -> None:
     # The one test that stops database/schema.py and the migration from drifting apart. The
     # migration is a snapshot and must stay one, so it repeats the definitions rather than
     # importing them - which only works while something compares the two.
+    #
+    # `AUTOGENERATE_OPTS` rather than a bare `compare_type`, so this runs the options env.py
+    # actually configures. On SQLite the difference is invisible - there are no checkpoint
+    # tables to exclude - and running a different configuration from production is the exact
+    # class of gap the safeguard below exists to close.
     with db.connect() as conn:
-        context = MigrationContext.configure(conn, opts={"compare_type": True})
+        context = MigrationContext.configure(conn, opts=AUTOGENERATE_OPTS)
 
         assert compare_metadata(context, metadata) == []
 
@@ -138,13 +151,190 @@ def test_the_migration_can_be_undone(tmp_path: Path) -> None:
     # A migration with no working downgrade is a one-way door, and the deploy in guidelines
     # §19 rolls back by redeploying the previous task definition against this schema.
     engine = migrated_engine(tmp_path)
+
+    command.downgrade(_alembic(engine), "base")
+
+    assert not set(_TABLES) & set(sa.inspect(engine).get_table_names())
+
+
+def _alembic(engine: Engine) -> AlembicConfig:
+    """Alembic pointed at this repository's migrations and at `engine`'s database."""
     config = AlembicConfig(_ROOT / "alembic.ini")
     config.set_main_option("script_location", str(_ROOT / "database" / "migrations"))
     config.set_main_option("sqlalchemy.url", str(engine.url))
+    return config
 
-    command.downgrade(config, "base")
 
-    assert not set(_TABLES) & set(sa.inspect(engine).get_table_names())
+def test_rev_0002_widens_the_status_check_and_the_narrow_one_refuses_queued(
+    tmp_path: Path,
+) -> None:
+    """ADR 0010 decision 1's ordering rule, on the dialect that recreates the table for it.
+
+    SQLite has no `ALTER TABLE ... DROP CONSTRAINT`, so rev_0002 rebuilds `jobs` around the new
+    CHECK - which is a whole-table operation on a revision that means to change one constraint.
+    Stepping to 0001 and back is what shows both halves happened: the narrow constraint really
+    refuses `queued`, and the wide one really accepts it.
+    """
+    engine = migrated_engine(tmp_path)
+    command.downgrade(_alembic(engine), "0001")
+
+    with pytest.raises(IntegrityError):
+        _create_job(engine, "key-early")
+
+    command.upgrade(_alembic(engine), "head")
+    job_id = _create_job(engine, "key-later")
+
+    row = queries.read_job(engine, job_id)
+    assert row is not None and row.status == "queued"
+
+
+def test_the_downgrade_moves_a_queued_job_to_running(tmp_path: Path) -> None:
+    # A rollback must fail on schema or not at all, never on data (guidelines §19): narrowing
+    # the constraint with a `queued` row still in the table would abort part-way through.
+    engine = migrated_engine(tmp_path)
+    job_id = _create_job(engine, "key-1")
+
+    command.downgrade(_alembic(engine), "0001")
+
+    row = queries.read_job(engine, job_id)
+    assert row is not None and row.status == "running"
+
+
+def test_the_status_check_survives_the_table_being_rebuilt(tmp_path: Path) -> None:
+    """The hazard `copy_from` exists to avoid, checked rather than trusted.
+
+    SQLite reflection cannot see a named CHECK constraint, so a recreate that reflected the
+    table instead of restating it would drop both of them silently - and a job status outside
+    the vocabulary would then be accepted with no test anywhere noticing.
+    """
+    engine = migrated_engine(tmp_path)
+    job_id = _create_job(engine, "key-1")
+
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(sa.update(jobs).where(jobs.c.job_id == job_id).values(status="nearly_done"))
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(sa.update(jobs).where(jobs.c.job_id == job_id).values(quality_flag="great"))
+
+
+def _create_job(engine: Engine, key: str) -> str:
+    job_id = new_job_id()
+    queries.create_job(
+        engine,
+        job_id=job_id,
+        user_id=new_job_id(),
+        question="Compare TCS and Infosys on cloud strategy.",
+        idempotency_key=key,
+        actor="submitter-7",
+    )
+    return job_id
+
+
+# --- The ownership boundary between Alembic and the checkpointer ---------------------
+#
+# Two things create tables in this database: Alembic owns the five in database/schema.py, and
+# LangGraph's `PostgresSaver.setup()` owns four that `metadata` deliberately does not describe
+# (guidelines §19). Autogenerate proposes dropping whatever it finds and `metadata` does not
+# name, so the second owner's tables look exactly like abandoned ones to it.
+#
+# These run on SQLite with the four table names created by hand. That is enough, because what
+# is under test is the name filter rather than anything PostgreSQL decides - and it means the
+# safeguard is covered by the suite that needs no service running. The same property is
+# asserted against a real `setup()` in tests/test_checkpointer_postgres.py.
+
+
+def test_autogenerate_would_drop_the_checkpointer_tables_without_the_safeguard(
+    db: Engine,
+) -> None:
+    """The failure mode itself, so the test below cannot pass by accident.
+
+    Without this, a `checkpoint_tables` fixture that quietly created nothing would make every
+    other test in this section green while proving nothing at all.
+    """
+    _pretend_a_worker_has_run(db)
+
+    with db.connect() as conn:
+        context = MigrationContext.configure(conn, opts={"compare_type": True})
+        dropped = _tables_proposed_for_removal(compare_metadata(context, metadata))
+
+    assert dropped == set(CHECKPOINTER_TABLES)
+
+
+def test_autogenerate_ignores_the_checkpointer_tables(db: Engine) -> None:
+    """The safeguard: the same database, the options env.py configures, and no proposal."""
+    _pretend_a_worker_has_run(db)
+
+    with db.connect() as conn:
+        context = MigrationContext.configure(conn, opts=AUTOGENERATE_OPTS)
+
+        assert compare_metadata(context, metadata) == []
+
+
+def test_autogenerate_still_reports_a_table_the_schema_no_longer_describes(db: Engine) -> None:
+    """The safeguard is a deny-list, and this is what that buys.
+
+    "Ignore everything `metadata` does not name" would be shorter and would also silence a
+    table that was deleted from database/schema.py and still exists in the database - which is
+    a migration somebody has to write, not noise.
+    """
+    _pretend_a_worker_has_run(db)
+    with db.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE leftover_experiment (id TEXT PRIMARY KEY)"))
+
+    with db.connect() as conn:
+        context = MigrationContext.configure(conn, opts=AUTOGENERATE_OPTS)
+        dropped = _tables_proposed_for_removal(compare_metadata(context, metadata))
+
+    assert dropped == {"leftover_experiment"}
+
+
+def test_autogenerate_still_reports_a_column_the_schema_does_not_have(db: Engine) -> None:
+    """Application-table drift, with the checkpointer's tables present the whole time.
+
+    A filter that excluded too much would pass every test above and quietly stop detecting the
+    thing autogenerate is for.
+    """
+    _pretend_a_worker_has_run(db)
+    with db.begin() as conn:
+        conn.execute(sa.text("ALTER TABLE jobs ADD COLUMN scratch TEXT"))
+
+    with db.connect() as conn:
+        context = MigrationContext.configure(conn, opts=AUTOGENERATE_OPTS)
+        differences = [str(difference) for difference in compare_metadata(context, metadata)]
+
+    assert any("remove_column" in text and "scratch" in text for text in differences), differences
+
+
+def test_the_safeguard_answers_for_tables_and_nothing_else() -> None:
+    """It defends ownership of a table, not of a string. An index or a column that happens to
+    share a name with one of the four is still compared, because nothing owns it but us."""
+    parents: dict[Any, Any] = {}
+
+    assert alembic_include_name("checkpoints", "table", parents) is False
+    assert alembic_include_name("jobs", "table", parents) is True
+    assert alembic_include_name("checkpoints", "index", parents) is True
+    assert alembic_include_name("checkpoints", "column", parents) is True
+    # A schema name is passed as None, and refusing it would exclude the default schema.
+    assert alembic_include_name(None, "schema", parents) is True
+
+
+def _pretend_a_worker_has_run(db: Engine) -> None:
+    """The four tables `PostgresSaver.setup()` creates, as bare names.
+
+    Their columns are irrelevant: the safeguard filters on the table name, and a faithful copy
+    of LangGraph's DDL here would be a second definition of something this repository does not
+    own. `tests/test_checkpointer_postgres.py` runs the real `setup()`.
+    """
+    with db.begin() as conn:
+        for table in sorted(CHECKPOINTER_TABLES):
+            conn.execute(sa.text(f"CREATE TABLE {table} (thread_id TEXT PRIMARY KEY)"))
+
+
+def _tables_proposed_for_removal(differences: list[Any]) -> set[str]:
+    return {
+        difference[1].name
+        for difference in differences
+        if isinstance(difference, tuple) and difference[0] == "remove_table"
+    }
 
 
 # --- The constraints ----------------------------------------------------------------
@@ -301,7 +491,9 @@ def test_create_job_records_the_submitter_not_the_system(db: Engine, job: str) -
     events = queries.read_audit_events(db, job)
 
     assert row is not None
-    assert row.status == "running"
+    # `queued`, not `running`: nothing is running it until the worker receives its message
+    # (ADR 0010 decisions 1 and 2).
+    assert row.status == "queued"
     assert row.report_json is None and row.exported_at is None and row.completed_at is None
     assert [(event.actor, event.action) for event in events] == [("submitter-7", "job_created")]
 
@@ -687,7 +879,14 @@ def test_reading_a_gate_visits_decision_answers_only_for_that_visit(db: Engine, 
         db, job_id=job, actor="reviewer-3", decision="edit", note=None, edits="a", calls_used=16
     )
 
-    assert queries.read_gate_decision(db, job, calls_used=16) == "edit"
+    # The whole decision, not just its verb: the worker rebuilds a `GateDecision` from this
+    # rather than reading the reviewer's text out of a queue message (ADR 0011 decision 2).
+    assert queries.read_gate_decision(db, job, calls_used=16) == {
+        "decision": "edit",
+        "note": None,
+        "edits": "a",
+        "calls_used": 16,
+    }
     assert queries.read_gate_decision(db, job, calls_used=21) is None
 
 
@@ -705,7 +904,8 @@ def test_one_job_s_decisions_are_not_read_as_anothers(db: Engine, job: str) -> N
     )
 
     assert queries.read_gate_decision(db, job, calls_used=16) is None
-    assert queries.read_gate_decision(db, other, calls_used=16) == "reject"
+    theirs = queries.read_gate_decision(db, other, calls_used=16)
+    assert theirs is not None and theirs["decision"] == "reject"
 
 
 def test_setting_a_status_leaves_a_finished_job_alone(db: Engine, job: str) -> None:

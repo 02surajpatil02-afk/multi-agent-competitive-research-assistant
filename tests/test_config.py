@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from agents.researcher import MAX_LLM_CALLS_PER_SUBTOPIC
-from config import MAX_RESEARCHER_CONCURRENCY, load_config
+from config import MAX_RESEARCHER_CONCURRENCY, load_config, required
 
 # Distinctive fake values, so a leak test can look for them by name. DATABASE_URL is a
 # secret when it is set - it carries a password - but it is not required until Phase 2.
@@ -28,30 +28,82 @@ _SECRETS = {
     "DATABASE_URL": "postgresql://user:db-password-should-not-be-printed@localhost:5432/x",
 }
 
-_REQUIRED = {
+_WORKER_ONLY = {
     "LLM_BASE_URL": "https://integrate.api.nvidia.com/v1",
     "LLM_MODEL": "main-model",
     "LLM_API_KEY": _SECRETS["LLM_API_KEY"],
     "TAVILY_API_KEY": _SECRETS["TAVILY_API_KEY"],
 }
+"""The four variables the **worker** cannot run without, and the API never needs.
+
+They were `load_config`'s required set until ADR 0012 decision 4 moved the requirement to the
+process that assumes an LLM. What each process refuses to start without is now that process's
+own statement - `worker.main()`, `scripts/check_model.py`, `scripts/measure_jobs.py` - made
+with `required()`, and the tests below hold both halves: `load_config` accepts an environment
+with none of them, and `required()` still fails loudly and names the variable.
+"""
+
+_FIELDS = {
+    "LLM_BASE_URL": "llm_base_url",
+    "LLM_MODEL": "llm_model",
+    "LLM_API_KEY": "llm_api_key",
+    "TAVILY_API_KEY": "tavily_api_key",
+}
+"""Which `Config` attribute each of those variables lands on."""
 
 
 def _env(**overrides: str) -> Mapping[str, str]:
-    """A minimally valid environment, plus whatever the test is varying."""
-    return {**_REQUIRED, **overrides}
+    """A worker's environment, plus whatever the test is varying.
+
+    Still the four, because most tests here are about *other* variables and a Config built
+    from a realistic environment is what they want to vary one thing against.
+    """
+    return {**_WORKER_ONLY, **overrides}
 
 
-@pytest.mark.parametrize("name", sorted(_REQUIRED))
-def test_a_missing_required_variable_fails_and_names_itself(name: str) -> None:
-    env = {key: value for key, value in _REQUIRED.items() if key != name}
+def test_the_api_process_starts_with_no_llm_or_tavily_variable_set() -> None:
+    """ADR 0012 decision 4's architectural requirement, at the one place that can refuse it.
 
+    The API process must start, serve every route and pass its health check with no LLM or
+    Tavily credential in its environment - which is what makes guidelines §13's least-privilege
+    table a property of the code rather than of an intended deployment. `load_config` is what
+    used to stop that, so an empty environment loading is the assertion.
+    """
+    config = load_config({})
+
+    assert (config.llm_base_url, config.llm_model, config.llm_api_key) == (None, None, None)
+    assert config.tavily_api_key is None
+
+
+@pytest.mark.parametrize("name", sorted(_WORKER_ONLY))
+def test_a_worker_only_variable_is_optional_here_and_required_where_it_is_used(name: str) -> None:
+    """The two halves of the boundary, on one variable at a time.
+
+    `load_config` must not refuse it - that is the API's requirement - and `required()` must
+    refuse it by name, because a worker that starts without an endpoint fails on its first job
+    instead of at startup.
+    """
+    env = {key: value for key, value in _WORKER_ONLY.items() if key != name}
+
+    config = load_config(env)
+
+    assert getattr(config, _FIELDS[name]) is None
     with pytest.raises(ValueError, match=name):
-        load_config(env)
+        required(getattr(config, _FIELDS[name]), name)
 
 
-def test_an_empty_string_counts_as_unset_for_a_required_variable() -> None:
+def test_an_empty_string_counts_as_unset_for_a_worker_only_variable() -> None:
+    # Whitespace is not a model id, and `required()` has to agree with `_optional()` about
+    # that or a blank line in `.env` would reach the endpoint as a model name.
+    config = load_config(_env(LLM_MODEL="   "))
+
+    assert config.llm_model is None
     with pytest.raises(ValueError, match="LLM_MODEL"):
-        load_config(_env(LLM_MODEL="   "))
+        required(config.llm_model, "LLM_MODEL")
+
+
+def test_required_returns_the_value_when_it_is_set() -> None:
+    assert required(load_config(_env()).llm_model, "LLM_MODEL") == "main-model"
 
 
 @pytest.mark.parametrize(
@@ -191,7 +243,7 @@ def clean_environ(monkeypatch: pytest.MonkeyPatch) -> None:
     load_dotenv writes straight into os.environ, so without this a test that loads a
     .env file would leak its values into the tests that run after it.
     """
-    names = [*_REQUIRED, *_SECRETS, "LLM_FAST_MODEL", "LLM_RPM_LIMIT", "APP_ENV", "LOG_LEVEL"]
+    names = [*_WORKER_ONLY, *_SECRETS, "LLM_FAST_MODEL", "LLM_RPM_LIMIT", "APP_ENV", "LOG_LEVEL"]
     for name in names:
         monkeypatch.delenv(name, raising=False)
 
@@ -205,7 +257,7 @@ def _write_dotenv(directory: Path, **values: str) -> None:
 def test_dotenv_is_read_when_no_mapping_is_passed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_environ: None
 ) -> None:
-    _write_dotenv(tmp_path, **_REQUIRED)
+    _write_dotenv(tmp_path, **_WORKER_ONLY)
     monkeypatch.chdir(tmp_path)
 
     assert load_config().llm_model == "main-model"
@@ -216,7 +268,7 @@ def test_the_real_environment_beats_dotenv(
 ) -> None:
     # This is what makes the same code path correct in a container, where the task
     # definition is the only source and a stray .env must not override it.
-    _write_dotenv(tmp_path, **_REQUIRED)
+    _write_dotenv(tmp_path, **_WORKER_ONLY)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("LLM_MODEL", "from-the-real-environment")
 
@@ -226,12 +278,15 @@ def test_the_real_environment_beats_dotenv(
 def test_a_missing_dotenv_is_not_an_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_environ: None
 ) -> None:
-    # Production has no .env at all. The absence must surface as the normal missing
-    # variable message, not as a file error.
+    # Production has no .env at all, and since ADR 0012 an environment with nothing in it is a
+    # valid API environment - so the absence has to surface as a Config whose optional fields
+    # are None, rather than as a file error or as a refusal.
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(ValueError, match="LLM_MODEL is required"):
-        load_config()
+    config = load_config()
+
+    assert config.llm_model is None
+    assert config.database_url is None
 
 
 def test_passing_a_mapping_never_touches_the_filesystem(

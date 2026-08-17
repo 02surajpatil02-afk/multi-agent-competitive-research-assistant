@@ -443,3 +443,125 @@ def test_the_sdk_does_not_retry_underneath_us() -> None:
 
     assert client._client.max_retries == 0
     assert str(client._client.base_url).startswith("https://example.invalid/v1")
+
+
+# --- The shared rate limiter (guidelines §11, §17) ----------------------------------
+#
+# The bucket itself lives in `redisstore.py` and is proven against real Redis in the
+# `redis`-marked layer. What belongs here is the half this file owns: when a token is
+# taken, what happens when one cannot be, and the bound on trying.
+
+
+class _Limiter:
+    """A scripted `RateLimiter`. `answers` is consumed in order, then it grants forever."""
+
+    def __init__(self, *answers: bool) -> None:
+        self.answers = list(answers)
+        self.calls = 0
+
+    def acquire(self) -> bool:
+        self.calls += 1
+        return self.answers.pop(0) if self.answers else True
+
+
+def _limited(limiter: _Limiter, *script: object) -> tuple[LLMClient, FakeOpenAI]:
+    fake = FakeOpenAI(*script)
+    return LLMClient(_config(), client=cast(OpenAI, fake), limiter=limiter), fake
+
+
+def test_a_token_is_taken_before_every_request() -> None:
+    limiter = _Limiter()
+    client, fake = _limited(limiter, _VALID)
+
+    _ask(client)
+
+    assert limiter.calls == 1
+    assert len(fake.completions.calls) == 1
+
+
+def test_no_token_means_no_request_at_all(slept: list[float]) -> None:
+    """guidelines §11's rule, asserted on the thing that matters: the endpoint was never
+    called. A limiter that let the request through after giving up would be decoration."""
+    limiter = _Limiter(False, False, False)
+    client, fake = _limited(limiter, _VALID)
+
+    with pytest.raises(LLMCallFailed) as raised:
+        _ask(client)
+
+    assert raised.value.reason == "rate_limiter_unavailable"
+    assert fake.completions.calls == []  # nothing was sent
+
+
+def test_the_limiter_retries_on_the_documented_schedule(slept: list[float]) -> None:
+    # guidelines §17's rate-limiter row: two retries, at 2s and 8s. Distinct from the 429
+    # schedule above, which answers the endpoint rather than our own bucket.
+    limiter = _Limiter(False, False, False)
+    client, _ = _limited(limiter, _VALID)
+
+    with pytest.raises(LLMCallFailed):
+        _ask(client)
+
+    assert slept == [2.0, 8.0]
+    assert limiter.calls == 3  # one attempt, then two retries
+
+
+def test_a_token_that_arrives_on_a_retry_sends_the_request(slept: list[float]) -> None:
+    # The retry exists to be useful: a bucket that opens during the backoff proceeds
+    # normally, and the job never learns there was a wait.
+    limiter = _Limiter(False, True)
+    client, fake = _limited(limiter, _VALID)
+
+    decision = _ask(client)
+
+    assert decision.next == "planner"
+    assert slept == [2.0]
+    assert len(fake.completions.calls) == 1
+
+
+def test_a_transport_retry_spends_a_second_token(slept: list[float]) -> None:
+    """**The decisive test for "does a retry consume a token?" - yes.**
+
+    A retried request is a real request against the same 40 RPM tier, which is the argument
+    `CallBudget` already makes for counting every attempt. A limiter that counted logical
+    calls while the budget counted attempts would let a job with two transport retries send
+    three requests on one token.
+    """
+    limiter = _Limiter()
+    budget = CallBudget(limit=60)
+    client, _ = _limited(limiter, timeout_error(), timeout_error(), _VALID)
+
+    _ask(client, budget)
+
+    assert limiter.calls == 3
+    assert budget.used == 3  # the two counters agree, request for request
+
+
+def test_the_limiter_is_asked_after_the_budget_is_spent() -> None:
+    """Order matters at the ceiling: a job that has exhausted `MAX_LLM_CALLS_PER_JOB` must
+    not take a token from a bucket every other job is sharing, for a request it will never
+    be allowed to send."""
+    limiter = _Limiter()
+    client, fake = _limited(limiter, _VALID)
+
+    with pytest.raises(LLMCallFailed) as raised:
+        _ask(client, CallBudget(limit=1, used=1))
+
+    assert raised.value.reason == "budget_exceeded"
+    assert limiter.calls == 0
+    assert fake.completions.calls == []
+
+
+def test_no_limiter_at_all_sends_the_request() -> None:
+    # Phase 1's behaviour, and what the offline suite and `scripts/measure_jobs.py` run on:
+    # there is no bucket, so there is no token to wait for.
+    client, fake = _client(_VALID)
+
+    _ask(client)
+
+    assert len(fake.completions.calls) == 1
+
+
+def test_a_limiter_failure_fails_the_node_not_the_job() -> None:
+    # guidelines §17 says "fail the node". A limiter that is unreachable now may answer on
+    # the next node, unlike a rate-limited endpoint, which has already spoken for the job.
+    assert "rate_limiter_unavailable" not in JOB_FATAL_REASONS

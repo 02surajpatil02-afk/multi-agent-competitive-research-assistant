@@ -59,8 +59,6 @@ from agents.supervisor import SupervisorUpdate
 from agents.synthesizer import SynthesizerUpdate
 from config import Config, load_config
 from graph.build import (
-    CHECKPOINTED_TYPES,
-    TERMINAL_STATUSES,
     GateUpdate,
     NodeDeps,
     TerminalUpdate,
@@ -72,16 +70,25 @@ from graph.build import (
     planner_node,
     postgres_checkpointer,
     reflection_node,
-    refuse_edit,
     researcher_node,
-    reviewer_payload,
-    run_config,
-    state_serde,
     supervisor_node,
     synthesizer_node,
 )
 from graph.reflection import ReflectionUpdate
-from graph.state import ResearchState, new_state
+from graph.state import (
+    CHECKPOINTED_TYPES,
+    TERMINAL_STATUSES,
+    ResearchState,
+    new_state,
+    refuse_edit,
+    reviewer_payload,
+    run_config,
+    state_serde,
+)
+
+# The payload projection lives beside the state it projects, so the API can reach it without
+# importing an agent (ADR 0013). The gate node still builds it, which is what the ordering
+# test below asserts.
 from llm_client import LLMClient
 from schemas import (
     REFLECTION_DIMENSIONS,

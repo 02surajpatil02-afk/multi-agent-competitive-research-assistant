@@ -16,10 +16,13 @@ from typing import Any, cast
 
 import pytest
 from fakes import FakeCache, FakeTavily
+from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from tavily import InvalidAPIKeyError, TavilyClient, UsageLimitExceededError
 
 import tools.search
 from config import Config, load_config
+from redisstore import RedisCache
 from schemas import SearchResult
 from tools.contracts import ToolCallFailed
 from tools.search import search
@@ -304,3 +307,30 @@ def test_what_is_cached_round_trips_to_the_same_results() -> None:
 
     assert [SearchResult.model_validate(item) for item in stored] == original
     assert stored[0]["truncated"] is True
+
+
+def test_a_dead_redis_costs_one_call_and_not_the_search() -> None:
+    """The fail-open rule end to end, through the real `RedisCache` (guidelines §11).
+
+    The tests above prove the *interface* fails open, using a fake. This one composes the
+    real implementation over a client whose every command raises, which is what a Redis
+    outage actually looks like - and the search still returns its results. A cache that let
+    a connection error through would turn a Redis blip into a failed subtopic.
+    """
+    cache = RedisCache(cast(Redis, _UnreachableRedis()))
+    client, fake = _tavily(_payload(_result("https://example.com/a")))
+
+    results = search("cloud", config=_config(), client=client, cache=cache)
+
+    assert len(results) == 1
+    assert len(fake.calls) == 1  # the outage cost one call, which the job budget bounds
+
+
+class _UnreachableRedis:
+    """Every command raises, the way redis-py reports a host that will not answer."""
+
+    def get(self, _key: str) -> str | None:
+        raise RedisConnectionError("redis is not answering")
+
+    def set(self, _key: str, _value: str, ex: int | None = None) -> None:
+        raise RedisConnectionError("redis is not answering")
