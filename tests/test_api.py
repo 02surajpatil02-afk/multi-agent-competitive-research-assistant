@@ -36,13 +36,14 @@ import ast
 import json
 from collections.abc import Iterator
 from dataclasses import fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import sqlalchemy as sa
 from dbharness import migrated_engine, new_job_id
-from fakes import FakeQueue
+from fakes import FakeQueue, FakeS3, s3_error
 from fastapi.testclient import TestClient
 from harness import (
     FakeLLM,
@@ -61,7 +62,10 @@ from openai import OpenAI
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
+import artifacts as artifacts_module
+import scripts.reexport_job as reexport_job
 from app import create_application
+from artifacts import ArtifactStore
 from config import Config, load_config
 from database import queries
 from database.schema import audit_events, jobs
@@ -99,6 +103,8 @@ _CALLS_TO_THE_GATE = 16
 """What one clean job spends before it pauses: 1 planner, 6 researcher, 1 synthesizer,
 1 fact-checker, 1 reflection, and 6 Supervisor hops. Used to put the budget exactly where a
 test needs it rather than approximately there."""
+
+_BUCKET = "research-reports"
 
 REVIEWER = "11111111-1111-4111-8111-111111111111"
 SUBMITTER = "22222222-2222-4222-8222-222222222222"
@@ -201,6 +207,17 @@ def queue() -> FakeQueue:
     return FakeQueue()
 
 
+@pytest.fixture
+def bucket() -> FakeS3:
+    """The report bucket, in memory, shared by the worker that writes and the API that signs.
+
+    That sharing is the deployment in miniature: the worker's role has `PutObject` and the
+    API's has only the signature (guidelines §13's least-privilege table), and here they are
+    two `ArtifactStore` objects over one dictionary.
+    """
+    return FakeS3()
+
+
 class _UnreachableRedis:
     """A `RedisProbe` that says no. What `/health` sees when Redis is down."""
 
@@ -217,31 +234,37 @@ class _RaisingRedis:
 
 
 @pytest.fixture
-def graph(config: Config, fake: FakeLLM, db: Engine, saver: InMemorySaver) -> ResearchGraph:
+def graph(
+    config: Config, fake: FakeLLM, db: Engine, saver: InMemorySaver, bucket: FakeS3
+) -> ResearchGraph:
     """The graph **the worker would hold**. The API never sees it.
 
     These tests build one because something has to move a job to the gate before a reviewer can
     decide on it, and since ADR 0011 that something is no longer the request that decides.
+
+    It holds the artifact store for the same reason: writing the object is the worker's, and
+    `GET /jobs/{id}/report` has nothing to sign for until the worker has written one.
     """
     return build_graph(
         config=config,
         llm=LLMClient(config, client=cast(OpenAI, fake)),
         db=db,
+        artifacts=ArtifactStore(_BUCKET, client=bucket),
         checkpointer=saver,
     )
 
 
 @pytest.fixture
 def client(
-    config: Config, db: Engine, saver: InMemorySaver, queue: FakeQueue
+    config: Config, db: Engine, saver: InMemorySaver, queue: FakeQueue, bucket: FakeS3
 ) -> Iterator[TestClient]:
-    with TestClient(_application(config, db, saver, queue)) as made:
+    with TestClient(_application(config, db, saver, queue, bucket)) as made:
         yield made
 
 
 @pytest.fixture
 def unraising_client(
-    config: Config, db: Engine, saver: InMemorySaver, queue: FakeQueue
+    config: Config, db: Engine, saver: InMemorySaver, queue: FakeQueue, bucket: FakeS3
 ) -> Iterator[TestClient]:
     """The same application, returning a server error instead of re-raising it.
 
@@ -251,12 +274,18 @@ def unraising_client(
     dies, so this one lets it come back as a response - which is what uvicorn does in front of
     the same handler.
     """
-    application = _application(config, db, saver, queue)
+    application = _application(config, db, saver, queue, bucket)
     with TestClient(application, raise_server_exceptions=False) as made:
         yield made
 
 
-def _application(config: Config, db: Engine, saver: InMemorySaver, queue: FakeQueue) -> Any:
+def _application(
+    config: Config,
+    db: Engine,
+    saver: InMemorySaver,
+    queue: FakeQueue,
+    bucket: FakeS3 | None = None,
+) -> Any:
     """The API under test: a config, an engine, a **checkpoint reader** and a queue.
 
     There is no `graph=` argument any more, and that absence is the assertion ADR 0012 asks
@@ -268,7 +297,14 @@ def _application(config: Config, db: Engine, saver: InMemorySaver, queue: FakeQu
     all four is the check on that.
     """
     return create_application(
-        config=config, engine=db, checkpoints=saver, queue=cast(Any, queue), keys=_KEYS
+        config=config,
+        engine=db,
+        checkpoints=saver,
+        queue=cast(Any, queue),
+        keys=_KEYS,
+        # A **presigner** and nothing more: the Protocol the route layer declares has no
+        # `put_report` on it, because the API's task role may not write an object.
+        artifacts=None if bucket is None else ArtifactStore(_BUCKET, client=bucket),
     )
 
 
@@ -803,21 +839,115 @@ def test_a_job_no_worker_has_picked_up_reports_that_it_is_queued(client: TestCli
     assert client.get(f"/jobs/{job_id}", headers=_SUBMITTER_AUTH).json()["phase"] == "queued"
 
 
-def test_the_report_route_is_a_404_until_s3_exists(
+def test_the_report_route_is_a_404_while_a_job_is_still_at_the_gate(
     web: RecordedWeb, client: TestClient, graph: ResearchGraph, db: Engine, queue: FakeQueue
 ) -> None:
-    # Phase 2 answers `404 not exported` by design; the body is read from GET /jobs/{id},
-    # which already carries it. No stand-in for S3 is built (ARCHITECTURE.md §8).
+    # `exported_at IS NULL` is the whole predicate (ADR 0009 decision 3), and a job waiting
+    # for a reviewer has no artifact by definition.
     job_id = _at_the_gate(client, graph, db, queue)
-    client.post(f"/jobs/{job_id}/approve", json={"decision": "approve"}, headers=_REVIEWER_AUTH)
-    _work(graph, db, queue)  # the export runs in the worker now (ADR 0011)
 
     response = client.get(f"/jobs/{job_id}/report", headers=_SUBMITTER_AUTH)
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_exported"
-    # And the approved body is where the specification says to read it instead.
-    assert client.get(f"/jobs/{job_id}", headers=_SUBMITTER_AUTH).json()["report"] is not None
+
+
+def test_the_report_route_answers_a_presigned_url_once_the_artifact_exists(
+    web: RecordedWeb,
+    client: TestClient,
+    graph: ResearchGraph,
+    db: Engine,
+    queue: FakeQueue,
+    bucket: FakeS3,
+) -> None:
+    """ADR 0009 decision 3, and guidelines §12's documented body: `{url, expires_at}`.
+
+    **The API never streams report bytes.** What comes back is a signature over an object the
+    worker wrote, which is what keeps a 20-minute job's output off the request path.
+    """
+    job_id = _at_the_gate(client, graph, db, queue)
+    client.post(f"/jobs/{job_id}/approve", json={"decision": "approve"}, headers=_REVIEWER_AUTH)
+    _work(graph, db, queue)  # the export, and the artifact write, run in the worker
+
+    response = client.get(f"/jobs/{job_id}/report", headers=_SUBMITTER_AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"url", "expires_at"}
+    assert f"reports/{job_id}.json" in body["url"]
+    # 15 minutes, in the signature itself rather than only in the field beside it.
+    assert "X-Amz-Expires=900" in body["url"]
+    expires_at = datetime.fromisoformat(body["expires_at"])
+    assert 800 < (expires_at - datetime.now(UTC)).total_seconds() <= 900
+    # And the object really is there, under the key the URL names.
+    assert bucket.body(f"reports/{job_id}.json")
+
+
+def test_the_report_route_stays_a_404_when_the_artifact_write_was_exhausted(
+    web: RecordedWeb,
+    client: TestClient,
+    graph: ResearchGraph,
+    db: Engine,
+    queue: FakeQueue,
+    bucket: FakeS3,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure ADR 0009 exists for, seen from the caller's side.
+
+    The report is finished, approved and preserved, and there is no artifact - so this route
+    says so, and the body is read from `GET /jobs/{id}` instead. Answering `200` with a URL
+    for an object nobody can fetch is exactly what keying on `exported_at` prevents.
+    """
+    monkeypatch.setattr(artifacts_module, "sleep", lambda _delay: None)
+    job_id = _at_the_gate(client, graph, db, queue)
+    bucket.script.extend([s3_error(), s3_error(), s3_error()])
+    client.post(f"/jobs/{job_id}/approve", json={"decision": "approve"}, headers=_REVIEWER_AUTH)
+    _work(graph, db, queue)
+
+    response = client.get(f"/jobs/{job_id}/report", headers=_SUBMITTER_AUTH)
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_exported"
+    # The job failed, and the approved body is still where the specification says to read it.
+    status_body = client.get(f"/jobs/{job_id}", headers=_SUBMITTER_AUTH).json()
+    assert status_body["status"] == "failed"
+    assert status_body["report"] is not None
+    assert bucket.objects == {}
+
+
+def test_a_recovered_artifact_is_downloadable_while_the_job_still_reads_failed(
+    web: RecordedWeb,
+    client: TestClient,
+    graph: ResearchGraph,
+    db: Engine,
+    queue: FakeQueue,
+    bucket: FakeS3,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0009's consequence, stated as a test because it reads like a contradiction.
+
+    A job that failed at export reads `status: "failed"` forever - `finish_job` is never
+    called again and nothing rewrites history - and its artifact is still reachable, because
+    this route keys on the artifact rather than on the status. A client branches on this
+    route's answer, not on the status, when it wants the object.
+    """
+    monkeypatch.setattr(artifacts_module, "sleep", lambda _delay: None)
+    job_id = _at_the_gate(client, graph, db, queue)
+    bucket.script.extend([s3_error(), s3_error(), s3_error()])
+    client.post(f"/jobs/{job_id}/approve", json={"decision": "approve"}, headers=_REVIEWER_AUTH)
+    _work(graph, db, queue)
+    assert client.get(f"/jobs/{job_id}/report", headers=_SUBMITTER_AUTH).status_code == 404
+
+    # What the operator runs, against the same database and the same bucket.
+    assert (
+        reexport_job.reexport(
+            db, ArtifactStore(_BUCKET, client=bucket), job_id=job_id, actor="ops-alice"
+        )
+        == 0
+    )
+
+    assert client.get(f"/jobs/{job_id}/report", headers=_SUBMITTER_AUTH).status_code == 200
+    assert client.get(f"/jobs/{job_id}", headers=_SUBMITTER_AUTH).json()["status"] == "failed"
 
 
 # --- Reading the gate -----------------------------------------------------------------
@@ -1291,6 +1421,9 @@ def test_the_route_layer_is_handed_nothing_that_could_execute_a_graph(
         # A health probe with one method, and no cache, no URL set and no rate-limit bucket:
         # the API reaches Redis to report on the workers, never to do their work (step 21).
         "redis",
+        # A presigner with one method, and no `put_report`: signing for an object is the
+        # API's, writing one is the worker's (step 22a, guidelines §13).
+        "artifacts",
     }
 
 
@@ -1327,7 +1460,7 @@ def test_a_reviewer_can_approve_and_the_export_runs(
     assert row is not None
     assert row.status == "approved"
     assert row.report_json is not None  # the export gate passed and stored the body
-    assert row.exported_at is not None
+    assert row.exported_at is not None  # and the artifact write succeeded (ADR 0009 dec 1)
     # Both messages acknowledged, and nothing left in flight to be redelivered.
     assert len(queue.deleted) == 2 and queue.in_flight() == []
 

@@ -42,7 +42,7 @@ from typing import cast
 
 import pytest
 from dbharness import a_finding, migrated_engine, new_job_id
-from fakes import server_error
+from fakes import FakeS3, s3_error, server_error
 from harness import (
     Answer,
     FakeLLM,
@@ -60,7 +60,9 @@ from openai import OpenAI
 from pydantic import HttpUrl
 from sqlalchemy.engine import Engine
 
+import artifacts as artifacts_module
 import llm_client
+from artifacts import ArtifactStore
 from config import load_config
 from database import queries
 from graph.build import (
@@ -100,6 +102,10 @@ _ROUTE_TO_THE_GATE = [
     decision("fact_checker"),
 ]
 
+_BUCKET = "research-reports"
+"""The bucket the fake stands in for. One name, so an object key in an assertion is
+recognisable as the one the export node wrote."""
+
 _SUBMITTER = "submitter-7"
 
 
@@ -133,6 +139,20 @@ def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     about, and waiting for one makes them slow for no gain."""
     recorded: list[float] = []
     monkeypatch.setattr(llm_client, "sleep", recorded.append)
+    return recorded
+
+
+@pytest.fixture
+def waited(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The **artifact** retry's backoff, recorded rather than waited.
+
+    Deliberately separate from `slept` above: guidelines §17 gives the LLM and the artifact
+    write different schedules, and one fixture covering both would let a test assert a delay
+    without saying which schedule produced it. Here the assertion is the schedule - three
+    attempts, 2s then 8s (ADR 0009 decision 1) - so it has to be unambiguous.
+    """
+    recorded: list[float] = []
+    monkeypatch.setattr(artifacts_module, "sleep", recorded.append)
     return recorded
 
 
@@ -173,9 +193,16 @@ def _fake(**overrides: list[Answer]) -> FakeLLM:
     return FakeLLM(**{**script, **overrides})
 
 
-def _graph(fake: FakeLLM, db: Engine | None) -> ResearchGraph:
+def _graph(
+    fake: FakeLLM, db: Engine | None, artifacts: ArtifactStore | None = None
+) -> ResearchGraph:
     config = load_config(_ENV)
-    return build_graph(config=config, llm=LLMClient(config, client=cast(OpenAI, fake)), db=db)
+    return build_graph(
+        config=config,
+        llm=LLMClient(config, client=cast(OpenAI, fake)),
+        db=db,
+        artifacts=artifacts,
+    )
 
 
 def _decide(compiled: ResearchGraph, job_id: str, decided: str) -> ResearchState:
@@ -186,8 +213,17 @@ def _decide(compiled: ResearchGraph, job_id: str, decided: str) -> ResearchState
     return cast(ResearchState, resumed)
 
 
-def _approved(fake: FakeLLM, db: Engine | None, job_id: str) -> ResearchState:
-    return _decide(_graph(fake, db), job_id, "approve")
+def _approved(
+    fake: FakeLLM, db: Engine | None, job_id: str, artifacts: ArtifactStore | None = None
+) -> ResearchState:
+    return _decide(_graph(fake, db, artifacts), job_id, "approve")
+
+
+def _store(*script: object) -> tuple[ArtifactStore, FakeS3]:
+    """The real `ArtifactStore` over a scripted bucket, so the retry schedule, the object key
+    and the JSON body under test are production's rather than a stub's."""
+    client = FakeS3(script=list(script))
+    return ArtifactStore(_BUCKET, client=client), client
 
 
 # --- What one job leaves behind -----------------------------------------------------
@@ -212,6 +248,9 @@ def test_a_whole_job_writes_its_audit_trail_in_order(
         ("system", "gate_opened"),
         ("system", "export_attempted"),
         ("system", "export_result"),
+        # ADR 0009 decision 5, and the sentence ARCHITECTURE.md §3 had to withdraw when
+        # ADR 0008 found it untrue: finalize really does emit an audit event now.
+        ("system", "job_finished"),
     ]
 
 
@@ -258,8 +297,14 @@ def test_the_claims_and_their_sources_are_written_with_the_verdict(
 def test_the_approved_report_is_what_jobs_report_json_holds(
     web: RecordedWeb, db: Engine, job: str
 ) -> None:
-    # Step 16, and ARCHITECTURE.md §8's Phase 2 answer to "where does an export go before S3
-    # exists": here, in the same node that will hold the PutObject in Phase 3.
+    """Step 16: the approved body is durable in Postgres, in the same node that writes the
+    artifact.
+
+    **`exported_at` is NULL here, and that is the assertion rather than an oversight.** This
+    graph has no artifact store, so no object was written - and since ADR 0009 decision 1 the
+    column means "the artifact exists" rather than "the body was stored". A job that claimed
+    an export date with no object behind it is exactly what that decision exists to prevent.
+    """
     final = _approved(_fake(), db, job)
     report = final["report"]
     assert report is not None
@@ -268,7 +313,7 @@ def test_the_approved_report_is_what_jobs_report_json_holds(
 
     assert row is not None
     assert row.report_json == report.model_dump(mode="json")
-    assert row.exported_at is not None
+    assert row.exported_at is None
     assert row.status == "approved"
     assert row.completed_at is not None
     assert (row.revision_count, row.llm_calls_used) == (
@@ -276,6 +321,165 @@ def test_the_approved_report_is_what_jobs_report_json_holds(
         final["llm_calls_used"],
     )
     assert row.quality_flag is None  # the rubric ran and the report passed
+
+
+# --- The artifact write, and what an exhausted one leaves behind ---------------------
+
+
+def test_a_successful_artifact_write_stores_the_object_and_stamps_exported_at(
+    web: RecordedWeb, db: Engine, job: str
+) -> None:
+    """ADR 0009 decision 1's happy path, end to end through the real graph.
+
+    Three facts have to line up, and each of the three is what a different reader depends on:
+    the body is in Postgres, the object is in the bucket, and `exported_at` says so.
+    """
+    artifacts, bucket = _store()
+
+    final = _approved(_fake(), db, job, artifacts)
+    report = final["report"]
+    assert report is not None
+
+    row = queries.read_job(db, job)
+    assert row is not None
+    assert row.status == "approved"
+    assert row.exported_at is not None
+    assert bucket.body(f"reports/{job}.json") == report.model_dump(mode="json")
+    assert row.report_json == bucket.body(f"reports/{job}.json")
+
+
+def test_the_artifact_write_is_recorded_under_its_own_export_result_row(
+    web: RecordedWeb, db: Engine, job: str
+) -> None:
+    # Two `export_result` rows, and they say different things: the gate passed, and then the
+    # object was written. The second is what a recovered export writes too, under an operator.
+    artifacts, _ = _store()
+
+    _approved(_fake(), db, job, artifacts)
+
+    results = [
+        event.detail
+        for event in queries.read_audit_events(db, job)
+        if event.action == "export_result"
+    ]
+    assert [detail["result"] for detail in results] == ["exported", "artifact_written"]
+    assert results[1]["key"] == f"reports/{job}.json"
+
+
+def test_a_first_write_that_fails_is_retried_and_the_job_still_exports(
+    web: RecordedWeb, db: Engine, job: str, waited: list[float]
+) -> None:
+    # guidelines §17's artifact row: a transient failure costs a retry, not a job. The report
+    # was already correct when the gate passed, so re-running anything would be absurd.
+    artifacts, bucket = _store(s3_error())
+
+    _approved(_fake(), db, job, artifacts)
+
+    row = queries.read_job(db, job)
+    assert row is not None
+    assert row.status == "approved" and row.exported_at is not None
+    assert len(bucket.puts) == 2
+    assert waited == [2.0]
+
+
+def test_two_failures_still_leave_the_third_attempt_to_succeed(
+    web: RecordedWeb, db: Engine, job: str, waited: list[float]
+) -> None:
+    # The full documented schedule: 3 attempts, 2s then 8s between them (ADR 0009 decision 1).
+    artifacts, bucket = _store(s3_error(), s3_error())
+
+    _approved(_fake(), db, job, artifacts)
+
+    row = queries.read_job(db, job)
+    assert row is not None and row.exported_at is not None
+    assert len(bucket.puts) == 3
+    assert waited == [2.0, 8.0]
+
+
+def test_an_exhausted_write_fails_the_job_and_preserves_everything_else(
+    web: RecordedWeb, db: Engine, job: str, waited: list[float]
+) -> None:
+    """ADR 0009's first shipping condition, and the one that matters most.
+
+    The report is finished, approved and gate-passed, and only the artifact is missing - so
+    the job fails, and the body, the claims, the `claim_sources` rows and the trail all stay.
+    Research and synthesis are never re-run for a storage error.
+    """
+    artifacts, bucket = _store(s3_error(), s3_error(), s3_error())
+
+    final = _approved(_fake(), db, job, artifacts)
+
+    assert final["status"] == "failed"
+    assert final["failure_reason"] == "export_write_failed"
+
+    row = queries.read_job(db, job)
+    assert row is not None
+    assert row.status == "failed"
+    assert row.report_json is not None  # the body is preserved
+    assert row.exported_at is None  # and nothing claims an artifact
+    assert bucket.objects == {}
+    assert len(bucket.puts) == 3 and waited == [2.0, 8.0]
+
+    assert queries.read_claims(db, job)  # the claims survive
+    assert queries.read_claim_sources(db, job)  # and so do their sources
+    assert queries.read_findings(db, job)
+
+
+def test_an_exhausted_write_is_the_recoverable_set_and_says_why_it_failed(
+    web: RecordedWeb, db: Engine, job: str, waited: list[float]
+) -> None:
+    """The predicate in ADR 0009 decision 1, and the `job_finished` row from decision 5 that
+    turns the inference into a recorded fact."""
+    artifacts, _ = _store(s3_error(), s3_error(), s3_error())
+
+    _approved(_fake(), db, job, artifacts)
+
+    row = queries.read_job(db, job)
+    assert row is not None
+    assert (row.status, row.report_json is not None, row.exported_at) == ("failed", True, None)
+
+    trail = {event.action: event.detail for event in queries.read_audit_events(db, job)}
+    assert trail["job_finished"] == {
+        "status": "failed",
+        "failure_reason": "export_write_failed",
+    }
+
+
+def test_a_write_that_succeeded_before_the_stamp_failed_converges_on_replay(
+    web: RecordedWeb, db: Engine, job: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case item 11 of the step calls "S3 succeeds but stamping `exported_at` fails".
+
+    The database gets 0 retries (guidelines §17), so the failure propagates out of the node and
+    the worker leaves the message; redelivery replays `export_node`. The key is derived from
+    the job id alone, so the second `PutObject` overwrites the first rather than making a
+    second artifact - which is what makes the replay converge rather than duplicate.
+    """
+    artifacts, bucket = _store()
+    graph = _graph(_fake(), db, artifacts)
+    settings = run_config(job)
+    graph.invoke(new_state(job_id=job, user_id="user-1", question=_QUESTION), settings)
+
+    # A database outage at exactly the wrong moment. guidelines §17 gives the database 0
+    # retries, so it propagates out of the node - which is what leaves the message on the queue.
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("the stamp failed")
+
+    monkeypatch.setattr(queries, "record_artifact_written", boom)
+    with pytest.raises(RuntimeError, match="the stamp failed"):
+        graph.invoke(Command(resume={"decision": "approve"}), settings)
+    monkeypatch.undo()
+
+    # The object is there and the row does not say so yet - the state a replay has to fix.
+    assert bucket.objects
+    row = queries.read_job(db, job)
+    assert row is not None and row.exported_at is None
+
+    graph.invoke(None, settings)
+
+    row = queries.read_job(db, job)
+    assert row is not None and row.exported_at is not None
+    assert len(bucket.objects) == 1  # one key, overwritten, never two artifacts
 
 
 def test_the_jobs_row_call_count_is_stale_while_a_job_waits_at_the_gate(

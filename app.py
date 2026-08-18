@@ -1,9 +1,10 @@
 """
 WHY THIS FILE EXISTS
-    The API entrypoint: `uvicorn app:app --reload` (CLAUDE.md commands). It builds the four
-    things the routes need - the config, the database engine, the compiled graph, and the
-    key table - and hands them over as one object. Nothing here decides anything; the
-    decisions are in routes/api.py and routes/auth.py.
+    The API entrypoint: `uvicorn app:app --reload` (CLAUDE.md commands). It builds what the
+    routes need - the config, the database engine, a checkpoint *reader*, the queue, the key
+    table, the Redis health probe and the artifact presigner - and hands them over as one
+    object. Nothing here decides anything; the decisions are in routes/api.py and
+    routes/auth.py.
 
     **Everything is built once, at startup, and a failure here is fatal on purpose.** A
     missing `AUTH_KEYS`, an unreachable database URL, or a malformed key table should stop
@@ -34,12 +35,13 @@ from psycopg.rows import DictRow, dict_row
 from psycopg_pool import ConnectionPool
 from sqlalchemy.engine import Engine
 
+from artifacts import build_artifact_store
 from config import Config, load_config, required
 from database.queries import create_database_engine
 from graph.state import state_serde
 from jobqueue import JobQueue, build_queue
 from redisstore import RedisHealth, build_redis
-from routes.api import ApiError, RedisProbe, RouteDeps, router
+from routes.api import ApiError, RedisProbe, ReportPresigner, RouteDeps, router
 from routes.auth import Identity, load_api_keys
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ def create_application(
     queue: JobQueue,
     keys: dict[str, Identity] | None = None,
     redis: RedisProbe | None = None,
+    artifacts: ReportPresigner | None = None,
 ) -> FastAPI:
     """Wire the routes to their collaborators.
 
@@ -62,6 +65,10 @@ def create_application(
     `redis` is the `/health` probe (step 21) and is optional for the same reason: a test that
     is not about health should not have to supply one, and an absent probe reports healthy
     rather than failing a check nobody configured.
+
+    `artifacts` is what `GET /jobs/{id}/report` signs a URL with (step 22a), optional on the
+    same terms. It is a **presigner**: the API's task role may sign for an object and the
+    worker's writes one, and the Protocol the route layer declares is that half.
     """
     application = FastAPI(title="Competitive Research API")
     application.state.deps = RouteDeps(
@@ -71,6 +78,7 @@ def create_application(
         queue=queue,
         keys=load_api_keys(config.auth_keys) if keys is None else keys,
         redis=redis,
+        artifacts=artifacts,
     )
     application.include_router(router)
 
@@ -141,13 +149,15 @@ def _checkpoint_reader(database_url: str) -> PostgresSaver:  # pragma: no cover
 def _build() -> FastAPI:  # pragma: no cover - exercised by running the server
     """The production wiring. **No graph, no LLM client, no Tavily key** (ADR 0012).
 
-    What it needs is `DATABASE_URL`, `AUTH_KEYS` and `SQS_QUEUE_URL`. A missing LLM credential
-    can no longer stop this process from starting, which is what makes guidelines §13's
-    least-privilege table a property of the code rather than of an intended deployment.
+    What it needs is `DATABASE_URL`, `AUTH_KEYS`, `SQS_QUEUE_URL` and - since step 22a -
+    `S3_BUCKET`, because `GET /jobs/{id}/report` signs a URL for an object in it. A missing LLM
+    credential can no longer stop this process from starting, which is what makes guidelines
+    §13's least-privilege table a property of the code rather than of an intended deployment.
     """
     config = load_config()
     database_url = required(config.database_url, "DATABASE_URL")
     queue_url = required(config.sqs_queue_url, "SQS_QUEUE_URL")
+    bucket = required(config.s3_bucket, "S3_BUCKET")
     return create_application(
         config=config,
         engine=create_database_engine(database_url),
@@ -158,6 +168,11 @@ def _build() -> FastAPI:  # pragma: no cover - exercised by running the server
         # One method of one client, for `/health` alone. The API caches nothing and takes no
         # rate-limit token: those belong to the process that fetches pages and calls models.
         redis=RedisHealth(build_redis(config.redis_url)),
+        # Presigning only. The API holds no report bytes and writes no object; the worker is
+        # the process with `PutObject` (guidelines §13).
+        artifacts=build_artifact_store(
+            bucket, region=config.aws_region, endpoint_url=config.aws_endpoint_url
+        ),
     )
 
 

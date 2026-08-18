@@ -36,6 +36,12 @@ WHY THIS FILE EXISTS
     maps to, never a name in the body. An approval that cannot say who made it is
     accountability theatre (guidelines §9, §16).
 
+    **The artifact route keys on the artifact, never on the status** (ADR 0009 decision 3).
+    `GET /jobs/{id}/report` answers a 15-minute presigned URL when `jobs.exported_at` is set
+    and `404 not_exported` when it is not - so a job that failed at export and was recovered by
+    an operator's re-export is downloadable while still reading `status: "failed"`. The API
+    signs; it never streams report bytes and never writes an object.
+
     **The gate is read on its own route, not on `GET /jobs/{id}`** (ADR 0013). A reviewer
     must be able to see what they are approving, and none of the six fields the status route
     carries is the draft: `report` there means the *exported* body, which is null until the
@@ -153,6 +159,18 @@ class RedisProbe(Protocol):
     def reachable(self) -> bool: ...
 
 
+class ReportPresigner(Protocol):
+    """The one S3 question the API asks: what is this job's artifact URL, and until when?
+
+    A Protocol for the same reason `RedisProbe` is one, and with a sharper edge: the API's
+    task role may **presign** objects and the worker's may **write** them (guidelines §13's
+    least-privilege table), so the surface the route layer declares is the half it is allowed
+    to use. `put_report` is deliberately not in here.
+    """
+
+    def presign(self, job_id: str) -> tuple[str, datetime]: ...
+
+
 @dataclass(frozen=True)
 class RouteDeps:
     """Everything the routes need, built once at startup and read from `app.state`.
@@ -173,6 +191,13 @@ class RouteDeps:
     queue: JobQueue
     keys: dict[str, Identity]
     redis: RedisProbe | None = None
+    artifacts: ReportPresigner | None = None
+    """What `GET /jobs/{id}/report` signs a URL with (step 22a).
+
+    Optional on the same terms as `redis`: a test that is not about the artifact route should
+    not have to supply one, and `app.py` always does. It is a presigner and nothing else - the
+    API never writes an object and never holds report bytes.
+    """
 
 
 class ApiError(Exception):
@@ -549,18 +574,53 @@ def _refuse_unaffordable_edit(deps: RouteDeps, job_id: str, *, llm_calls_used: i
 
 @router.get("/jobs/{job_id}/report")
 def read_report(job_id: str, request: Request) -> JSONResponse:
-    """Always `404` in Phase 2.
+    """A 15-minute presigned URL for the artifact, or `404 not_exported`.
 
-    The artifact is a presigned S3 URL and S3 arrives in Phase 3; the approved body is read
-    from `GET /jobs/{id}` until then, which already carries `report`. No stand-in is built
-    (ARCHITECTURE.md §8, §10).
+    **It keys on the artifact, not on the status** (ADR 0009 decision 3). That is
+    ARCHITECTURE.md §3's sentence made executable - *"whether a report is downloadable is
+    answered by the artifact existing"* - and it is what makes a recovered job's artifact
+    reachable without rewriting the job's history: a job that failed at export and was
+    re-exported by an operator reads `status: "failed"` forever and still answers `200` here.
+
+    `exported_at IS NULL` is `404` and covers every way there can be no object: the job has not
+    reached export, it was rejected, the gate blocked it, or the write was exhausted and the
+    body is preserved in `jobs.report_json` with no artifact behind it. A caller that wants the
+    body in that last case reads `GET /jobs/{id}`, which has always carried `report`.
+
+    **The API never streams report bytes** (guidelines §12). It signs a URL and the client
+    fetches the object directly, so a 20-minute job's output never occupies a worker - and
+    signing reaches nothing, so this route needs no Redis, no graph, no LLM and no node
+    execution, which keeps ADR 0012's boundary exactly where it was.
     """
     deps = _deps(request)
     identity = _caller(request)
-    _owned(_job_or_404(deps.engine, job_id), identity)
+    job = _job_or_404(deps.engine, job_id)
+    _owned(job, identity)
 
-    raise ApiError(
-        status.HTTP_404_NOT_FOUND, "not_exported", "No artifact exists for this job", job_id=job_id
+    if job.exported_at is None:
+        raise ApiError(
+            status.HTTP_404_NOT_FOUND,
+            "not_exported",
+            "No artifact exists for this job",
+            job_id=job_id,
+        )
+
+    if deps.artifacts is None:
+        # The row says an artifact was written and this process cannot sign for it, which is a
+        # deployment that is missing `S3_BUCKET` rather than anything the caller did. It gets
+        # the generic failure; the explanation goes to the log (guidelines §16).
+        logger.error("job %s has an artifact and this process has no presigner", job_id)
+        raise ApiError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "The request could not be completed",
+            job_id=job_id,
+        )
+
+    url, expires_at = deps.artifacts.presign(job_id)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"url": url, "expires_at": expires_at.isoformat()},
     )
 
 

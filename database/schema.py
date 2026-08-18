@@ -90,14 +90,24 @@ AuditAction = Literal[
     "reviewer_decision",
     "export_attempted",
     "export_result",
+    "job_finished",
     "retention_delete",
 ]
-"""The actions ARCHITECTURE.md §9 enumerates, plus `reflection_failed`.
+"""The actions ARCHITECTURE.md §9 enumerates, plus `reflection_failed` and `job_finished`.
 
-That one is not an addition of ours: ARCHITECTURE.md §15 requires an `audit_events` row
-when the scoring call fails and the report is kept, and §9's list simply does not carry it.
-Both are in the specification, so the vocabulary follows the requirement rather than the
-list, and the discrepancy is worth correcting in §9 rather than silently working around.
+`reflection_failed` is not an addition of ours: ARCHITECTURE.md §15 requires an
+`audit_events` row when the scoring call fails and the report is kept, and §9's list simply
+does not carry it. Both are in the specification, so the vocabulary follows the requirement
+rather than the list, and the discrepancy is worth correcting in §9 rather than silently
+working around.
+
+`job_finished` is ADR 0009 decision 5, which adopts the shape
+[ADR 0008](../docs/adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md)
+designed and deliberately did not build: `{status, failure_reason}` in the trail rather than
+a `jobs.failure_reason` column. Phase 3 is where it stops being optional, because recovering
+a failed export is the first operation that has to read a failure's reason from somewhere
+that is not the checkpoint. It costs one Alembic revision - `rev_0003` - because the CHECK
+below is built from `get_args(AuditAction)`, so a new literal is a constraint change.
 """
 
 

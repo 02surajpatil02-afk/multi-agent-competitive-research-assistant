@@ -586,8 +586,8 @@ def test_a_verdict_for_a_claim_the_database_does_not_have_is_logged(
 
 
 def test_the_export_result_and_the_report_body_are_written_together(db: Engine, job: str) -> None:
-    # jobs.report_json is where Phase 2 keeps the approved body, and the audit row and the
-    # body must not be able to disagree about whether an export happened.
+    # jobs.report_json is where the approved body lives, and the audit row and the body must
+    # not be able to disagree about whether the gate passed.
     _drafted(db, job)
     report = a_report(("c1", ["f1"]))
 
@@ -597,9 +597,59 @@ def test_the_export_result_and_the_report_body_are_written_together(db: Engine, 
     event = queries.read_audit_events(db, job)[-1]
     assert row is not None
     assert row.report_json == report.model_dump(mode="json")
-    assert row.exported_at is not None
+    # And **not** exported: the body being durable is not the artifact existing (ADR 0009
+    # decision 1). Stamping here would claim an export date for an object nobody can fetch.
+    assert row.exported_at is None
     assert (event.actor, event.action) == ("system", "export_result")
     assert event.detail == {"result": "exported", "claims": 1}
+
+
+def test_the_artifact_write_is_what_stamps_exported_at(db: Engine, job: str) -> None:
+    """ADR 0009 decision 1's split, which is what makes the recoverable set a query.
+
+    `exported_at IS NOT NULL` has to mean "the object exists" and nothing weaker, because
+    `GET /jobs/{id}/report` keys on it and an operator's recovery keys on its absence.
+    """
+    _drafted(db, job)
+    queries.record_export_result(db, job_id=job, report=a_report(("c1", ["f1"])), uncited=())
+
+    queries.record_artifact_written(db, job_id=job, actor="system", key=f"reports/{job}.json")
+
+    row = queries.read_job(db, job)
+    event = queries.read_audit_events(db, job)[-1]
+    assert row is not None and row.exported_at is not None
+    assert event.action == "export_result"
+    assert event.detail == {"result": "artifact_written", "key": f"reports/{job}.json"}
+
+
+def test_an_exhausted_artifact_write_leaves_the_body_and_no_export_date(
+    db: Engine, job: str
+) -> None:
+    # The state ADR 0009 decision 1 defines as recoverable: the report is preserved and the
+    # artifact is not there, so the re-export script has something to re-project.
+    _drafted(db, job)
+    queries.record_export_result(db, job_id=job, report=a_report(("c1", ["f1"])), uncited=())
+
+    queries.record_artifact_failed(db, job_id=job, actor="system", key=f"reports/{job}.json")
+
+    row = queries.read_job(db, job)
+    event = queries.read_audit_events(db, job)[-1]
+    assert row is not None
+    assert row.report_json is not None and row.exported_at is None
+    assert event.detail == {"result": "artifact_write_failed", "key": f"reports/{job}.json"}
+
+
+def test_a_re_export_records_the_operator_rather_than_the_system(db: Engine, job: str) -> None:
+    # ADR 0009 decision 4: recovery writes its rows under the person who ran it, so a
+    # recovered export is exactly as auditable as an original one.
+    _drafted(db, job)
+    queries.record_export_result(db, job_id=job, report=a_report(("c1", ["f1"])), uncited=())
+
+    queries.record_export_attempt(db, job_id=job, actor="alice", claims_checked=1)
+    queries.record_artifact_written(db, job_id=job, actor="alice", key=f"reports/{job}.json")
+
+    actors = [event.actor for event in queries.read_audit_events(db, job)[-2:]]
+    assert actors == ["alice", "alice"]
 
 
 def test_a_blocked_export_stores_no_report_and_names_the_uncited_claims(
@@ -625,6 +675,7 @@ def test_finishing_a_job_stamps_the_outcome_the_counters_and_completed_at(
         db,
         job_id=job,
         status="approved",
+        failure_reason=None,
         quality_flag="below_threshold",
         revision_count=2,
         llm_calls_used=41,
@@ -636,6 +687,80 @@ def test_finishing_a_job_stamps_the_outcome_the_counters_and_completed_at(
     assert row.quality_flag == "below_threshold"
     assert (row.revision_count, row.llm_calls_used) == (2, 41)
     assert row.completed_at is not None
+
+
+def test_finishing_a_job_writes_one_job_finished_row_carrying_the_reason(
+    db: Engine, job: str
+) -> None:
+    """ADR 0009 decision 5, which is what makes a failure's reason durable outside the
+    checkpoint - the gap ADR 0008 accepted for Phase 2 and assigned to this one."""
+    queries.finish_job(
+        db,
+        job_id=job,
+        status="failed",
+        failure_reason="export_write_failed",
+        quality_flag=None,
+        revision_count=1,
+        llm_calls_used=30,
+    )
+
+    event = queries.read_audit_events(db, job)[-1]
+    assert (event.actor, event.action) == ("system", "job_finished")
+    assert event.detail == {"status": "failed", "failure_reason": "export_write_failed"}
+
+
+def test_finalizing_a_job_twice_leaves_one_terminal_row(db: Engine, job: str) -> None:
+    # A replayed `finalize` node, or the worker finalising a job whose invocation raised. A
+    # job finishes once, so the trail says so once (ADR 0009 decision 5).
+    for _ in range(2):
+        queries.finish_job(
+            db,
+            job_id=job,
+            status="approved",
+            failure_reason=None,
+            quality_flag=None,
+            revision_count=0,
+            llm_calls_used=16,
+        )
+
+    finished = [
+        event for event in queries.read_audit_events(db, job) if event.action == "job_finished"
+    ]
+    assert len(finished) == 1
+
+
+def test_a_second_finalization_that_disagrees_is_logged_rather_than_recorded(
+    db: Engine, job: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The trail keeps the first answer, and the disagreement is visible rather than silently
+    # overwritten - the same reason a verdict for an unknown claim is logged and not raised.
+    queries.finish_job(
+        db,
+        job_id=job,
+        status="approved",
+        failure_reason=None,
+        quality_flag=None,
+        revision_count=0,
+        llm_calls_used=16,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        queries.finish_job(
+            db,
+            job_id=job,
+            status="failed",
+            failure_reason="job_dead_lettered",
+            quality_flag=None,
+            revision_count=0,
+            llm_calls_used=16,
+        )
+
+    finished = [
+        event for event in queries.read_audit_events(db, job) if event.action == "job_finished"
+    ]
+    assert len(finished) == 1
+    assert finished[0].detail == {"status": "approved", "failure_reason": None}
+    assert "job_dead_lettered" in caplog.text
 
 
 def test_the_audit_trail_reads_back_as_a_timeline(db: Engine, job: str) -> None:
@@ -652,7 +777,7 @@ def test_the_audit_trail_reads_back_as_a_timeline(db: Engine, job: str) -> None:
         weighted_score=3.1,
     )
     queries.record_reflection_failed(db, job_id=job)
-    queries.record_export_attempt(db, job_id=job, claims_checked=2)
+    queries.record_export_attempt(db, job_id=job, actor="system", claims_checked=2)
 
     events = queries.read_audit_events(db, job)
 
@@ -918,7 +1043,13 @@ def test_setting_a_status_leaves_a_finished_job_alone(db: Engine, job: str) -> N
     assert _status(db, job) == "awaiting_approval"
 
     queries.finish_job(
-        db, job_id=job, status="approved", quality_flag=None, revision_count=0, llm_calls_used=17
+        db,
+        job_id=job,
+        status="approved",
+        failure_reason=None,
+        quality_flag=None,
+        revision_count=0,
+        llm_calls_used=17,
     )
     queries.set_job_status(db, job_id=job, status="running")
 

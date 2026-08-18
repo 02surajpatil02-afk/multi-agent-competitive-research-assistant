@@ -48,7 +48,7 @@ from typing import Any, cast
 import pytest
 import sqlalchemy as sa
 from dbharness import migrated_engine, new_job_id
-from fakes import FakeQueue
+from fakes import FakeQueue, FakeS3
 from harness import (
     FakeLLM,
     Page,
@@ -66,6 +66,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
+from artifacts import ArtifactStore
 from config import Config, load_config
 from database import queries
 from database.schema import jobs
@@ -94,6 +95,7 @@ _ENV = {
     "TAVILY_API_KEY": "key",
     "DATABASE_URL": "postgresql://user:pw@localhost:5432/research",
     "SQS_QUEUE_URL": "https://sqs.ap-south-1.amazonaws.com/1/research-jobs.fifo",
+    "S3_BUCKET": "research-reports",
 }
 
 _QUESTION = "Compare TCS and Infosys on cloud strategy."
@@ -180,9 +182,25 @@ def queue() -> FakeQueue:
 
 
 @pytest.fixture
-def graph(config: Config, fake: FakeLLM, db: Engine, saver: InMemorySaver) -> ResearchGraph:
+def bucket() -> FakeS3:
+    """The report bucket, in memory. Wrapped in the real `ArtifactStore` below, so the key,
+    the retry schedule and the JSON body under test are production's."""
+    return FakeS3()
+
+
+@pytest.fixture
+def graph(
+    config: Config, fake: FakeLLM, db: Engine, saver: InMemorySaver, bucket: FakeS3
+) -> ResearchGraph:
     return build_graph(
-        config=config, llm=LLMClient(config, client=cast(OpenAI, fake)), db=db, checkpointer=saver
+        config=config,
+        llm=LLMClient(config, client=cast(OpenAI, fake)),
+        db=db,
+        # The worker is the process that writes an artifact (step 22a), so the graph these
+        # tests drive has one - otherwise an approved job would end with `exported_at` NULL
+        # and nothing here would exercise the write the real worker performs.
+        artifacts=ArtifactStore("research-reports", client=bucket),
+        checkpointer=saver,
     )
 
 
@@ -413,7 +431,7 @@ def test_a_message_for_a_finished_job_is_deleted_without_invoking_anything(
 
 
 def test_a_paused_job_resumes_from_the_decision_on_record(
-    web: RecordedWeb, deps: WorkerDeps, db: Engine, queue: FakeQueue
+    web: RecordedWeb, deps: WorkerDeps, db: Engine, queue: FakeQueue, bucket: FakeS3
 ) -> None:
     """ADR 0011's headline: the decision is read from the audit trail, keyed by the visit.
 
@@ -431,7 +449,10 @@ def test_a_paused_job_resumes_from_the_decision_on_record(
     row = queries.read_job(db, job_id)
     assert row is not None
     assert row.status == "approved"
+    # The body is durable and the artifact exists, which is what `exported_at` now means
+    # (ADR 0009 decision 1) - and the object is really in the bucket, not merely claimed.
     assert row.report_json is not None and row.exported_at is not None
+    assert bucket.body(f"reports/{job_id}.json") == row.report_json
     assert queue.in_flight() == []
 
 
@@ -1030,7 +1051,17 @@ def test_a_queue_with_no_redrive_policy_starts_with_a_warning(
 
 @pytest.mark.parametrize(
     "name",
-    ["DATABASE_URL", "SQS_QUEUE_URL", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "TAVILY_API_KEY"],
+    [
+        "DATABASE_URL",
+        "SQS_QUEUE_URL",
+        # Step 22a. Discovering a missing bucket at export time would fail a job that had
+        # already paid for its whole pipeline.
+        "S3_BUCKET",
+        "LLM_BASE_URL",
+        "LLM_API_KEY",
+        "LLM_MODEL",
+        "TAVILY_API_KEY",
+    ],
 )
 def test_the_worker_refuses_to_start_without_each_variable_it_uses(name: str) -> None:
     """ADR 0012 decision 4's other half: the API stopped requiring these, so the worker states
@@ -1041,10 +1072,11 @@ def test_the_worker_refuses_to_start_without_each_variable_it_uses(name: str) ->
         required_credentials(load_config(without))
 
 
-def test_a_complete_environment_narrows_to_the_six_values(config: Config) -> None:
+def test_a_complete_environment_narrows_to_the_seven_values(config: Config) -> None:
     credentials = required_credentials(config)
 
     assert credentials.queue_url == _ENV["SQS_QUEUE_URL"]
+    assert credentials.s3_bucket == "research-reports"
     assert credentials.llm_model == "main-model"
 
 

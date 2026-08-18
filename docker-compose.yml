@@ -4,10 +4,11 @@
 #     there is no application image here, because the API and the worker are not containerised
 #     yet and a Dockerfile that nothing runs would be a file to maintain for no requirement.
 #
-#     **PostgreSQL, SQS and Redis have application code behind them; S3 does not.** The API
-#     enqueues to the queue and `python -m worker` consumes it (step 20); the worker caches
-#     searches and fetches in Redis, deduplicates URLs per job there, and takes every LLM token
-#     from the shared bucket (step 21). S3 is started so step 22 has something to build against.
+#     **All four stores have application code behind them.** The API enqueues to the queue and
+#     `python -m worker` consumes it (step 20); the worker caches searches and fetches in Redis,
+#     deduplicates URLs per job there, and takes every LLM token from the shared bucket (step 21);
+#     and the export node writes `reports/{job_id}.json` to S3, which `GET /jobs/{id}/report`
+#     presigns (step 22a).
 #
 #     `docker compose up -d --wait` is the whole bootstrap. Each service's healthcheck is what
 #     `--wait` waits on, and LocalStack's deliberately checks for the queue and the bucket
@@ -67,7 +68,8 @@ services:
       retries: 30
 
   # SQS and S3, locally. The queue is consumed by `python -m worker` (step 20); the export
-  # node's `PutObject` into the bucket is step 22 and is not built.
+  # node writes the approved report into the bucket and the API presigns it (step 22a). The
+  # `integration`-marked tests drive both against this container.
   localstack:
     image: localstack/localstack:4.11
     environment:

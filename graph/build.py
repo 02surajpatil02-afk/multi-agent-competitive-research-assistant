@@ -32,14 +32,17 @@ WHY THIS FILE EXISTS
     longest job to 50 super-steps, and LangGraph's default limit of 1,000 sits well above
     that. A test measures that gap rather than leaving it assumed (guidelines §5).
 
-    **Both durable stores are injected, and both are optional here** (implementation steps
-    14-16). `checkpointer` is the Postgres one in any process that has to survive a restart
-    - `postgres_checkpointer()` below builds it - and the in-memory one otherwise, which is
-    what the offline test suite and the single-process measurement harness run on.
-    `db` is the SQLAlchemy engine the nodes write findings, claims, `claim_sources`, and
-    audit events through as the job runs; without it the graph behaves exactly as it did in
-    Phase 1. Neither is a fallback the code chooses on its own: a caller that wants
-    durability passes both, and one that does not gets no surprise.
+    **Every durable store is injected, and every one of them is optional here**
+    (implementation steps 14-16, and step 22a for the third). `checkpointer` is the Postgres
+    one in any process that has to survive a restart - `postgres_checkpointer()` below builds
+    it - and the in-memory one otherwise, which is what the offline test suite and the
+    single-process measurement harness run on. `db` is the SQLAlchemy engine the nodes write
+    findings, claims, `claim_sources`, and audit events through as the job runs.
+    `artifacts` is the S3 bucket the export node writes the approved report to; without it the
+    gate still runs and the body still reaches `jobs.report_json`, and `exported_at` stays NULL
+    because no artifact exists (ADR 0009 decision 1). With none of the three the graph behaves
+    exactly as it did in Phase 1. None of them is a fallback the code chooses on its own: a
+    caller that wants durability passes them, and one that does not gets no surprise.
 
     **Where a node writes, it writes before it returns.** LangGraph applies a node's update
     and writes the checkpoint after the node returns, so a crash in between leaves the
@@ -84,8 +87,10 @@ from agents.planner import PlannerUpdate, plan_research
 from agents.researcher import ResearcherUpdate, research_subtopic
 from agents.supervisor import decide_next
 from agents.synthesizer import SynthesizerUpdate, write_report
+from artifacts import ArtifactError, ArtifactStore, object_key
 from config import Config
 from database import queries
+from database.schema import SYSTEM_ACTOR
 from graph.reflection import ReflectionOutcome, reflect
 from graph.state import (
     TERMINAL_STATUSES,
@@ -145,6 +150,14 @@ class NodeDeps:
     outlives the process. It is what the offline test suite and `scripts/measure_jobs.py`
     use, because neither has a database and neither is what persistence is for.
     """
+    artifacts: ArtifactStore | None = None
+    """The report bucket the export node writes to, or None to export without an artifact.
+
+    None is the third store on the same terms as the other two: the export gate still runs and
+    the approved body still reaches `jobs.report_json`, and `exported_at` stays NULL because
+    nothing was written to S3 (ADR 0009 decision 1). The offline suite and the measurement
+    harness run that way; the worker passes one.
+    """
 
 
 class GateUpdate(TypedDict, total=False):
@@ -177,6 +190,7 @@ def build_graph(
     cache: ToolCache | None = None,
     urls: UrlDeduplicator | None = None,
     db: Engine | None = None,
+    artifacts: ArtifactStore | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> ResearchGraph:
     """Wire the five agents and the four control-flow nodes, and compile.
@@ -190,7 +204,7 @@ def build_graph(
     `database.queries.create_database_engine()`; the test suite and the measurement harness
     pass neither, which is why they still run with no service behind them.
     """
-    deps = NodeDeps(config=config, llm=llm, cache=cache, urls=urls, db=db)
+    deps = NodeDeps(config=config, llm=llm, cache=cache, urls=urls, db=db, artifacts=artifacts)
     builder = StateGraph(ResearchState)
 
     # The five agents. Each node hands the state to one agent function and returns that
@@ -424,7 +438,7 @@ def human_gate_node(state: ResearchState, *, deps: NodeDeps) -> Command[GateRout
 
 
 def export_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
-    """The claim-to-URL gate, and Phase 2's artifact write.
+    """The claim-to-URL gate, then the artifact write.
 
     Every claim must reach at least one source URL, or the export does not happen - not a
     warning, and not a footnote on an exported report (CLAUDE.md invariant 1). Coverage is
@@ -432,38 +446,69 @@ def export_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
     (ARCHITECTURE.md §20 row 12). The check itself is unchanged and runs on the report in
     state, whether or not there is a database underneath.
 
-    What the database adds is the record: `export_attempted` before the check, so an export
-    that fails the invariant is still visible as an attempt, and then `export_result`
-    either way. A passing export writes the approved body to `jobs.report_json` and stamps
-    `exported_at` in the same transaction as its audit row, which is where the report is
-    read from until S3 arrives in Phase 3 - in this same node (ARCHITECTURE.md §8).
+    **The order of the two durable writes is ADR 0009 decision 1, and it is the whole point
+    of this node's shape:**
 
-    **A blocked export is never retried.** An uncited claim is a defect in the report, not
-    an infrastructure error, and the two are handled differently on purpose.
+        gate passes -> report_json + export_result   (Postgres, 0 retries)
+                    -> PutObject                     (10s, 2 retries at 2s and 8s)
+                    -> exported_at + export_result    on success
+                       status=failed, export_write_failed, exported_at left NULL on exhaustion
+
+    The report is durable **before** the artifact is attempted, which is what makes a storage
+    failure recoverable at all: the body is never lost, only the object is, so recovery is a
+    re-export of a row that already exists rather than a re-run of research and synthesis.
+    `exported_at` therefore means "the artifact exists" and nothing weaker - a job whose
+    `PutObject` failed must not claim an export date for an object nobody can fetch.
+
+    **Two failures, handled differently on purpose.** An uncited claim is a defect in the
+    report: never retried, because it is an invariant rather than an error. An exhausted
+    `PutObject` is infrastructure: bounded, then terminal, and research and synthesis are
+    never re-run for it because the report was already correct when the gate passed
+    (ARCHITECTURE.md §20 row 30).
+
+    **Without an artifact store this node behaves exactly as it did in Phase 2** - the gate
+    runs, the body is stored, and `exported_at` stays NULL because no artifact was written.
+    That is the offline suite's and the measurement harness's shape, and it is honest rather
+    than convenient: nothing claims an artifact that does not exist.
     """
     report = state["report"]
     if report is None:
         logger.error("export reached with no report")
         return TerminalUpdate(status="failed", failure_reason="no_report_to_export")
 
+    job_id = state["job_id"]
     if deps.db is not None:
         queries.record_export_attempt(
-            deps.db, job_id=state["job_id"], claims_checked=len(report.claims)
+            deps.db, job_id=job_id, actor=SYSTEM_ACTOR, claims_checked=len(report.claims)
         )
 
     uncited = _uncited_claims(report)
     if uncited:
         logger.error("export blocked: %d claim(s) reach no source URL: %s", len(uncited), uncited)
         if deps.db is not None:
-            queries.record_export_result(
-                deps.db, job_id=state["job_id"], report=None, uncited=uncited
-            )
+            queries.record_export_result(deps.db, job_id=job_id, report=None, uncited=uncited)
         return TerminalUpdate(status="failed", failure_reason="uncited_claims")
 
     if deps.db is not None:
-        queries.record_export_result(deps.db, job_id=state["job_id"], report=report, uncited=())
+        queries.record_export_result(deps.db, job_id=job_id, report=report, uncited=())
 
     logger.info("export gate passed: %d claims, every one cited", len(report.claims))
+
+    if deps.artifacts is None:
+        return TerminalUpdate(status="approved")
+
+    try:
+        key = deps.artifacts.put_report(job_id, report.model_dump(mode="json"))
+    except ArtifactError:
+        logger.exception("job %s: the artifact write was exhausted", job_id)
+        if deps.db is not None:
+            queries.record_artifact_failed(
+                deps.db, job_id=job_id, actor=SYSTEM_ACTOR, key=object_key(job_id)
+            )
+        return TerminalUpdate(status="failed", failure_reason="export_write_failed")
+
+    if deps.db is not None:
+        queries.record_artifact_written(deps.db, job_id=job_id, actor=SYSTEM_ACTOR, key=key)
     return TerminalUpdate(status="approved")
 
 
@@ -476,6 +521,16 @@ def finalize_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
 
     It is also the only place `jobs.completed_at` is set (ARCHITECTURE.md §9), and where the
     two counters become durable, so budget behaviour stays auditable once state is gone.
+
+    **Since ADR 0009 decision 5 it also writes the one `job_finished` row**, in the same
+    transaction, carrying `{status, failure_reason}`. That is the sentence ARCHITECTURE.md §3
+    had to withdraw when ADR 0008 found it untrue, and it is what stops a failed job's reason
+    living only in a checkpoint that retention does not cover.
+
+    The status and the reason recorded are the **effective** ones - what `_terminal_update`
+    decided, falling back to state - so a failure the graph had to rename (`unrecorded_failure`,
+    `no_terminal_status`) is recorded under the name the job actually ended with rather than
+    the one it arrived with.
     """
     update = _terminal_update(state)
 
@@ -484,6 +539,7 @@ def finalize_node(state: ResearchState, *, deps: NodeDeps) -> TerminalUpdate:
             deps.db,
             job_id=state["job_id"],
             status=update.get("status", state["status"]),
+            failure_reason=update.get("failure_reason", state["failure_reason"]),
             quality_flag=state["quality_flag"],
             revision_count=state["revision_count"],
             llm_calls_used=state["llm_calls_used"],

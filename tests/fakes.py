@@ -26,6 +26,7 @@ WHO CALLS IT
 from __future__ import annotations
 
 import ast
+import json
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from typing import Any
 
 import httpx
 import pytest
+from botocore.exceptions import ClientError
 from openai import APIStatusError, APITimeoutError, InternalServerError, RateLimitError
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -301,6 +303,57 @@ def pdf_bytes(*pages: str, title: str = "") -> bytes:
     buffer = BytesIO()
     writer.write(buffer)
     return buffer.getvalue()
+
+
+@dataclass
+class FakeS3:
+    """Shaped like the two boto3 S3 methods `artifacts.py` calls, and nothing else.
+
+    **It is a fake *client*, not a fake `ArtifactStore`.** Tests wrap it in the real
+    `ArtifactStore`, the way they wrap `FakeOpenAI` in the real `LLMClient`, so the retry
+    schedule, the object key, the JSON body and the `ArtifactError` translation under test are
+    the production ones. A fake store would assert only that a stub was called.
+
+    `script` is popped per attempt, exactly like `FakeCompletions`: an entry that is an
+    exception is raised and anything else is treated as a success. That is what makes
+    "the first write fails and the retry succeeds" a sentence a test can write.
+    """
+
+    script: list[Any] = field(default_factory=list)
+    objects: dict[str, bytes] = field(default_factory=dict)
+    puts: list[dict[str, Any]] = field(default_factory=list)
+    presigns: list[dict[str, Any]] = field(default_factory=list)
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.puts.append(kwargs)
+        if self.script:
+            answer = self.script.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+        self.objects[str(kwargs["Key"])] = bytes(kwargs["Body"])
+        return {}
+
+    def generate_presigned_url(self, operation: str, **kwargs: Any) -> str:
+        self.presigns.append({"operation": operation, **kwargs})
+        if self.script:
+            answer = self.script.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+        params = kwargs["Params"]
+        return (
+            f"https://{params['Bucket']}.s3.example.invalid/{params['Key']}"
+            f"?X-Amz-Expires={kwargs['ExpiresIn']}"
+        )
+
+    def body(self, key: str) -> Any:
+        """The object at `key`, decoded. Raises `KeyError` when nothing was written there,
+        which is what a test asserting "no artifact exists" wants to see."""
+        return json.loads(self.objects[key].decode("utf-8"))
+
+
+def s3_error(code: str = "ServiceUnavailable") -> ClientError:
+    """What S3 raises when it is having the bad day ADR 0009 sizes the retry against."""
+    return ClientError({"Error": {"Code": code, "Message": "S3 is unwell"}}, "PutObject")
 
 
 @dataclass

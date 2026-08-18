@@ -4,9 +4,10 @@
 #     runs everything in `/etc/localstack/init/ready.d` once it answers, so this is the
 #     bootstrap `docker compose up --wait` is really waiting for.
 #
-#     **Nothing in this repository consumes any of it yet.** The worker is a later stage; this
-#     script exists so that the infrastructure is there to build against, and so the queue's
-#     shape is declared once - in docker-compose.yml, which passes it in.
+#     **Everything here is consumed now.** `python -m worker` receives from the queue and
+#     dead-letters into the DLQ (step 20); the export node writes `reports/{job_id}.json` into the
+#     bucket and the API presigns it (step 22a). The queue's shape is declared once - in
+#     docker-compose.yml, which passes it in.
 #
 #     **It converges rather than creates.** Each resource is checked, created if absent, and
 #     then has its attributes set unconditionally, so running it twice leaves exactly the same

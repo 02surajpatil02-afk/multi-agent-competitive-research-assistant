@@ -464,14 +464,20 @@ def count_reviewer_edits(engine: Engine, job_id: str) -> int:
         ).scalar_one()
 
 
-def record_export_attempt(engine: Engine, *, job_id: str, claims_checked: int) -> None:
+def record_export_attempt(engine: Engine, *, job_id: str, actor: str, claims_checked: int) -> None:
     """The export gate is about to run. Recorded before the check, so an attempt that
-    fails the invariant is still visible as an attempt (ARCHITECTURE.md §9)."""
+    fails the invariant is still visible as an attempt (ARCHITECTURE.md §9).
+
+    `actor` is `SYSTEM_ACTOR` from the export node and the operator's identity from
+    `scripts/reexport_job.py`, which writes this same pair of rows when it recovers an
+    artifact (ADR 0009 decision 4). A recovered export is then exactly as auditable as an
+    original one, and the trail says which of the two it was without a second action name.
+    """
     with engine.begin() as conn:
         _audit(
             conn,
             job_id=job_id,
-            actor=SYSTEM_ACTOR,
+            actor=actor,
             action="export_attempted",
             detail={"claims": claims_checked},
         )
@@ -482,10 +488,14 @@ def record_export_result(
 ) -> None:
     """What the export gate decided, and - when it passed - the report body itself.
 
-    A passing export writes `report_json` and stamps `exported_at` in the same transaction
-    as its audit row: the two must not be able to disagree about whether a report was
-    exported. This is Phase 2's artifact store, and Phase 3 adds the S3 write to the same
-    node with `report_json` staying as the durable body (ARCHITECTURE.md §8).
+    **This is the point at which the report is durable, and it is deliberately not the point
+    at which the job counts as exported** (ADR 0009 decision 1). Phase 2 wrote `report_json`
+    and stamped `exported_at` here together, which was correct while there was no artifact and
+    "exported" could only mean "the body was stored". Once S3 exists that reading is wrong: a
+    job whose `PutObject` failed would claim an export date for an object nobody can fetch.
+    `exported_at` is stamped by `record_artifact_written` below, after the write succeeds, and
+    the split is what makes *"which approved reports have no artifact?"* the SQL predicate
+    `status = 'failed' AND report_json IS NOT NULL AND exported_at IS NULL`.
 
     A blocked export writes no report and lists the uncited claims. Nothing is retried -
     an uncited claim is a defect in the report, not an infrastructure error.
@@ -504,7 +514,7 @@ def record_export_result(
         conn.execute(
             sa.update(jobs)
             .where(jobs.c.job_id == job_id)
-            .values(report_json=report.model_dump(mode="json"), exported_at=sa.func.now())
+            .values(report_json=report.model_dump(mode="json"))
         )
         _audit(
             conn,
@@ -515,19 +525,79 @@ def record_export_result(
         )
 
 
+def record_artifact_written(engine: Engine, *, job_id: str, actor: str, key: str) -> None:
+    """The artifact exists. Stamp `exported_at` and say so, in one transaction.
+
+    **`exported_at IS NOT NULL` means the object was written**, and nothing else may set it
+    (ADR 0009 decision 1). That is what `GET /jobs/{id}/report` keys on, so the column and the
+    bucket must not be able to disagree - hence one transaction, and hence a stamp that happens
+    strictly after the `PutObject` returned rather than beside it.
+
+    Written by the export node under `system`, and by the re-export script under the operator
+    who ran it.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            sa.update(jobs).where(jobs.c.job_id == job_id).values(exported_at=sa.func.now())
+        )
+        _audit(
+            conn,
+            job_id=job_id,
+            actor=actor,
+            action="export_result",
+            detail={"result": "artifact_written", "key": key},
+        )
+
+
+def record_artifact_failed(engine: Engine, *, job_id: str, actor: str, key: str) -> None:
+    """The bounded write was exhausted. **`exported_at` is not touched** (ADR 0009 decision 1).
+
+    The reason the job ends with is `export_write_failed`, and that lives on the `job_finished`
+    row `finish_job` writes below. This row is what the *re-export script* needs: it never
+    finalises anything, so a recovery attempt that also failed would otherwise leave no trace
+    at all beyond a log line on somebody's terminal.
+    """
+    with engine.begin() as conn:
+        _audit(
+            conn,
+            job_id=job_id,
+            actor=actor,
+            action="export_result",
+            detail={"result": "artifact_write_failed", "key": key},
+        )
+
+
 def finish_job(
     engine: Engine,
     *,
     job_id: str,
     status: JobStatus,
+    failure_reason: str | None,
     quality_flag: QualityFlag | None,
     revision_count: int,
     llm_calls_used: int,
 ) -> None:
-    """The terminal row. `completed_at` is set here and nowhere else (ARCHITECTURE.md §9).
+    """The terminal row, and the one `job_finished` audit event that explains it.
 
-    The two counters are persisted so budget behaviour stays auditable after the job ends,
-    which is the only place they can be read once state is gone.
+    `completed_at` is set here and nowhere else (ARCHITECTURE.md §9). The two counters are
+    persisted so budget behaviour stays auditable after the job ends, which is the only place
+    they can be read once state is gone.
+
+    **`job_finished` is ADR 0009 decision 5, and it is why the row is written here rather than
+    beside this call.** ADR 0008 chose the shape - `{status, failure_reason}` in the trail, not
+    a `jobs.failure_reason` column - and left the reason living only in the checkpoint, with
+    the accepted risk stated: a pruned checkpoint leaves a `jobs` row saying `failed` with
+    nothing left to say why. Recovering a failed export is the first operation that has to read
+    that reason from a durable place, so the row stops being optional in this phase. Writing it
+    inside this transaction is what makes the status and its explanation impossible to
+    disagree.
+
+    **One row per job, because a job finishes once.** `finish_job` can genuinely run twice - a
+    replayed `finalize` node, or the worker finalising a job whose invocation raised - and the
+    guard is the same "keyed so a replayed node converges" rule `record_gate_opened` follows,
+    with the job itself as the key. A second finalisation that disagrees with the first is
+    logged rather than recorded: the trail keeps the first answer, and the disagreement is
+    visible rather than silently overwritten.
     """
     with engine.begin() as conn:
         conn.execute(
@@ -541,6 +611,7 @@ def finish_job(
                 completed_at=sa.func.now(),
             )
         )
+        _record_job_finished(conn, job_id=job_id, status=status, failure_reason=failure_reason)
 
 
 # --- Reads --------------------------------------------------------------------------
@@ -617,6 +688,43 @@ def _audit(
         sa.insert(audit_events).values(
             job_id=job_id, actor=actor, action=action, detail=dict(detail)
         )
+    )
+
+
+def _record_job_finished(
+    conn: sa.Connection, *, job_id: str, status: JobStatus, failure_reason: str | None
+) -> None:
+    """The one terminal audit row, inside `finish_job`'s transaction (ADR 0009 decision 5).
+
+    The query-then-insert guard is `record_gate_opened`'s, keyed on the job rather than on a
+    gate visit, because "this job has finished" happens once however many times the code that
+    records it runs.
+    """
+    recorded = conn.execute(
+        sa.select(audit_events.c.detail)
+        .where(audit_events.c.job_id == job_id, audit_events.c.action == "job_finished")
+        .order_by(audit_events.c.event_id)
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if recorded is not None:
+        if recorded.get("status") != status or recorded.get("failure_reason") != failure_reason:
+            logger.warning(
+                "job %s finished again as %s/%s; the trail keeps the first answer %s/%s",
+                job_id,
+                status,
+                failure_reason,
+                recorded.get("status"),
+                recorded.get("failure_reason"),
+            )
+        return
+
+    _audit(
+        conn,
+        job_id=job_id,
+        actor=SYSTEM_ACTOR,
+        action="job_finished",
+        detail={"status": status, "failure_reason": failure_reason},
     )
 
 

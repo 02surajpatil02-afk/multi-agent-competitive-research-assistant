@@ -67,6 +67,7 @@ from openai import OpenAI
 from redis import Redis
 from sqlalchemy.engine import Engine
 
+from artifacts import build_artifact_store
 from config import Config, load_config, required
 from database import queries
 from database.queries import create_database_engine
@@ -365,6 +366,11 @@ def _finalise(deps: WorkerDeps, job_id: str, *, reason: str) -> None:
             deps.engine,
             job_id=job_id,
             status="failed",
+            # The reason reaches the `job_finished` row from here too (ADR 0009 decision 5).
+            # `job_timeout` and `job_dead_lettered` are the two failures no node is alive to
+            # record, which is exactly the case ADR 0008 said the checkpoint alone could not
+            # be trusted to explain later.
+            failure_reason=reason,
             quality_flag=None if state is None else state["quality_flag"],
             revision_count=0 if state is None else state["revision_count"],
             llm_calls_used=0 if state is None else state["llm_calls_used"],
@@ -447,17 +453,23 @@ def check_queue(queue: JobQueue, config: Config) -> int | None:
 
 @dataclass(frozen=True)
 class Credentials:
-    """The six variables this process cannot start without, narrowed once (ADR 0012 dec 4).
+    """The seven variables this process cannot start without, narrowed once (ADR 0012 dec 4).
 
     They are optional on `Config` so the **API** can start with none of the last four set -
     that is what makes guidelines §13's least-privilege table a property of the code. The
     consequence is that each process has to state what it needs, and this is the worker's
-    statement: it runs the graph, so it assumes an LLM, a web-search key, a database and a
-    queue, and it says so at startup rather than at the first job.
+    statement: it runs the graph, so it assumes an LLM, a web-search key, a database, a queue
+    and a bucket, and it says so at startup rather than at the first job.
+
+    **`S3_BUCKET` joined the list in step 22a**, because the export node now writes an
+    artifact. Discovering a missing bucket at export time would mean failing a job that had
+    already paid for its whole pipeline, which is the failure this whole function exists to
+    move to startup.
     """
 
     database_url: str
     queue_url: str
+    s3_bucket: str
     llm_base_url: str
     llm_api_key: str
     llm_model: str
@@ -465,7 +477,7 @@ class Credentials:
 
 
 def required_credentials(config: Config) -> Credentials:
-    """Narrow all six loudly, naming the first one that is missing.
+    """Narrow all seven loudly, naming the first one that is missing.
 
     Separate from `main()` so the statement can be tested without opening a connection pool -
     "which variables does the worker refuse to start without?" is a question worth a test, and
@@ -474,6 +486,7 @@ def required_credentials(config: Config) -> Credentials:
     return Credentials(
         database_url=required(config.database_url, "DATABASE_URL"),
         queue_url=required(config.sqs_queue_url, "SQS_QUEUE_URL"),
+        s3_bucket=required(config.s3_bucket, "S3_BUCKET"),
         llm_base_url=required(config.llm_base_url, "LLM_BASE_URL"),
         llm_api_key=required(config.llm_api_key, "LLM_API_KEY"),
         llm_model=required(config.llm_model, "LLM_MODEL"),
@@ -545,6 +558,13 @@ def main() -> int:  # pragma: no cover - the entrypoint itself; its parts are te
                 cache=RedisCache(redis),
                 urls=RedisUrlDeduplicator(redis),
                 db=engine,
+                # The worker is the only process that writes an artifact; the API only
+                # presigns one (guidelines §13's least-privilege table).
+                artifacts=build_artifact_store(
+                    credentials.s3_bucket,
+                    region=config.aws_region,
+                    endpoint_url=config.aws_endpoint_url,
+                ),
                 checkpointer=checkpointer,
             ),
             queue=queue,

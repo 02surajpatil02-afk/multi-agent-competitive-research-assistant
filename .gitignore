@@ -24,3 +24,5 @@ measurements/
 # The local files stay; they are simply not tracked.
 docs/interview-prep.md
 docs/engineering-guidelines.md
+
+CLAUDE.md

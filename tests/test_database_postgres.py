@@ -55,7 +55,15 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from database import queries
-from database.schema import audit_events, claim_sources, claims, findings, jobs, metadata
+from database.schema import (
+    AuditAction,
+    audit_events,
+    claim_sources,
+    claims,
+    findings,
+    jobs,
+    metadata,
+)
 from schemas import Claim, JobStatus, Report, ResearchPlan, Section, Source, Subtopic
 
 pytestmark = pytest.mark.postgres
@@ -281,6 +289,240 @@ def test_the_widening_and_the_narrowing_leave_everything_else_alone(
     found = {index["name"] for index in sa.inspect(pg).get_indexes("jobs")}
     assert _INDEXES["jobs"] <= found
     assert _status(pg, job) == "running"  # the row survived, moved by the downgrade
+
+
+# --- rev_0003: the CHECK constraint that lets a job say why it finished (ADR 0009) -----
+#
+# Same shape as rev_0002 above and the same deploy-time rule: the widening revision has to be
+# applied before `finish_job` writes its first `job_finished` row. The difference worth testing
+# separately is the table - `audit_events` carries a foreign key, a second CHECK and an index,
+# and the SQLite path recreates all of that while the PostgreSQL path swaps one constraint.
+# Only the second is what production runs.
+
+
+def _action_check(engine: Engine) -> str:
+    """`ck_audit_events_action` as PostgreSQL itself renders it."""
+    with engine.connect() as conn:
+        return str(
+            conn.execute(
+                sa.text(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conname = 'ck_audit_events_action'"
+                )
+            ).scalar_one()
+        )
+
+
+def test_the_action_check_names_the_whole_documented_vocabulary(pg: Engine) -> None:
+    # `database.schema.AuditAction` is what the CHECK is built from, so this is the two
+    # agreeing on the database rather than in Python.
+    rendered = _action_check(pg)
+
+    for action in get_args(AuditAction):
+        assert f"'{action}'" in rendered, action
+
+
+@pytest.mark.parametrize("action", list(get_args(AuditAction)))
+def test_every_action_in_the_vocabulary_is_accepted(action: str, pg: Engine, job: str) -> None:
+    """`job_finished` included, which is the value rev_0003 exists for.
+
+    Parametrized over the whole vocabulary rather than the new value alone, for rev_0002's
+    reason: the failure mode of a rewritten CHECK is not "the new value is missing" - it is
+    "an old one was dropped while nobody was looking".
+    """
+    with pg.begin() as conn:
+        conn.execute(
+            sa.insert(audit_events).values(job_id=job, actor="system", action=action, detail={})
+        )
+
+    written = [event.action for event in queries.read_audit_events(pg, job)]
+    assert action in written
+
+
+def test_finishing_a_job_writes_its_reason_to_the_trail_on_postgres(pg: Engine, job: str) -> None:
+    """ADR 0009 decision 5 on the engine that will run it.
+
+    This is the row that stops a failed job's reason living only in a checkpoint - the risk
+    ADR 0008 accepted for Phase 2 and assigned here: *"If a job's checkpoint is ever pruned,
+    its `jobs` row still says `failed` for the remaining retention window with nothing left to
+    say why."*
+    """
+    queries.finish_job(
+        pg,
+        job_id=job,
+        status="failed",
+        failure_reason="export_write_failed",
+        quality_flag=None,
+        revision_count=0,
+        llm_calls_used=30,
+    )
+
+    event = queries.read_audit_events(pg, job)[-1]
+    assert (event.actor, event.action) == ("system", "job_finished")
+    assert event.detail == {"status": "failed", "failure_reason": "export_write_failed"}
+
+
+def test_one_job_finishes_once_however_often_finalize_runs(pg: Engine, job: str) -> None:
+    # The guard is a JSONB-free read on `action`, but the convergence rule is the same one
+    # ADR 0005 applies to every graph-time write, and it is worth proving on this engine too.
+    for _ in range(3):
+        queries.finish_job(
+            pg,
+            job_id=job,
+            status="approved",
+            failure_reason=None,
+            quality_flag=None,
+            revision_count=0,
+            llm_calls_used=16,
+        )
+
+    finished = [
+        event for event in queries.read_audit_events(pg, job) if event.action == "job_finished"
+    ]
+    assert len(finished) == 1
+
+
+def test_the_recoverable_set_is_one_indexed_query(pg: Engine, job: str) -> None:
+    """ADR 0009 decision 1's predicate, run as SQL against PostgreSQL.
+
+    *"Which approved reports have no artifact?"* has to be a query rather than an
+    investigation, which is the same property `claim_sources` was built for one level down.
+    `ix_jobs_status` already indexes the leading column.
+    """
+    queries.record_research(
+        pg, job_id=job, new_findings=[a_finding("f1")], subtopic="s1", status="done"
+    )
+    queries.record_export_result(pg, job_id=job, report=a_report(("c1", ["f1"])), uncited=[])
+    queries.finish_job(
+        pg,
+        job_id=job,
+        status="failed",
+        failure_reason="export_write_failed",
+        quality_flag=None,
+        revision_count=0,
+        llm_calls_used=30,
+    )
+
+    with pg.connect() as conn:
+        recoverable = (
+            conn.execute(
+                sa.select(jobs.c.job_id).where(
+                    jobs.c.status == "failed",
+                    jobs.c.report_json.is_not(None),
+                    jobs.c.exported_at.is_(None),
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert list(recoverable) == [job]
+
+    # And once the artifact exists, the job leaves the set without its history changing.
+    queries.record_artifact_written(pg, job_id=job, actor="ops-alice", key=f"reports/{job}.json")
+
+    with pg.connect() as conn:
+        still = (
+            conn.execute(
+                sa.select(jobs.c.job_id).where(
+                    jobs.c.status == "failed",
+                    jobs.c.report_json.is_not(None),
+                    jobs.c.exported_at.is_(None),
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert list(still) == []
+    assert _status(pg, job) == "failed"
+
+
+def test_the_revision_before_it_refuses_a_job_finished_row(empty_pg: str) -> None:
+    """The ordering rule, proven by standing on the wrong side of it.
+
+    At rev_0002 the CHECK does not list `job_finished`, so a `finalize` running against that
+    schema would fail on every terminal job. That is why guidelines §19 requires the widening
+    revision to be applied - as its own task, exiting 0 - **before** the new service revision
+    starts.
+    """
+    command.upgrade(alembic_config(empty_pg), "0002")
+    engine = queries.create_database_engine(empty_pg)
+    job_id = new_job_id()
+    queries.create_job(
+        engine,
+        job_id=job_id,
+        user_id=new_job_id(),
+        question="Compare TCS and Infosys on cloud strategy.",
+        idempotency_key="key-early",
+        actor="submitter-7",
+    )
+
+    with pytest.raises(IntegrityError):
+        queries.finish_job(
+            engine,
+            job_id=job_id,
+            status="failed",
+            failure_reason="export_write_failed",
+            quality_flag=None,
+            revision_count=0,
+            llm_calls_used=1,
+        )
+
+    upgrade_to_head(empty_pg)
+    queries.finish_job(
+        engine,
+        job_id=job_id,
+        status="failed",
+        failure_reason="export_write_failed",
+        quality_flag=None,
+        revision_count=0,
+        llm_calls_used=1,
+    )
+    assert queries.read_audit_events(engine, job_id)[-1].action == "job_finished"
+    engine.dispose()
+
+
+def test_the_downgrade_removes_the_rows_the_narrow_check_cannot_hold(empty_pg: str) -> None:
+    """rev_0003's downgrade deletes its `job_finished` rows, and that is stated out loud
+    rather than discovered.
+
+    `audit_events` is append-only everywhere else, and rev_0002 had somewhere to move its data
+    to - `queued` became `running`. There is no other action meaning "the job finished", so a
+    rollback either deletes these rows or fails on data, and guidelines §19's rollback path
+    must not fail on data. The fact is not lost: the status is still on the `jobs` row and the
+    reason is still in the checkpoint, which is where ADR 0008 left it before this revision.
+    """
+    upgrade_to_head(empty_pg)
+    engine = queries.create_database_engine(empty_pg)
+    job_id = new_job_id()
+    queries.create_job(
+        engine,
+        job_id=job_id,
+        user_id=new_job_id(),
+        question="Compare TCS and Infosys on cloud strategy.",
+        idempotency_key="key-down",
+        actor="submitter-7",
+    )
+    queries.finish_job(
+        engine,
+        job_id=job_id,
+        status="failed",
+        failure_reason="export_write_failed",
+        quality_flag=None,
+        revision_count=0,
+        llm_calls_used=1,
+    )
+    engine.dispose()
+
+    command.downgrade(alembic_config(empty_pg), "0002")
+
+    engine = queries.create_database_engine(empty_pg)
+    actions = [event.action for event in queries.read_audit_events(engine, job_id)]
+    assert "job_finished" not in actions
+    assert "job_created" in actions  # and nothing else was taken with it
+    assert _status(engine, job_id) == "failed"  # the outcome is still on the row
+    engine.dispose()
 
 
 # --- The types SQLite cannot represent ------------------------------------------------
@@ -575,7 +817,13 @@ def test_setting_a_status_leaves_a_finished_job_alone(pg: Engine, job: str) -> N
     assert _status(pg, job) == "awaiting_approval"
 
     queries.finish_job(
-        pg, job_id=job, status="approved", quality_flag=None, revision_count=1, llm_calls_used=12
+        pg,
+        job_id=job,
+        status="approved",
+        failure_reason=None,
+        quality_flag=None,
+        revision_count=1,
+        llm_calls_used=12,
     )
     queries.set_job_status(pg, job_id=job, status="failed")
 

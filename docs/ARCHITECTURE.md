@@ -6,10 +6,14 @@
 > are up (`routes/`, `app.py`); and since **2026-08-17** a job is dispatched through **SQS and run by
 > `python -m worker`** (`jobqueue.py`, `worker.py`), with the Compose stack behind it.
 >
-> **What is not built:** Redis has no application code (step 21), there is no S3 write, no application
-> image and no CI (steps 22–23), no AWS at all (Phase 5), and no eval set (Phase 4). §1's "built vs
-> planned" table is the per-capability answer, and every section below marks what is implemented where
-> the distinction matters.
+> Since **2026-08-18** the export node **writes the report to S3** and `GET /jobs/{id}/report`
+> answers a presigned URL (`artifacts.py`, step 22a), which is [ADR
+> 0009](adr/0009-recovering-an-export-that-failed-after-approval.md) built.
+>
+> **What is not built:** the application image and its two entrypoints, and CI (the rest of step 22,
+> and step 23), no AWS at all (Phase 5), and no eval set (Phase 4). §1's "built vs planned" table is
+> the per-capability answer, and every section below marks what is implemented where the distinction
+> matters.
 >
 > This document is the **blueprint the implementation is written against**. If code exists and this
 > document disagrees with it, this document is wrong and must be corrected.
@@ -118,10 +122,10 @@ parameter:** a process that has to survive a restart passes the Postgres one, an
 the offline suite, `scripts/measure_jobs.py` - gets the in-memory one and dies with the process, which
 is acceptable there because neither is what durability is for (CLAUDE.md phase plan).
 
-The lifecycle above is the Phase 3+ shape, and most of it now exists: the API (step 18), the database
-(steps 13–16), and the queue and worker (stage 2, step 20). **The presigned URL is what is still
-missing** — `GET /jobs/{id}/report` answers `404 not_exported` until the S3 write lands in step 22, and
-the approved body is read from `GET /jobs/{id}` until then.
+The lifecycle above is the Phase 3+ shape, and it now exists end to end: the API (step 18), the
+database (steps 13–16), the queue and worker (stage 2, step 20), Redis (step 21), and the S3 artifact
+write with its presigned URL (step 22a). What is still missing around it is operational — there is no
+application image, no CI and no AWS.
 
 ### Eventual AWS production shape (Phase 5)
 
@@ -146,7 +150,8 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | Docker Compose: PostgreSQL 16, Redis 7, LocalStack for SQS + S3 | 3 | **Built** (2026-08-17, stage 1) — `docker-compose.yml`, `docker/`. Services only; there is no application image |
 | The queue and the async worker: pointer messages, FIFO groups, `queued`, the worker's start/resume/continue, the runtime bound, the DLQ path | 3 | **Built** (2026-08-17, stage 2, step 20) — `jobqueue.py`, `worker.py`, `rev_0002`. Against LocalStack, not AWS |
 | The API stops holding a graph or an LLM client | 3 | **Built** (2026-08-17) — [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). `uvicorn app:app` starts with no LLM or Tavily credential |
-| S3 export write, the application image, CI | 3 | Planned — steps 22 and 23 |
+| The S3 artifact write, `exported_at` meaning the artifact exists, the presigned-URL route, and the operator re-export | 3 | **Built** (2026-08-18, step 22a) — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`. [ADR 0009](adr/0009-recovering-an-export-that-failed-after-approval.md), verified against LocalStack S3 |
+| The application image and its two entrypoints, CI | 3 | Planned — the rest of step 22, and step 23 |
 | Redis: shared rate limiter, caches, URL dedupe | 3 | **Built** (2026-08-17, step 21) — `redisstore.py`. Fail-open caches and URL set, fail-closed limiter (§20 row 29), verified against a real Redis 7 |
 | LangSmith tracing, eval dataset, eval as a release gate | 4 | Planned |
 | AWS deployment, Cognito JWT, CloudWatch alarms | 5 | Planned |
@@ -1292,19 +1297,46 @@ Exported reports only, written by the export node after the gate passes, read by
 15-minute presigned URL. Report bytes never stream through the API, so a 20-minute job's output never
 occupies a worker (gl §12).
 
-#### Phase 2, before S3 exists
+#### What the export node writes, and in what order
 
-The export **gate** ships in Phase 2; S3 does not arrive until Phase 3. So in Phase 2 the export node
-runs the claim-to-URL check and, when it passes, writes the approved report body to
-`jobs.report_json` and stamps `jobs.exported_at`. Retrieval uses the route that already returns a
-report body — `GET /jobs/{id}`, whose contract has always included `report?` (§10). The artifact route
-`GET /jobs/{id}/report` returns `404 not exported` until Phase 3 wires S3.
+**Built, 2026-08-18 (step 22a).** `artifacts.py` is the one module that talks to S3 — the way
+`jobqueue.py` is the one that talks to SQS — and the export node, the API and the re-export script all
+reach the bucket through it. The object key is `reports/{job_id}.json`, derived from the job id alone,
+so one job has one artifact and a re-export overwrites rather than accumulating a second copy.
 
-**No stand-in for S3 is built.** No storage abstraction, no local-filesystem artifact writer, no
-interface with one implementation. Phase 3 adds the `PutObject` and the presigned URL to the same
-export node; `report_json` stays as the durable body the artifact is rendered from. The bounded-retry
-and `export_write_failed` behaviour above describes the S3 write and therefore begins in Phase 3 — a
-Phase 2 write failure is an ordinary database error on the §17 database bound.
+The order of the two durable writes is [ADR
+0009](adr/0009-recovering-an-export-that-failed-after-approval.md) decision 1:
+
+```text
+gate passes
+  ↓
+jobs.report_json + the export_result audit row      (Postgres, 0 retries, gl §17)
+  ↓
+PutObject to S3                                     (10s, 2 retries at 2s and 8s, gl §17)
+  ↓  written                         ↓  exhausted
+stamp jobs.exported_at              status=failed, failure_reason="export_write_failed"
++ an export_result row              report_json preserved, exported_at left NULL
+```
+
+**`exported_at` means the artifact exists, and nothing weaker.** In Phase 2 it meant "the body was
+stored", which was correct while there was no artifact; once one exists that reading would let a job
+whose `PutObject` failed claim an export date for an object nobody can fetch. The split is what makes
+the recoverable set a query rather than an investigation:
+
+```sql
+SELECT job_id FROM jobs
+ WHERE status = 'failed' AND report_json IS NOT NULL AND exported_at IS NULL;
+```
+
+No historical row is reinterpreted: no Phase 2 job carries a `report_json` without an `exported_at`,
+so the two meanings coincide on every row that existed before the change.
+
+**The report is never lost — only the artifact is.** The body is durable in Postgres before the write
+is attempted, so recovery is a re-projection of a row that already exists: `scripts/reexport_job.py`,
+run by a person with `--actor`, which re-runs only the artifact write and stamps `exported_at` on
+success. It never rewrites the job's status, never touches the graph, and never constructs an
+`LLMClient`. The job reads `failed` forever with a downloadable artifact, and §10's report route
+keying on `exported_at` rather than on the status is what stops that being a contradiction.
 
 **A failed write is infrastructure, not a failed report.** The two are handled differently on purpose:
 
@@ -1626,7 +1658,7 @@ injection defense leans on, so one authenticated endpoint owns all three outcome
 - **Auth:** required. **Authz:** the caller must own the job.
 - **Behaviour:** **report bytes never stream through the API.** The API stays a control plane
   (gl §12).
-- **Phase 2:** always `404 not exported`, because there is no artifact until S3 arrives in Phase 3.
+- **Since step 22a:** `200` with a presigned URL when `jobs.exported_at IS NOT NULL`, and `404 not_exported` otherwise — which covers a job still running, a rejected one, a blocked gate, and an artifact write that was exhausted. The API never streams report bytes, and presigning reaches nothing: no Redis, no graph, no LLM ([ADR 0009](adr/0009-recovering-an-export-that-failed-after-approval.md) decision 3).
   The approved report body is read from `GET /jobs/{id}`, which already carries `report?` (§8).
 
 ### 6. `GET /health`
@@ -1722,7 +1754,8 @@ approved" into "this person approved it", which is the only version worth auditi
 > wins and this section is the thing to fix.
 >
 > What is **not** built: the DLQ alarm (there is no CloudWatch), the S3 write in the flow below
-> (step 22), and any worker on AWS. The queue is LocalStack's.
+> the application image and its two entrypoints (the rest of step 22), and any worker on AWS. The
+> queue and the bucket are LocalStack's.
 
 ### The flow
 
@@ -1743,7 +1776,7 @@ flowchart TD
     DEL --> APPROVE["POST /jobs/id/approve<br/>records actor + decision, claims the gate"]
     APPROVE --> Q2["enqueue resume message<br/>200, status = running"]
     Q2 --> W2["worker: resume with the recorded decision"]
-    W2 --> EXPORT["export gate, then S3 write - step 22"]
+    W2 --> EXPORT["export gate, then the S3 write"]
     EXPORT --> FINAL["finalize - terminal status"]
     Q -->|"3 failed deliveries"| DLQ["dead-letter queue<br/>job -> failed, job_dead_lettered<br/>alarm on depth > 0 - Phase 5"]
 ```
@@ -2526,7 +2559,7 @@ stage 1, and `python -m worker` with Phase 3 stage 2 — see "What Compose start
 |---|---|---|
 | **1** (today) | Python process only. In-memory checkpointer, in-memory state. Needs `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` and `TAVILY_API_KEY` | No Postgres, no Redis, no queue, no S3, no API. The gate node exists and pauses, but nothing outside the process can resume it yet |
 | **2** | + PostgreSQL 16 (checkpointer, audit tables, Alembic) and the FastAPI app via `uvicorn` | No queue and no S3 yet. The export gate writes the approved body to `jobs.report_json` until Phase 3 wires S3 (§8) |
-| **3** | + Redis 7, + LocalStack (SQS and S3), + the worker process, all via Docker Compose | Nothing else. This is the full local shape. **Stages 1 and 2 are built**: the services, the queue, and `python -m worker`. Redis and S3 have no application code behind them yet (steps 21 and 22) |
+| **3** | + Redis 7, + LocalStack (SQS and S3), + the worker process, all via Docker Compose | Nothing else. This is the full local shape, and **all four stores now have application code behind them**: the queue and `python -m worker` (step 20), Redis (step 21), and the S3 artifact write (step 22a). What is missing is the application image and CI |
 
 ### Logical component → local mapping (Phase 3)
 
@@ -2564,7 +2597,7 @@ the worker it added runs from the host like everything else here.
 |---|---|---|
 | `postgres` | `postgres:16-alpine` | **Used.** The five application tables, the checkpointer's own tables, and the `research_test` database the integration suite runs on |
 | `redis` | `redis:7-alpine` | **Used** since step 21. The worker caches searches and fetches here, deduplicates URLs per job, and takes every LLM token from the shared bucket; the API reads it only to answer `checks.redis` |
-| `localstack` | SQS + S3 | **SQS is used; S3 is started only.** `POST /jobs` and `POST /jobs/{id}/approve` enqueue to the job queue, `python -m worker` consumes it, and the dead-letter queue is where a message goes after three failed deliveries (stage 2, step 20). Nothing writes an object to the bucket yet — step 22 |
+| `localstack` | SQS + S3 | **Both are used.** `POST /jobs` and `POST /jobs/{id}/approve` enqueue to the job queue, `python -m worker` consumes it, and the dead-letter queue is where a message goes after three failed deliveries (stage 2, step 20). The export node writes `reports/{job_id}.json` to the bucket and `GET /jobs/{id}/report` presigns it (step 22a) |
 
 **Bootstrap is a healthcheck, not a sleep.** Each service declares one, and `--wait` blocks on all
 three. LocalStack's deliberately checks that the queue and the bucket answer rather than that the
@@ -2876,7 +2909,7 @@ entrypoints, and neither exists.
 |---|---|---|---|
 | 20 | **SQS worker** — pointer message, idempotency key unique in `jobs`, visibility timeout, DLQ, graceful shutdown | 18 | Needs the job row and the checkpoint to resume against. **Done (2026-08-17).** `jobqueue.py`, `worker.py`, `rev_0002`'s `queued`, the API's enqueue on both write routes, and the gate resume moved off the request — [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md), [ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md), [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). Verified offline against a `FakeQueue` and again against real LocalStack SQS (`pytest -m integration`), and `rev_0002` against real PostgreSQL 16 |
 | 21 | **Redis** — shared rate limiter, URL dedupe set, search and fetch caches, with hit/miss logging | 7, 20 | The shared bucket only matters once more than one process makes LLM calls. **Done (2026-08-17).** `redisstore.py`, wired through `worker.py`; two failure policies in one file (gl §11, §20 row 29), `checks.redis` on `/health`, and a fourth test layer against the real Redis 7 |
-| 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists. **Partly done, 2026-08-17:** the three services, their healthchecks, and the queue/DLQ/bucket bootstrap are built, and both the real-PostgreSQL and the LocalStack SQS suites run on them. **The image and the two entrypoints are not**, and the S3 export write is not either, so the step stays open |
+| 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists. **Partly done.** 2026-08-17: the three services, their healthchecks, and the queue/DLQ/bucket bootstrap, with the real-PostgreSQL and LocalStack SQS suites running on them. 2026-08-18 (**step 22a**): the S3 artifact write, the presigned-URL route, and the operator re-export — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`, verified against LocalStack S3. **The image and the two entrypoints are still not built**, so the step stays open |
 | 23 | **CI** — ruff, mypy, pytest, gitleaks, image build to ECR | 19, 22 | Every later step ships through it |
 
 ### Phase 4 — observability and evaluation
@@ -2973,6 +3006,11 @@ is also when `export_write_failed` first becomes reachable (§8).
 > [ADR 0008](adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md) decision 5's shape,
 > because recovery is the first operation that has to read a failure reason from somewhere durable.
 > **This item is closed.**
+>
+> **Built on 2026-08-18 (step 22a):** `artifacts.py`, the export node's two-stage write, `rev_0003`
+> adding the `job_finished` action, `GET /jobs/{id}/report`'s presigned URL, and
+> `scripts/reexport_job.py`. Every one of ADR 0009's six shipping conditions has a test behind it,
+> and the LocalStack S3 layer runs the write, the URL and the recovery against a real bucket.
 
 #### 2. Low stakes — may reflection start a cycle on the reviewer-`edit` path?
 
