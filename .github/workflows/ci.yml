@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# This workflow verifies the repository; it does not publish, deploy, or request cloud access.
+permissions:
+  contents: read
+
+env:
+  # boto3 must never resolve a runner profile or instance metadata. LocalStack ignores these
+  # placeholders, and the integration command below supplies its endpoint explicitly.
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_DEFAULT_REGION: ap-south-1
+  AWS_EC2_METADATA_DISABLED: "true"
+  AWS_CONFIG_FILE: /dev/null
+  AWS_SHARED_CREDENTIALS_FILE: /dev/null
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      - name: Lint
+        run: uv run ruff check .
+      - name: Check formatting
+        run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy --strict .
+      - name: Check whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git diff --check
+          if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git diff --check "$BASE_SHA" "$GITHUB_SHA"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          fi
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      - name: Run offline suite
+        run: uv run pytest -q
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      - name: Start Compose infrastructure
+        run: docker compose --env-file .env.example up -d --wait
+      - name: Run PostgreSQL 16 suite
+        env:
+          TEST_DATABASE_URL: postgresql://research:research@localhost:5432/research_test
+        run: uv run pytest -m postgres
+      - name: Remove Compose resources
+        if: always()
+        run: docker compose --env-file .env.example down -v --remove-orphans
+
+  redis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      - name: Start Compose infrastructure
+        run: docker compose --env-file .env.example up -d --wait
+      - name: Run Redis 7 suite
+        env:
+          TEST_REDIS_URL: redis://localhost:6379/15
+        run: uv run pytest -m redis
+      - name: Remove Compose resources
+        if: always()
+        run: docker compose --env-file .env.example down -v --remove-orphans
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      - name: Start Compose infrastructure
+        run: docker compose --env-file .env.example up -d --wait
+      - name: Run LocalStack SQS and S3 suite
+        env:
+          SQS_ENDPOINT_URL: http://localhost:4566
+        run: uv run pytest -m integration
+      - name: Remove Compose resources
+        if: always()
+        run: docker compose --env-file .env.example down -v --remove-orphans
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # RFC 2606 reserves .invalid. The container suite asserts this remains unreachable.
+      LLM_BASE_URL: https://llm.invalid/v1
+      LLM_MODEL: ci-model
+      LLM_FAST_MODEL: ci-fast-model
+      LLM_API_KEY: ci-placeholder
+      TAVILY_API_KEY: ci-placeholder
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      - name: Build the application image
+        run: docker compose --env-file .env.example --profile app build
+      - name: Start the application profile
+        run: docker compose --env-file .env.example --profile app up -d --wait
+      - name: Run container suite
+        env:
+          TEST_CONTAINER_STACK: "1"
+        run: uv run pytest -m container
+      - name: Remove Compose resources
+        if: always()
+        run: docker compose --env-file .env.example --profile app down -v --remove-orphans

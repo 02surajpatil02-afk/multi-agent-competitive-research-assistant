@@ -14,7 +14,9 @@
 > (`Dockerfile`, step 22b/c), and Compose's `app` profile runs them beside the infrastructure. Step
 > 22 is complete.
 >
-> **What is not built:** CI (step 23) — so the image is only ever built locally and pushed nowhere —
+> **What is not built:** no AWS deployment, registry publishing, evaluation set, or Phase 4/5
+> operational layer. Step 23 CI verifies the local repository contracts only; it builds the image
+> but pushes it nowhere.
 > no AWS at all (Phase 5), and no eval set (Phase 4). §1's "built vs planned" table is
 > the per-capability answer, and every section below marks what is implemented where the distinction
 > matters.
@@ -156,7 +158,7 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | The API stops holding a graph or an LLM client | 3 | **Built** (2026-08-17) — [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). `uvicorn app:app` starts with no LLM or Tavily credential |
 | The S3 artifact write, `exported_at` meaning the artifact exists, the presigned-URL route, and the operator re-export | 3 | **Built** (2026-08-18, step 22a) — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`. [ADR 0009](adr/0009-recovering-an-export-that-failed-after-approval.md), verified against LocalStack S3 |
 | The application image and its two entrypoints | 3 | **Built** (2026-08-18, step 22b/c) — `Dockerfile`, `.dockerignore`, and the `migrate`/`api`/`worker` services. One image, three commands, a non-root user, and a fifth `container` test layer. Built locally; never pushed to a registry |
-| CI | 3 | Planned — step 23 |
+| CI | 3 | Built locally — step 23, GitHub Actions verification only; first hosted run pending, with no publishing or deployment |
 | Redis: shared rate limiter, caches, URL dedupe | 3 | **Built** (2026-08-17, step 21) — `redisstore.py`. Fail-open caches and URL set, fail-closed limiter (§20 row 29), verified against a real Redis 7 |
 | LangSmith tracing, eval dataset, eval as a release gate | 4 | Planned |
 | AWS deployment, Cognito JWT, CloudWatch alarms | 5 | Planned |
@@ -2645,7 +2647,7 @@ stage 1, and `python -m worker` with Phase 3 stage 2 — see "What Compose start
 |---|---|---|
 | **1** (today) | Python process only. In-memory checkpointer, in-memory state. Needs `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` and `TAVILY_API_KEY` | No Postgres, no Redis, no queue, no S3, no API. The gate node exists and pauses, but nothing outside the process can resume it yet |
 | **2** | + PostgreSQL 16 (checkpointer, audit tables, Alembic) and the FastAPI app via `uvicorn` | No queue and no S3 yet. The export gate writes the approved body to `jobs.report_json` until Phase 3 wires S3 (§8) |
-| **3** | + Redis 7, + LocalStack (SQS and S3), + the worker process, all via Docker Compose | Nothing else. This is the full local shape, and **all four stores now have application code behind them**: the queue and `python -m worker` (step 20), Redis (step 21), and the S3 artifact write (step 22a). What is missing is the application image and CI |
+| **3** | + Redis 7, + LocalStack (SQS and S3), + the worker process, all via Docker Compose | This is the full local shape, and **all four stores now have application code behind them**: the queue and `python -m worker` (step 20), Redis (step 21), and the S3 artifact write (step 22a). The image is built by Compose and CI verifies every local layer; no image is published |
 
 ### Logical component → local mapping (Phase 3)
 
@@ -3051,7 +3053,7 @@ entrypoints.
 | 20 | **SQS worker** — pointer message, idempotency key unique in `jobs`, visibility timeout, DLQ, graceful shutdown | 18 | Needs the job row and the checkpoint to resume against. **Done (2026-08-17).** `jobqueue.py`, `worker.py`, `rev_0002`'s `queued`, the API's enqueue on both write routes, and the gate resume moved off the request — [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md), [ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md), [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). Verified offline against a `FakeQueue` and again against real LocalStack SQS (`pytest -m integration`), and `rev_0002` against real PostgreSQL 16 |
 | 21 | **Redis** — shared rate limiter, URL dedupe set, search and fetch caches, with hit/miss logging | 7, 20 | The shared bucket only matters once more than one process makes LLM calls. **Done (2026-08-17).** `redisstore.py`, wired through `worker.py`; two failure policies in one file (gl §11, §20 row 29), `checks.redis` on `/health`, and a fourth test layer against the real Redis 7 |
 | 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists. **Partly done.** 2026-08-17: the three services, their healthchecks, and the queue/DLQ/bucket bootstrap, with the real-PostgreSQL and LocalStack SQS suites running on them. 2026-08-18 (**step 22a**): the S3 artifact write, the presigned-URL route, and the operator re-export — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`, verified against LocalStack S3. 2026-08-18 (**step 22b/c**): `Dockerfile`, `.dockerignore`, and the `migrate`/`api`/`worker` services behind the `app` profile, with a fifth `container` test layer driving them. **Done** |
-| 23 | **CI** — ruff, mypy, pytest, gitleaks, image build to ECR | 19, 22 | Every later step ships through it |
+| 23 | **CI** — static checks, offline pytest, PostgreSQL, Redis, LocalStack, and the application-image/container suite | 19, 22 | **Built locally; first GitHub-hosted run pending.** `.github/workflows/ci.yml` runs on pull requests and pushes to `main`, using Python 3.13 and `uv sync --frozen --extra dev`. Independent jobs run `ruff check .`, `ruff format --check .`, `mypy --strict .`, and a committed-range `git diff --check`; `pytest -q`; and each marked service layer against the existing Compose definition (PostgreSQL 16, Redis 7, LocalStack 4.11). Compose is always given `.env.example`, never a developer's `.env`; the container job builds the real Dockerfile and starts the `app` profile before `pytest -m container`. Every Docker job removes Compose resources even on failure. AWS credentials are fixed LocalStack placeholders, metadata and runner credential files are disabled, and the sole provider endpoint is `https://llm.invalid/v1` with placeholder values. No image is pushed, no secret scan or ECR behavior is claimed, and no deployment runs. |
 
 ### Phase 4 — observability and evaluation
 
