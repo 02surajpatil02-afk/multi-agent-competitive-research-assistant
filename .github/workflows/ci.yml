@@ -143,6 +143,19 @@ jobs:
         env:
           SQS_ENDPOINT_URL: http://localhost:4566
         run: uv run pytest -m integration
+      # LocalStack's healthcheck waits for the queue and the bucket, so `--wait` failing
+      # means the ready.d hook did not create them. The hook's own output is in the container
+      # log and the failing probe's output is in the health log, and neither survives cleanup.
+      - name: Diagnose LocalStack
+        if: failure()
+        run: |
+          docker compose --env-file .env.example ps -a
+          docker compose --env-file .env.example logs --no-color localstack
+          container="$(docker compose --env-file .env.example ps -aq localstack)"
+          if [ -n "$container" ]; then
+            docker inspect --format 'status={{ .State.Status }} exit={{ .State.ExitCode }} health={{ if .State.Health }}{{ .State.Health.Status }}{{ else }}none{{ end }}' "$container"
+            docker inspect --format '{{ json .State.Health }}' "$container"
+          fi
       - name: Remove Compose resources
         if: always()
         run: docker compose --env-file .env.example down -v --remove-orphans
@@ -176,6 +189,19 @@ jobs:
         env:
           TEST_CONTAINER_STACK: "1"
         run: uv run pytest -m container
+      # LocalStack's healthcheck waits for the queue and the bucket, so `--wait` failing
+      # means the ready.d hook did not create them. The hook's own output is in the container
+      # log and the failing probe's output is in the health log, and neither survives cleanup.
+      - name: Diagnose LocalStack
+        if: failure()
+        run: |
+          docker compose --env-file .env.example --profile app ps -a
+          docker compose --env-file .env.example --profile app logs --no-color localstack
+          container="$(docker compose --env-file .env.example --profile app ps -aq localstack)"
+          if [ -n "$container" ]; then
+            docker inspect --format 'status={{ .State.Status }} exit={{ .State.ExitCode }} health={{ if .State.Health }}{{ .State.Health.Status }}{{ else }}none{{ end }}' "$container"
+            docker inspect --format '{{ json .State.Health }}' "$container"
+          fi
       - name: Remove Compose resources
         if: always()
         run: docker compose --env-file .env.example --profile app down -v --remove-orphans
