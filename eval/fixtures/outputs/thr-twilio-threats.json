@@ -1,0 +1,174 @@
+{
+  "question": "What are the competitive threats to Twilio?",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10011-1111-4111-8111-000000000011",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done",
+    "s3": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Larger vendors compete with Twilio.",
+      "evidence": "Larger platform vendors compete directly with Twilio in its core market.",
+      "url": "https://research.example.com/threats/incumbents",
+      "title": "Market overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-research.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s2",
+      "claim": "Pricing pressure is reported.",
+      "evidence": "Reported pricing pressure has narrowed the gap between Twilio and cheaper alternatives.",
+      "url": "https://ir.example.org/threats/pricing",
+      "title": "Pricing pressure note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-ir.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "New entrants are reported.",
+      "evidence": "Coverage names several new entrants targeting the same buyers as Twilio.",
+      "url": "https://news.example.net/threats/entrants",
+      "title": "New entrant coverage",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-news.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s3",
+      "claim": "Switching costs are described as low.",
+      "evidence": "The note describes switching costs away from Twilio as low for new buyers.",
+      "url": "https://analyst.example.io/threats/switching",
+      "title": "Switching cost note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-analyst.example.io",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "Who competes with Twilio",
+        "body": "Larger platform vendors compete directly with Twilio, and several new entrants target the same buyers."
+      },
+      {
+        "id": "sec2",
+        "heading": "Why the position is contestable",
+        "body": "Pricing pressure has narrowed the gap with cheaper alternatives, and switching costs for new buyers are described as low."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Larger platform vendors compete directly with Twilio.",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec1",
+        "text": "Several new entrants target the same buyers as Twilio.",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "claim_id": "c3",
+        "section_id": "sec2",
+        "text": "Pricing pressure has narrowed the gap with cheaper alternatives.",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "claim_id": "c4",
+        "section_id": "sec2",
+        "text": "Switching costs for new buyers are described as low.",
+        "finding_ids": [
+          "f4"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://research.example.com/threats/incumbents",
+        "title": "Market overview",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://news.example.net/threats/entrants",
+        "title": "New entrant coverage",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "url": "https://ir.example.org/threats/pricing",
+        "title": "Pricing pressure note",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "url": "https://analyst.example.io/threats/switching",
+        "title": "Switching cost note",
+        "finding_ids": [
+          "f4"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Larger platform vendors compete directly with Twilio in its core market.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "Coverage names several new entrants targeting the same buyers as Twilio.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c3",
+      "supported": true,
+      "quote": "Reported pricing pressure has narrowed the gap between Twilio and cheaper alternatives.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c4",
+      "supported": true,
+      "quote": "The note describes switching costs away from Twilio as low for new buyers.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": null
+}

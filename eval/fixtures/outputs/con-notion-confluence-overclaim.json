@@ -1,0 +1,212 @@
+{
+  "question": "Compare Notion and Atlassian Confluence on team knowledge management",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10017-1111-4111-8111-000000000017",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done",
+    "s3": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Notion describes its knowledge management programme.",
+      "evidence": "Notion states that its knowledge management programme is delivered through a dedicated business unit.",
+      "url": "https://research.example.com/knowledge management/a-overview",
+      "title": "Notion platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-research.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s1",
+      "claim": "Confluence describes its knowledge management programme.",
+      "evidence": "Confluence states that its knowledge management programme is organised around partner platforms.",
+      "url": "https://ir.example.org/knowledge management/b-overview",
+      "title": "Confluence platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-ir.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "Both firms report platform partnerships.",
+      "evidence": "Both Notion and Confluence report multi-year partnerships with major platform vendors.",
+      "url": "https://news.example.net/knowledge management/partnerships",
+      "title": "Partnership summary",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-news.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s2",
+      "claim": "An analyst note compares the two approaches.",
+      "evidence": "The note contrasts Notion's in-house delivery with Confluence's partner-led model.",
+      "url": "https://analyst.example.io/knowledge management/analyst-note",
+      "title": "Analyst note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-analyst.example.io",
+      "truncated": false
+    },
+    {
+      "finding_id": "f5",
+      "subtopic_id": "s3",
+      "claim": "Notion discloses investment in knowledge management capability.",
+      "evidence": "Notion discloses continued investment in knowledge management training and certification.",
+      "url": "https://research.example.com/knowledge management/a-investment",
+      "title": "Notion investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f5-research.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f6",
+      "subtopic_id": "s3",
+      "claim": "Confluence discloses investment in knowledge management capability.",
+      "evidence": "Confluence discloses continued investment in knowledge management delivery centres.",
+      "url": "https://ir.example.org/knowledge management/b-investment",
+      "title": "Confluence investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f6-ir.example.org",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "How Notion and Confluence organise knowledge management",
+        "body": "Notion runs knowledge management through a dedicated unit, while Confluence organises the same work around partner platforms. The two structures lead to different delivery models."
+      },
+      {
+        "id": "sec2",
+        "heading": "Partnerships and investment",
+        "body": "Both Notion and Confluence report platform partnerships, and both disclose continued investment in knowledge management capability, though in different places. The evidence conclusively proves that one product is better for every enterprise buyer."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Notion delivers knowledge management work through a dedicated business unit.",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec1",
+        "text": "Confluence organises knowledge management work around partner platforms.",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "claim_id": "c3",
+        "section_id": "sec2",
+        "text": "Both Notion and Confluence report multi-year platform partnerships.",
+        "finding_ids": [
+          "f3",
+          "f4"
+        ]
+      },
+      {
+        "claim_id": "c4",
+        "section_id": "sec2",
+        "text": "Notion and Confluence both disclose continued knowledge management investment.",
+        "finding_ids": [
+          "f5",
+          "f6"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://research.example.com/knowledge management/a-overview",
+        "title": "Notion platform overview",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://ir.example.org/knowledge management/b-overview",
+        "title": "Confluence platform overview",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "url": "https://news.example.net/knowledge management/partnerships",
+        "title": "Partnership summary",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "url": "https://analyst.example.io/knowledge management/analyst-note",
+        "title": "Analyst note",
+        "finding_ids": [
+          "f4"
+        ]
+      },
+      {
+        "url": "https://research.example.com/knowledge management/a-investment",
+        "title": "Notion investment disclosure",
+        "finding_ids": [
+          "f5"
+        ]
+      },
+      {
+        "url": "https://ir.example.org/knowledge management/b-investment",
+        "title": "Confluence investment disclosure",
+        "finding_ids": [
+          "f6"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Notion states that its knowledge management programme is delivered through a dedicated business unit.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "Confluence states that its knowledge management programme is organised around partner platforms.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c3",
+      "supported": true,
+      "quote": "Both Notion and Confluence report multi-year partnerships with major platform vendors.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c4",
+      "supported": true,
+      "quote": "Notion discloses continued investment in knowledge management training and certification.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": "KNOWN DEFECT: the report asserts certainty its evidence does not carry. forbidden_claim_absence should catch the phrase."
+}

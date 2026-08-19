@@ -1,0 +1,106 @@
+{
+  "question": "What pricing and licensing changes has HashiCorp made since 2023?",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10022-1111-4111-8111-000000000022",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "unresearched",
+    "s3": "unresearched"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Larger vendors compete with HashiCorp.",
+      "evidence": "Larger platform vendors compete directly with HashiCorp in its core market.",
+      "url": "https://research.example.com/threats/incumbents",
+      "title": "Market overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-research.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s2",
+      "claim": "Pricing pressure is reported.",
+      "evidence": "Reported pricing pressure has narrowed the gap between HashiCorp and cheaper alternatives.",
+      "url": "https://ir.example.org/threats/pricing",
+      "title": "Pricing pressure note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-ir.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "New entrants are reported.",
+      "evidence": "Coverage names several new entrants targeting the same buyers as HashiCorp.",
+      "url": "https://news.example.net/threats/entrants",
+      "title": "New entrant coverage",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-news.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s3",
+      "claim": "Switching costs are described as low.",
+      "evidence": "The note describes switching costs away from HashiCorp as low for new buyers.",
+      "url": "https://analyst.example.io/threats/switching",
+      "title": "Switching cost note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-analyst.example.io",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "Who competes with HashiCorp",
+        "body": "Larger platform vendors compete directly with HashiCorp, and several new entrants target the same buyers."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Larger platform vendors compete directly with HashiCorp.",
+        "finding_ids": [
+          "f1"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://research.example.com/threats/incumbents",
+        "title": "Market overview",
+        "finding_ids": [
+          "f1"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Larger platform vendors compete directly with HashiCorp in its core market.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": "below_threshold",
+  "notes": "Two of three subtopics found nothing, so the report is thin and reaches the reviewer flagged rather than polished."
+}

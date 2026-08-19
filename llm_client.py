@@ -77,8 +77,10 @@ from openai import (
     APIStatusError,
     APITimeoutError,
     InternalServerError,
+    Omit,
     OpenAI,
     RateLimitError,
+    omit,
 )
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, ValidationError
@@ -274,8 +276,16 @@ class LLMClient:
         user: str,
         budget: CallBudget,
         tier: ModelTier = "main",
+        temperature: float | Omit = omit,
     ) -> ModelT:
         """Ask for one JSON object, validate it against `schema`, and return it.
+
+        `temperature` defaults to the SDK's `omit`, so every agent's request is byte-for-byte the
+        one it has always sent and whatever the endpoint's own default is stays in force. It
+        exists for the offline evaluation judge (`eval/judge.py`), which asks for 0.0 because a
+        judge that scores the same report differently on two runs cannot be used to compare two
+        runs. No agent passes it, and nothing in the graph should: sampling is a property of the
+        endpoint and belongs in configuration, not in a node.
 
         Raises LLMCallFailed on every failure path. Never returns a partially valid
         object and never substitutes a default for a field the model did not produce: a
@@ -288,7 +298,7 @@ class LLMClient:
         last_error: ValidationError | None = None
 
         for attempt in range(1, _VALIDATION_ATTEMPTS + 1):
-            raw = self._send(messages, budget=budget, tier=tier)
+            raw = self._send(messages, budget=budget, tier=tier, temperature=temperature)
             try:
                 value = schema.model_validate_json(raw)
             except ValidationError as error:
@@ -375,6 +385,7 @@ class LLMClient:
         *,
         budget: CallBudget,
         tier: ModelTier,
+        temperature: float | Omit = omit,
     ) -> str:
         """One logical request, with the transport and 429 retries around it.
 
@@ -395,6 +406,9 @@ class LLMClient:
                     messages=messages,
                     response_format={"type": "json_object"},
                     timeout=self._timeout_for(tier),
+                    # `omit` is the SDK's "do not send this field", so the default path
+                    # produces exactly the request it produced before this parameter existed.
+                    temperature=temperature,
                 )
             except RateLimitError as error:
                 if rate_limit_retries == len(_RATE_LIMIT_BACKOFF_S):

@@ -1,0 +1,149 @@
+{
+  "question": "Compare Datadog and New Relic on observability products",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10005-1111-4111-8111-000000000005",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done",
+    "s3": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Datadog describes its observability programme.",
+      "evidence": "Datadog states that its observability programme is delivered through a dedicated business unit.",
+      "url": "https://research.example.com/observability/a-overview",
+      "title": "Datadog platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-research.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s1",
+      "claim": "New Relic describes its observability programme.",
+      "evidence": "New Relic states that its observability programme is organised around partner platforms.",
+      "url": "https://ir.example.org/observability/b-overview",
+      "title": "New Relic platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-ir.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "Both firms report platform partnerships.",
+      "evidence": "Both Datadog and New Relic report multi-year partnerships with major platform vendors.",
+      "url": "https://news.example.net/observability/partnerships",
+      "title": "Partnership summary",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-news.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s2",
+      "claim": "An analyst note compares the two approaches.",
+      "evidence": "The note contrasts Datadog's in-house delivery with New Relic's partner-led model.",
+      "url": "https://analyst.example.io/observability/analyst-note",
+      "title": "Analyst note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-analyst.example.io",
+      "truncated": false
+    },
+    {
+      "finding_id": "f5",
+      "subtopic_id": "s3",
+      "claim": "Datadog discloses investment in observability capability.",
+      "evidence": "Datadog discloses continued investment in observability training and certification.",
+      "url": "https://research.example.com/observability/a-investment",
+      "title": "Datadog investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f5-research.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f6",
+      "subtopic_id": "s3",
+      "claim": "New Relic discloses investment in observability capability.",
+      "evidence": "New Relic discloses continued investment in observability delivery centres.",
+      "url": "https://ir.example.org/observability/b-investment",
+      "title": "New Relic investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f6-ir.example.org",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "How Datadog organises observability",
+        "body": "Datadog runs observability through a dedicated unit. The competing approach is organised around partner platforms."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Datadog delivers observability work through a dedicated business unit.",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec1",
+        "text": "The competing vendor organises the same work around partner platforms.",
+        "finding_ids": [
+          "f2"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://research.example.com/observability/a-overview",
+        "title": "Datadog platform overview",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://ir.example.org/observability/b-overview",
+        "title": "New Relic platform overview",
+        "finding_ids": [
+          "f2"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Datadog states that its observability programme is delivered through a dedicated business unit.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "New Relic states that its observability programme is organised around partner platforms.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": "KNOWN DEFECT: the report never names New Relic, so a comparison answers half the question. expected_entity_coverage should read 0.5."
+}

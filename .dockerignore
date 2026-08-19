@@ -44,6 +44,11 @@ __pycache__
 # responses and the fakes - none of which a production process may import.
 tests
 
+# The offline evaluation subsystem. Not runtime code: no production process runs an
+# evaluation, and the benchmark fixtures are report bodies and page quotes that have no
+# business in a deployed layer.
+eval
+
 # Real-job measurement output: fetched third-party page text and report bodies (gitignored).
 measurements
 

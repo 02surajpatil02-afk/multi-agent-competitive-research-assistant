@@ -1,0 +1,27 @@
+{
+  "question": "What are the competitive threats to Unity in game engines?",
+  "status": "failed",
+  "failure_reason": "uncited_claims",
+  "job_id": "e0a10023-1111-4111-8111-000000000023",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "unresearched",
+    "s2": "unresearched",
+    "s3": "unresearched"
+  },
+  "findings": [],
+  "report": null,
+  "verdicts": [],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 244.0,
+  "llm_calls_used": 11,
+  "revision_count": 0,
+  "quality_flag": "below_threshold",
+  "notes": "The job found nothing and failed at the export gate rather than exporting an ungrounded report. Every report-dependent metric reports not-applicable, which is the behaviour that keeps a failed job from scoring zero on twelve counts."
+}

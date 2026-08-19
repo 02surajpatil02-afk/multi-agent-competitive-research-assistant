@@ -20,6 +20,7 @@ WHO CALLS IT
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 from worker import visibility_renewal_interval
@@ -70,6 +71,43 @@ def test_compose_mounts_bootstrap_scripts_that_exist() -> None:
 
         assert directory.is_dir(), mounted
         assert list(directory.glob("*.sh")), mounted
+
+
+def test_localstacks_ready_scripts_are_executable_on_a_linux_checkout() -> None:
+    """LocalStack runs a ready.d script with `subprocess.call([path])` - the file itself, with
+    no interpreter in front of it - so a script without the executable bit is a
+    `PermissionError`, the hook is marked failed, and the queue and the bucket are never
+    created. The healthcheck then never passes and `docker compose up --wait` fails.
+
+    **The mode is read out of the git index rather than off the disk**, because the disk is
+    the half that cannot see this. A Windows checkout sets `core.fileMode=false` and a
+    Docker Desktop bind mount presents every file as executable regardless, so the bug is
+    invisible locally and fails only on Linux CI - which is exactly how it shipped.
+
+    The postgres image is deliberately not held to this: its entrypoint sources a
+    non-executable `.sh` instead of running it, so that one works either way.
+    """
+    modes = _index_modes("docker/localstack-init")
+
+    assert modes, "docker/localstack-init holds no tracked files"
+    for path, mode in modes.items():
+        assert mode == "100755", f"{path} is {mode}; LocalStack cannot execute it on Linux"
+
+
+def _index_modes(directory: str) -> dict[str, str]:
+    """`{tracked path: mode}` for one directory, as git recorded it."""
+    listed = subprocess.run(
+        ["git", "ls-files", "--stage", "--", directory],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=_ROOT,
+    )
+    entries = {}
+    for line in listed.stdout.splitlines():
+        mode, _, rest = line.partition(" ")
+        entries[rest.split("	", 1)[1]] = mode
+    return entries
 
 
 def _compose_setting(name: str) -> str:

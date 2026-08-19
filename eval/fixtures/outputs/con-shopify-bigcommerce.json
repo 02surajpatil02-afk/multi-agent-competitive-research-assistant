@@ -1,0 +1,250 @@
+{
+  "question": "Compare Shopify and BigCommerce on enterprise e-commerce platforms",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10016-1111-4111-8111-000000000016",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done",
+    "s3": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Shopify describes its commerce programme.",
+      "evidence": "Shopify states that its commerce programme is delivered through a dedicated business unit.",
+      "url": "https://docs.example.com/commerce/a-overview",
+      "title": "Shopify platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-docs.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s1",
+      "claim": "BigCommerce describes its commerce programme.",
+      "evidence": "BigCommerce states that its commerce programme is organised around partner platforms.",
+      "url": "https://blog.example.org/commerce/b-overview",
+      "title": "BigCommerce platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-blog.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "Both firms report platform partnerships.",
+      "evidence": "Both Shopify and BigCommerce report multi-year partnerships with major platform vendors.",
+      "url": "https://press.example.net/commerce/partnerships",
+      "title": "Partnership summary",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-press.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s2",
+      "claim": "An analyst note compares the two approaches.",
+      "evidence": "The note contrasts Shopify's in-house delivery with BigCommerce's partner-led model.",
+      "url": "https://review.example.io/commerce/analyst-note",
+      "title": "Analyst note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-review.example.io",
+      "truncated": false
+    },
+    {
+      "finding_id": "f5",
+      "subtopic_id": "s3",
+      "claim": "Shopify discloses investment in commerce capability.",
+      "evidence": "Shopify discloses continued investment in commerce training and certification.",
+      "url": "https://docs.example.com/commerce/a-investment",
+      "title": "Shopify investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f5-docs.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f6",
+      "subtopic_id": "s3",
+      "claim": "BigCommerce discloses investment in commerce capability.",
+      "evidence": "BigCommerce discloses continued investment in commerce delivery centres.",
+      "url": "https://blog.example.org/commerce/b-investment",
+      "title": "BigCommerce investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f6-blog.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f7",
+      "subtopic_id": "s2",
+      "claim": "A second source disagrees about the partner model.",
+      "evidence": "A second source reports that BigCommerce delivers commerce work in-house rather than through partners.",
+      "url": "https://review.example.io/commerce/disagreement",
+      "title": "Conflicting note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f7-review.example.io",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "How Shopify and BigCommerce organise commerce",
+        "body": "Shopify runs commerce through a dedicated unit, while BigCommerce organises the same work around partner platforms. The two structures lead to different delivery models."
+      },
+      {
+        "id": "sec2",
+        "heading": "Partnerships and investment",
+        "body": "Both Shopify and BigCommerce report platform partnerships, and both disclose continued investment in commerce capability, though in different places."
+      },
+      {
+        "id": "sec3",
+        "heading": "Where the sources disagree",
+        "body": "The two sources disagree about BigCommerce's delivery model: one describes a partner-led approach and the other in-house delivery. Both positions are reported here rather than resolved."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Shopify delivers commerce work through a dedicated business unit.",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec1",
+        "text": "BigCommerce organises commerce work around partner platforms.",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "claim_id": "c3",
+        "section_id": "sec2",
+        "text": "Both Shopify and BigCommerce report multi-year platform partnerships.",
+        "finding_ids": [
+          "f3",
+          "f4"
+        ]
+      },
+      {
+        "claim_id": "c4",
+        "section_id": "sec2",
+        "text": "Shopify and BigCommerce both disclose continued commerce investment.",
+        "finding_ids": [
+          "f5",
+          "f6"
+        ]
+      },
+      {
+        "claim_id": "c5",
+        "section_id": "sec3",
+        "text": "Sources disagree about whether BigCommerce delivers commerce work in-house.",
+        "finding_ids": [
+          "f2",
+          "f7"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://docs.example.com/commerce/a-overview",
+        "title": "Shopify platform overview",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://blog.example.org/commerce/b-overview",
+        "title": "BigCommerce platform overview",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "url": "https://press.example.net/commerce/partnerships",
+        "title": "Partnership summary",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "url": "https://review.example.io/commerce/analyst-note",
+        "title": "Analyst note",
+        "finding_ids": [
+          "f4"
+        ]
+      },
+      {
+        "url": "https://docs.example.com/commerce/a-investment",
+        "title": "Shopify investment disclosure",
+        "finding_ids": [
+          "f5"
+        ]
+      },
+      {
+        "url": "https://blog.example.org/commerce/b-investment",
+        "title": "BigCommerce investment disclosure",
+        "finding_ids": [
+          "f6"
+        ]
+      },
+      {
+        "url": "https://review.example.io/commerce/disagreement",
+        "title": "Conflicting note",
+        "finding_ids": [
+          "f7"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Shopify states that its commerce programme is delivered through a dedicated business unit.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "BigCommerce states that its commerce programme is organised around partner platforms.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c3",
+      "supported": true,
+      "quote": "Both Shopify and BigCommerce report multi-year partnerships with major platform vendors.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c4",
+      "supported": true,
+      "quote": "Shopify discloses continued investment in commerce training and certification.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c5",
+      "supported": true,
+      "quote": "A second source reports that BigCommerce delivers commerce work in-house rather than through partners.",
+      "note": "both cited sources are quoted"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": null
+}

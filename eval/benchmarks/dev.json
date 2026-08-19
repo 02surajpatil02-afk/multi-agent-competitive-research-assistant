@@ -1,0 +1,670 @@
+{
+  "version": "dev-1",
+  "description": "Phase 4 DEV benchmark. Every case is fixture-backed: the questions are the shapes this system is for, and the outputs are authored files citing example.com. No case asserts an external fact about a real company - see docs/evaluation.md.",
+  "cases": [
+    {
+      "case_id": "cmp-tcs-infosys-cloud",
+      "question": "Compare TCS and Infosys on cloud strategy",
+      "category": "company_comparison",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-tcs-infosys-cloud.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "TCS",
+        "Infosys"
+      ],
+      "required_facts": [
+        {
+          "id": "delivery-model",
+          "any_of": [
+            "dedicated business unit",
+            "partner platforms"
+          ]
+        }
+      ],
+      "min_claims": 3,
+      "min_sources": 4,
+      "min_distinct_domains": 3,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "TCS",
+        "Infosys"
+      ],
+      "tags": [
+        "comparison",
+        "healthy"
+      ],
+      "notes": "The reference healthy comparison. Its question is one of the twenty in scripts/measure_jobs.py; its output is an authored fixture citing example.com.",
+      "split": "dev"
+    },
+    {
+      "case_id": "ent-tcs-infosys-entities",
+      "question": "Compare TCS and Infosys on cloud strategy",
+      "category": "entity_coverage",
+      "difficulty": "easy",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-tcs-infosys-cloud.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "TCS",
+        "Infosys"
+      ],
+      "entity_scope": [
+        "TCS",
+        "Infosys"
+      ],
+      "tags": [
+        "entity",
+        "healthy",
+        "shared-output"
+      ],
+      "notes": "Same output as cmp-tcs-infosys-cloud, asked only about entity coverage.",
+      "split": "dev"
+    },
+    {
+      "case_id": "div-tcs-infosys-sources",
+      "question": "Compare TCS and Infosys on cloud strategy",
+      "category": "source_diversity",
+      "difficulty": "easy",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-tcs-infosys-cloud.json",
+      "expected_status": "approved",
+      "min_sources": 4,
+      "min_distinct_domains": 4,
+      "entity_scope": [
+        "TCS",
+        "Infosys"
+      ],
+      "tags": [
+        "sourcing",
+        "healthy",
+        "shared-output"
+      ],
+      "notes": "Same output again, asked only about how many distinct hosts it rests on.",
+      "split": "dev"
+    },
+    {
+      "case_id": "cmp-snowflake-databricks",
+      "question": "Compare Snowflake and Databricks on data warehousing",
+      "category": "multi_source_synthesis",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-snowflake-databricks.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Snowflake",
+        "Databricks"
+      ],
+      "min_claims": 3,
+      "min_sources": 4,
+      "min_distinct_domains": 3,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Snowflake",
+        "Databricks"
+      ],
+      "tags": [
+        "comparison",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "cmp-stripe-adyen",
+      "question": "Compare Stripe and Adyen on enterprise payment infrastructure",
+      "category": "company_comparison",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-stripe-adyen.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Stripe",
+        "Adyen"
+      ],
+      "min_claims": 4,
+      "min_sources": 4,
+      "min_distinct_domains": 4,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Stripe",
+        "Adyen"
+      ],
+      "tags": [
+        "comparison",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "cmp-zoom-teams",
+      "question": "Compare Zoom and Microsoft Teams on enterprise video conferencing",
+      "category": "company_comparison",
+      "difficulty": "easy",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-zoom-teams.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Zoom",
+        "Microsoft Teams"
+      ],
+      "min_claims": 4,
+      "min_sources": 4,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Zoom",
+        "Microsoft Teams"
+      ],
+      "tags": [
+        "comparison",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "cmp-datadog-newrelic-half",
+      "question": "Compare Datadog and New Relic on observability products",
+      "category": "entity_coverage",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cmp-datadog-newrelic-half.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Datadog",
+        "New Relic"
+      ],
+      "min_claims": 2,
+      "entity_scope": [
+        "Datadog",
+        "New Relic"
+      ],
+      "tags": [
+        "comparison",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case: the fixture names only one of the two companies, so expected_entity_coverage fails at 0.5. It exists to keep that detector honest.",
+      "split": "dev"
+    },
+    {
+      "case_id": "fac-openai-launches",
+      "question": "What has OpenAI launched in the last 12 months?",
+      "category": "factual_extraction",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/fac-openai-launches.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "OpenAI"
+      ],
+      "required_facts": [
+        {
+          "id": "availability",
+          "any_of": [
+            "staged by region",
+            "by region"
+          ]
+        }
+      ],
+      "min_claims": 3,
+      "min_sources": 3,
+      "min_distinct_domains": 3,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "OpenAI"
+      ],
+      "temporal_scope": "the last 12 months",
+      "tags": [
+        "event-tracking",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "fac-anthropic-releases",
+      "question": "What products has Anthropic released in the last 12 months?",
+      "category": "factual_extraction",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/fac-anthropic-releases.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Anthropic"
+      ],
+      "min_claims": 3,
+      "min_sources": 3,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Anthropic"
+      ],
+      "temporal_scope": "the last 12 months",
+      "tags": [
+        "event-tracking",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "fac-servicenow-acquisitions",
+      "question": "What acquisitions has ServiceNow made in the last 12 months?",
+      "category": "factual_extraction",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/fac-servicenow-acquisitions.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "ServiceNow"
+      ],
+      "min_claims": 3,
+      "min_sources": 3,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "ServiceNow"
+      ],
+      "temporal_scope": "the last 12 months",
+      "tags": [
+        "event-tracking",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "syn-nvidia-datacenter",
+      "question": "What has Nvidia announced in data center GPUs in the last 12 months?",
+      "category": "multi_source_synthesis",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/syn-nvidia-datacenter.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Nvidia"
+      ],
+      "min_claims": 3,
+      "min_sources": 3,
+      "min_distinct_domains": 3,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Nvidia"
+      ],
+      "temporal_scope": "the last 12 months",
+      "tags": [
+        "event-tracking",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "syn-cloudflare-developers",
+      "question": "What has Cloudflare launched for developers in the last 12 months?",
+      "category": "multi_source_synthesis",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/syn-cloudflare-developers.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Cloudflare"
+      ],
+      "min_claims": 3,
+      "min_sources": 3,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "Cloudflare"
+      ],
+      "temporal_scope": "the last 12 months",
+      "tags": [
+        "event-tracking",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "thr-twilio-threats",
+      "question": "What are the competitive threats to Twilio?",
+      "category": "multi_source_synthesis",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/thr-twilio-threats.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Twilio"
+      ],
+      "min_claims": 4,
+      "min_sources": 4,
+      "min_distinct_domains": 4,
+      "max_unsupported_claims": 0,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Twilio"
+      ],
+      "tags": [
+        "threat-analysis",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "thr-docusign-threats",
+      "question": "What are the competitive threats to DocuSign in e-signature?",
+      "category": "company_comparison",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/thr-docusign-threats.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "DocuSign"
+      ],
+      "min_claims": 4,
+      "min_sources": 4,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "DocuSign"
+      ],
+      "tags": [
+        "threat-analysis",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "cit-okta-grounded",
+      "question": "What are the competitive threats to Okta in identity management?",
+      "category": "citation_grounding",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cit-okta-grounded.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Okta"
+      ],
+      "min_claims": 4,
+      "min_sources": 4,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "Okta"
+      ],
+      "tags": [
+        "citation",
+        "healthy"
+      ],
+      "notes": "Every claim reaches a source, which is the state CLAUDE.md invariant 1 requires before an export can happen.",
+      "split": "dev"
+    },
+    {
+      "case_id": "cit-elastic-unknown-finding",
+      "question": "What are the competitive threats to Elastic in search and observability?",
+      "category": "citation_grounding",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/cit-elastic-unknown-finding.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Elastic"
+      ],
+      "min_claims": 4,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "Elastic"
+      ],
+      "tags": [
+        "citation",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case: one claim cites a finding id that does not exist, so it reaches no source. It keeps claim_citation_coverage and claim_support_rate honest.",
+      "split": "dev"
+    },
+    {
+      "case_id": "cit-unity-invalid-report",
+      "question": "What are the competitive threats to Unity in game engines?",
+      "category": "citation_grounding",
+      "difficulty": "hard",
+      "provenance": "synthetic_contract",
+      "output_ref": "../fixtures/outputs/cit-unity-invalid-report.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Unity"
+      ],
+      "entity_scope": [
+        "Unity"
+      ],
+      "tags": [
+        "citation",
+        "known-defect",
+        "schema"
+      ],
+      "notes": "KNOWN DEFECT case, authored rather than plausible: the stored report body violates schemas.Report, so the loader records the errors instead of raising and structured_output_validity reports 0.",
+      "split": "dev"
+    },
+    {
+      "case_id": "con-shopify-bigcommerce",
+      "question": "Compare Shopify and BigCommerce on enterprise e-commerce platforms",
+      "category": "contradiction_handling",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/con-shopify-bigcommerce.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Shopify",
+        "BigCommerce"
+      ],
+      "required_facts": [
+        {
+          "id": "disagreement-reported",
+          "any_of": [
+            "disagree",
+            "sources disagree"
+          ]
+        }
+      ],
+      "forbidden_claims": [
+        "conclusively proves",
+        "there is no disagreement"
+      ],
+      "min_claims": 5,
+      "min_sources": 5,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "Shopify",
+        "BigCommerce"
+      ],
+      "tags": [
+        "contradiction",
+        "healthy"
+      ],
+      "notes": "The healthy contradiction case: the report states both positions rather than picking one. Whether it resolved the disagreement well is the judge's contradiction_handling dimension; this case can only check that it did not assert certainty.",
+      "split": "dev"
+    },
+    {
+      "case_id": "con-notion-confluence-overclaim",
+      "question": "Compare Notion and Atlassian Confluence on team knowledge management",
+      "category": "contradiction_handling",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/con-notion-confluence-overclaim.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Notion",
+        "Confluence"
+      ],
+      "forbidden_claims": [
+        "conclusively proves"
+      ],
+      "min_claims": 4,
+      "entity_scope": [
+        "Notion",
+        "Confluence"
+      ],
+      "tags": [
+        "contradiction",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case: the fixture over-claims, so forbidden_claim_absence fails. Lexical, and it says so - a differently phrased over-claim would pass.",
+      "split": "dev"
+    },
+    {
+      "case_id": "res-wix-partial-coverage",
+      "question": "What are the competitive threats to Wix?",
+      "category": "research_coverage",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/res-wix-partial-coverage.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Wix"
+      ],
+      "min_claims": 4,
+      "expect_all_subtopics_researched": false,
+      "entity_scope": [
+        "Wix"
+      ],
+      "tags": [
+        "coverage",
+        "healthy"
+      ],
+      "notes": "A job that ran out of evidence on one subtopic and carried the gap to the reviewer. The case expects the gap, so research_coverage passes at 0.667 - the documented behaviour is to report the gap, never to turn it into a pass.",
+      "split": "dev"
+    },
+    {
+      "case_id": "res-okta-full-coverage",
+      "question": "What are the competitive threats to Okta in identity management?",
+      "category": "research_coverage",
+      "difficulty": "medium",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/res-okta-full-coverage.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Okta"
+      ],
+      "min_claims": 4,
+      "expect_all_subtopics_researched": true,
+      "entity_scope": [
+        "Okta"
+      ],
+      "tags": [
+        "coverage",
+        "healthy"
+      ],
+      "split": "dev"
+    },
+    {
+      "case_id": "dup-salesforce-hubspot",
+      "question": "Compare Salesforce and HubSpot on AI product announcements",
+      "category": "duplicate_sources",
+      "difficulty": "medium",
+      "provenance": "synthetic_contract",
+      "output_ref": "../fixtures/outputs/dup-salesforce-hubspot.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Salesforce",
+        "HubSpot"
+      ],
+      "min_sources": 4,
+      "min_distinct_domains": 4,
+      "entity_scope": [
+        "Salesforce",
+        "HubSpot"
+      ],
+      "tags": [
+        "sourcing",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case, authored: one URL is cited twice, so a report that looks like it rests on seven sources rests on six.",
+      "split": "dev"
+    },
+    {
+      "case_id": "div-single-host",
+      "question": "Compare Snowflake and Databricks on governance features",
+      "category": "source_diversity",
+      "difficulty": "medium",
+      "provenance": "synthetic_contract",
+      "output_ref": "../fixtures/outputs/div-single-host.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Snowflake",
+        "Databricks"
+      ],
+      "min_distinct_domains": 3,
+      "entity_scope": [
+        "Snowflake",
+        "Databricks"
+      ],
+      "tags": [
+        "sourcing",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case, authored: six findings from one host. Everything else about the report is fine, which is the point - only source_diversity should move.",
+      "split": "dev"
+    },
+    {
+      "case_id": "ins-hashicorp-thin",
+      "question": "What pricing and licensing changes has HashiCorp made since 2023?",
+      "category": "insufficient_evidence",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/ins-hashicorp-thin.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "HashiCorp"
+      ],
+      "min_claims": 3,
+      "expect_all_subtopics_researched": false,
+      "entity_scope": [
+        "HashiCorp"
+      ],
+      "temporal_scope": "since 2023",
+      "tags": [
+        "coverage",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case: the evidence ran out on two subtopics and the report carries one claim, so minimum_useful_output fails against min_claims=3 while research_coverage passes - the gap was reported rather than hidden.",
+      "split": "dev"
+    },
+    {
+      "case_id": "ins-unity-no-evidence",
+      "question": "What are the competitive threats to Unity in game engines?",
+      "category": "insufficient_evidence",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/ins-unity-no-evidence.json",
+      "expected_status": "failed",
+      "entity_scope": [
+        "Unity"
+      ],
+      "expect_all_subtopics_researched": false,
+      "tags": [
+        "failure",
+        "healthy"
+      ],
+      "notes": "A job that failed correctly. expected_status is `failed`, so terminal_success passes - the system behaving as documented must not read as a quality regression.",
+      "split": "dev"
+    },
+    {
+      "case_id": "sup-okta-unsupported",
+      "question": "What are the competitive threats to Okta in identity management?",
+      "category": "citation_grounding",
+      "difficulty": "hard",
+      "provenance": "repository_fixture",
+      "output_ref": "../fixtures/outputs/sup-okta-unsupported.json",
+      "expected_status": "approved",
+      "required_entities": [
+        "Okta"
+      ],
+      "min_claims": 4,
+      "max_unsupported_claims": 0,
+      "entity_scope": [
+        "Okta"
+      ],
+      "tags": [
+        "citation",
+        "known-defect"
+      ],
+      "notes": "KNOWN DEFECT case: every claim is cited, and two of them are not supported by the source they cite - which is exactly why coverage and support are two metrics.",
+      "split": "dev"
+    }
+  ]
+}

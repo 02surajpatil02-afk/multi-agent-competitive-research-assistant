@@ -1,0 +1,212 @@
+{
+  "question": "Compare Zoom and Microsoft Teams on enterprise video conferencing",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10004-1111-4111-8111-000000000004",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done",
+    "s3": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Zoom describes its video conferencing programme.",
+      "evidence": "Zoom states that its video conferencing programme is delivered through a dedicated business unit.",
+      "url": "https://docs.example.com/video conferencing/a-overview",
+      "title": "Zoom platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-docs.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s1",
+      "claim": "Microsoft Teams describes its video conferencing programme.",
+      "evidence": "Microsoft Teams states that its video conferencing programme is organised around partner platforms.",
+      "url": "https://blog.example.org/video conferencing/b-overview",
+      "title": "Microsoft Teams platform overview",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-blog.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "Both firms report platform partnerships.",
+      "evidence": "Both Zoom and Microsoft Teams report multi-year partnerships with major platform vendors.",
+      "url": "https://press.example.net/video conferencing/partnerships",
+      "title": "Partnership summary",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-press.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s2",
+      "claim": "An analyst note compares the two approaches.",
+      "evidence": "The note contrasts Zoom's in-house delivery with Microsoft Teams's partner-led model.",
+      "url": "https://review.example.io/video conferencing/analyst-note",
+      "title": "Analyst note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-review.example.io",
+      "truncated": false
+    },
+    {
+      "finding_id": "f5",
+      "subtopic_id": "s3",
+      "claim": "Zoom discloses investment in video conferencing capability.",
+      "evidence": "Zoom discloses continued investment in video conferencing training and certification.",
+      "url": "https://docs.example.com/video conferencing/a-investment",
+      "title": "Zoom investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f5-docs.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f6",
+      "subtopic_id": "s3",
+      "claim": "Microsoft Teams discloses investment in video conferencing capability.",
+      "evidence": "Microsoft Teams discloses continued investment in video conferencing delivery centres.",
+      "url": "https://blog.example.org/video conferencing/b-investment",
+      "title": "Microsoft Teams investment disclosure",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f6-blog.example.org",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "How Zoom and Microsoft Teams organise video conferencing",
+        "body": "Zoom runs video conferencing through a dedicated unit, while Microsoft Teams organises the same work around partner platforms. The two structures lead to different delivery models."
+      },
+      {
+        "id": "sec2",
+        "heading": "Partnerships and investment",
+        "body": "Both Zoom and Microsoft Teams report platform partnerships, and both disclose continued investment in video conferencing capability, though in different places."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Zoom delivers video conferencing work through a dedicated business unit.",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec1",
+        "text": "Microsoft Teams organises video conferencing work around partner platforms.",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "claim_id": "c3",
+        "section_id": "sec2",
+        "text": "Both Zoom and Microsoft Teams report multi-year platform partnerships.",
+        "finding_ids": [
+          "f3",
+          "f4"
+        ]
+      },
+      {
+        "claim_id": "c4",
+        "section_id": "sec2",
+        "text": "Zoom and Microsoft Teams both disclose continued video conferencing investment.",
+        "finding_ids": [
+          "f5",
+          "f6"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://docs.example.com/video conferencing/a-overview",
+        "title": "Zoom platform overview",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://blog.example.org/video conferencing/b-overview",
+        "title": "Microsoft Teams platform overview",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "url": "https://press.example.net/video conferencing/partnerships",
+        "title": "Partnership summary",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "url": "https://review.example.io/video conferencing/analyst-note",
+        "title": "Analyst note",
+        "finding_ids": [
+          "f4"
+        ]
+      },
+      {
+        "url": "https://docs.example.com/video conferencing/a-investment",
+        "title": "Zoom investment disclosure",
+        "finding_ids": [
+          "f5"
+        ]
+      },
+      {
+        "url": "https://blog.example.org/video conferencing/b-investment",
+        "title": "Microsoft Teams investment disclosure",
+        "finding_ids": [
+          "f6"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Zoom states that its video conferencing programme is delivered through a dedicated business unit.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "Microsoft Teams states that its video conferencing programme is organised around partner platforms.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c3",
+      "supported": true,
+      "quote": "Both Zoom and Microsoft Teams report multi-year partnerships with major platform vendors.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c4",
+      "supported": true,
+      "quote": "Zoom discloses continued investment in video conferencing training and certification.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": null
+}

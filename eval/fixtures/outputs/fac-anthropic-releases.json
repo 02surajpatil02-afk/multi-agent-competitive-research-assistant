@@ -1,0 +1,159 @@
+{
+  "question": "What products has Anthropic released in the last 12 months?",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10007-1111-4111-8111-000000000007",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Anthropic announced a product in model.",
+      "evidence": "Anthropic announced a new model product during the period covered.",
+      "url": "https://docs.example.com/model/launch-one",
+      "title": "Anthropic announcement",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-docs.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s1",
+      "claim": "Coverage confirms the model announcement.",
+      "evidence": "Independent coverage confirms Anthropic made the model announcement.",
+      "url": "https://blog.example.org/model/launch-two",
+      "title": "Coverage of the announcement",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-blog.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "Availability was staged by region.",
+      "evidence": "The model product became available in stages, by region.",
+      "url": "https://press.example.net/model/availability",
+      "title": "Availability note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-press.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s2",
+      "claim": "Pricing was published alongside availability.",
+      "evidence": "Pricing for the model product was published alongside availability.",
+      "url": "https://review.example.io/model/pricing",
+      "title": "Pricing note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-review.example.io",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "What Anthropic announced",
+        "body": "Anthropic announced a new model product, confirmed by independent coverage."
+      },
+      {
+        "id": "sec2",
+        "heading": "Availability and pricing",
+        "body": "The model product became available in stages by region, with pricing published alongside availability."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Anthropic announced a new model product.",
+        "finding_ids": [
+          "f1",
+          "f2"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec2",
+        "text": "Availability was staged by region.",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "claim_id": "c3",
+        "section_id": "sec2",
+        "text": "Pricing was published alongside availability.",
+        "finding_ids": [
+          "f4"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://docs.example.com/model/launch-one",
+        "title": "Anthropic announcement",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://blog.example.org/model/launch-two",
+        "title": "Coverage of the announcement",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "url": "https://press.example.net/model/availability",
+        "title": "Availability note",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "url": "https://review.example.io/model/pricing",
+        "title": "Pricing note",
+        "finding_ids": [
+          "f4"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Anthropic announced a new model product during the period covered.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "The model product became available in stages, by region.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c3",
+      "supported": true,
+      "quote": "Pricing for the model product was published alongside availability.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": null
+}

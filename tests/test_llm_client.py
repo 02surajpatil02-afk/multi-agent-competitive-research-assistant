@@ -27,7 +27,7 @@ from fakes import (
     status_error,
     timeout_error,
 )
-from openai import OpenAI
+from openai import OpenAI, omit
 
 import llm_client
 from config import Config, load_config
@@ -112,6 +112,32 @@ def test_json_mode_is_requested() -> None:
     _ask(client)
 
     assert fake.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_no_temperature_is_sent_unless_a_caller_asks_for_one() -> None:
+    # `omit` is the SDK's "do not send this field", so every agent's request is the one it sent
+    # before the parameter existed and the endpoint's own default stays in force.
+    client, fake = _client(_VALID)
+
+    _ask(client)
+
+    assert fake.completions.calls[0]["temperature"] is omit
+
+
+def test_a_caller_that_asks_for_a_temperature_gets_it_on_the_wire() -> None:
+    # The offline evaluation judge is the only caller that does, and it asks for 0.0 so two
+    # runs of the same rubric over the same report are comparable (eval/judge.py).
+    client, fake = _client(_VALID)
+
+    client.call_structured(
+        schema=SupervisorDecision,
+        system="You route the graph.",
+        user="What runs next?",
+        budget=CallBudget(limit=60),
+        temperature=0.0,
+    )
+
+    assert fake.completions.calls[0]["temperature"] == 0.0
 
 
 def test_the_system_prompt_carries_the_agent_text_and_the_schema() -> None:

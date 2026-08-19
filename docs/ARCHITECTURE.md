@@ -160,7 +160,9 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | The application image and its two entrypoints | 3 | **Built** (2026-08-18, step 22b/c) — `Dockerfile`, `.dockerignore`, and the `migrate`/`api`/`worker` services. One image, three commands, a non-root user, and a fifth `container` test layer. Built locally; never pushed to a registry |
 | CI | 3 | Built locally — step 23, GitHub Actions verification only; first hosted run pending, with no publishing or deployment |
 | Redis: shared rate limiter, caches, URL dedupe | 3 | **Built** (2026-08-17, step 21) — `redisstore.py`. Fail-open caches and URL set, fail-closed limiter (§20 row 29), verified against a real Redis 7 |
-| LangSmith tracing, eval dataset, eval as a release gate | 4 | Planned |
+| The offline evaluation subsystem: benchmark schema, DEV benchmark, twelve deterministic metrics, the optional structured judge, and `python -m eval.run` | 4 | **Built** (2026-08-19, block A+B) — `eval/`, [ADR 0017](adr/0017-deterministic-evaluators-and-a-custom-structured-judge.md), `docs/evaluation.md`. It scores **already-produced outputs** and never runs the graph. The judge is off by default, so the default run needs no credential. **The DEV benchmark is fixture-backed and does not yet measure this system's research quality** (evaluation.md §5) |
+| LangSmith trace metadata (`job_id` / `agent` / `model` / `revision` under those names), structured JSON logging | 4 | Planned — steps 24 and 25. Evaluation was built not to depend on either: linkage is by `thread_id`, which LangGraph already sets |
+| Rubric calibration, and eval as a release gate | 4 | Planned — steps 27 and 28. **Deliberately not in block A+B**: a gate needs a distribution to calibrate against, and block A+B is what produces the first one (evaluation.md §14) |
 | AWS deployment, Cognito JWT, CloudWatch alarms | 5 | Planned |
 
 ---
@@ -2435,6 +2437,19 @@ cannot decide, ask which question the signal answers — *what did the agents do
 infrastructure healthy* — and put it there. `job_id` is the join key between the two, so nothing needs
 to be duplicated to be correlatable (gl §14).
 
+### The third question, which is not a layer here
+
+*"Is the research any good?"* is neither of the two above, and both layers answer it with silence. It
+is answered offline, over finished jobs, by `eval/` — see **`docs/evaluation.md`** and
+[ADR 0017](adr/0017-deterministic-evaluators-and-a-custom-structured-judge.md).
+
+It is worth stating here because of the no-duplication rule this section just made. Evaluation
+**reads** what these two layers already record — `jobs`, `findings`, `claims`, the audit trail — and
+adds no telemetry of its own, no third store, and no third dashboard. It does not read LangSmith at
+all: the join is `job_id`, which is also the `thread_id` on every run in a job's trace, so a low score
+opens the run tree without evaluation needing to call the service. Deterministic evaluation therefore
+works with `LANGSMITH_TRACING` off.
+
 ### Security note
 
 LangSmith is a hosted third-party service. Prompts, model outputs, and **fetched page content** leave
@@ -3064,6 +3079,27 @@ entrypoints.
 | 26 | **Eval dataset** — 30–50 questions across comparison, event tracking, and threat analysis, with expected evidence | 24 | Trace linkage in both directions is part of the deliverable |
 | 27 | **Rubric calibration** — score 20 reports by hand, fix any dimension where judge and human differ by more than a point | 26 | Until this passes, the reflection gate is decoration |
 | 28 | **Eval as a release gate in CI** — path-filtered, no dimension may drop more than 0.3 | 23, 26, 27 | Enforcement, not intention |
+
+**Step 26 was built ahead of step 24, and the dependency above is why that is worth stating.** Block
+A+B (2026-08-19) shipped the whole evaluation *engine* — `eval/schema.py`, `eval/outputs.py`,
+`eval/metrics.py`, `eval/judge.py`, `eval/report.py`, `eval/run.py`, a 26-case DEV benchmark, and the
+JSON/CSV report — before the trace metadata step 26 was listed as depending on. That was deliberate:
+the dependency existed because trace linkage was assumed to need step 24's named metadata, and it
+does not. `thread_id = job_id` is already on every run LangGraph emits, which is the only join an
+eval row needs, so evaluation runs today with LangSmith switched off entirely.
+[ADR 0017](adr/0017-deterministic-evaluators-and-a-custom-structured-judge.md) records the design;
+`docs/evaluation.md` is the reference.
+
+**What step 26 still owes, and it is the honest half:** the DEV benchmark is **fixture-backed**. No
+case asserts an external fact about a real company, because this repository ships no corpus of real
+research outputs to label — `measurements/` is gitignored precisely because those rows carry
+third-party page text. So the benchmark exercises the evaluators end to end and pins the contract,
+and does **not** yet measure this system's research quality. Closing that needs a run whose outputs
+can be committed, which is a decision about publishing report bodies.
+
+**Steps 27 and 28 are untouched and stay in that order.** Block C is where they land, and the reason
+is the one this table already applies to the reflection rubric: a gate needs a distribution to be
+calibrated against, and block A+B is what produces the first one.
 
 ### Phase 5 — AWS
 

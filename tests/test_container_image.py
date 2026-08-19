@@ -53,9 +53,13 @@ INFRASTRUCTURE_SERVICES = ("postgres", "redis", "localstack")
 """The three that were already here, and that `docker compose up -d --wait` still starts on
 its own - which is what the `postgres`, `integration` and `redis` test layers run against."""
 
-NOT_IN_THE_IMAGE = frozenset({"tests"})
+NOT_IN_THE_IMAGE = frozenset({"tests", "eval"})
 """Top-level importable names the image deliberately does not carry. `tests` is not runtime
-code, and a production process may not import the harnesses or the recorded web responses."""
+code, and a production process may not import the harnesses or the recorded web responses.
+
+`eval` is out for the same two reasons: no production process runs an evaluation, and the
+benchmark fixtures are report bodies and page quotes that have no business in a deployed
+layer. It is an offline harness, like `scripts/measure_jobs.py` next to it."""
 
 PROVIDER_VARIABLES = (
     "LLM_BASE_URL",

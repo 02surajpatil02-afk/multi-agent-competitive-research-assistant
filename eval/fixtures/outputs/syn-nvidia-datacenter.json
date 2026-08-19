@@ -1,0 +1,159 @@
+{
+  "question": "What has Nvidia announced in data center GPUs in the last 12 months?",
+  "status": "approved",
+  "failure_reason": null,
+  "job_id": "e0a10009-1111-4111-8111-000000000009",
+  "model": "fixture-model",
+  "planned_subtopics": [
+    "s1",
+    "s2"
+  ],
+  "subtopic_status": {
+    "s1": "done",
+    "s2": "done"
+  },
+  "findings": [
+    {
+      "finding_id": "f1",
+      "subtopic_id": "s1",
+      "claim": "Nvidia announced a product in data center GPU.",
+      "evidence": "Nvidia announced a new data center GPU product during the period covered.",
+      "url": "https://docs.example.com/data center GPU/launch-one",
+      "title": "Nvidia announcement",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f1-docs.example.com",
+      "truncated": false
+    },
+    {
+      "finding_id": "f2",
+      "subtopic_id": "s1",
+      "claim": "Coverage confirms the data center GPU announcement.",
+      "evidence": "Independent coverage confirms Nvidia made the data center GPU announcement.",
+      "url": "https://blog.example.org/data center GPU/launch-two",
+      "title": "Coverage of the announcement",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f2-blog.example.org",
+      "truncated": false
+    },
+    {
+      "finding_id": "f3",
+      "subtopic_id": "s2",
+      "claim": "Availability was staged by region.",
+      "evidence": "The data center GPU product became available in stages, by region.",
+      "url": "https://press.example.net/data center GPU/availability",
+      "title": "Availability note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f3-press.example.net",
+      "truncated": false
+    },
+    {
+      "finding_id": "f4",
+      "subtopic_id": "s2",
+      "claim": "Pricing was published alongside availability.",
+      "evidence": "Pricing for the data center GPU product was published alongside availability.",
+      "url": "https://review.example.io/data center GPU/pricing",
+      "title": "Pricing note",
+      "retrieved_at": "2026-08-18T09:30:00+00:00",
+      "content_hash": "sha256-f4-review.example.io",
+      "truncated": false
+    }
+  ],
+  "report": {
+    "sections": [
+      {
+        "id": "sec1",
+        "heading": "What Nvidia announced",
+        "body": "Nvidia announced a new data center GPU product, confirmed by independent coverage."
+      },
+      {
+        "id": "sec2",
+        "heading": "Availability and pricing",
+        "body": "The data center GPU product became available in stages by region, with pricing published alongside availability."
+      }
+    ],
+    "claims": [
+      {
+        "claim_id": "c1",
+        "section_id": "sec1",
+        "text": "Nvidia announced a new data center GPU product.",
+        "finding_ids": [
+          "f1",
+          "f2"
+        ]
+      },
+      {
+        "claim_id": "c2",
+        "section_id": "sec2",
+        "text": "Availability was staged by region.",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "claim_id": "c3",
+        "section_id": "sec2",
+        "text": "Pricing was published alongside availability.",
+        "finding_ids": [
+          "f4"
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://docs.example.com/data center GPU/launch-one",
+        "title": "Nvidia announcement",
+        "finding_ids": [
+          "f1"
+        ]
+      },
+      {
+        "url": "https://blog.example.org/data center GPU/launch-two",
+        "title": "Coverage of the announcement",
+        "finding_ids": [
+          "f2"
+        ]
+      },
+      {
+        "url": "https://press.example.net/data center GPU/availability",
+        "title": "Availability note",
+        "finding_ids": [
+          "f3"
+        ]
+      },
+      {
+        "url": "https://review.example.io/data center GPU/pricing",
+        "title": "Pricing note",
+        "finding_ids": [
+          "f4"
+        ]
+      }
+    ]
+  },
+  "verdicts": [
+    {
+      "claim_id": "c1",
+      "supported": true,
+      "quote": "Nvidia announced a new data center GPU product during the period covered.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c2",
+      "supported": true,
+      "quote": "The data center GPU product became available in stages, by region.",
+      "note": "the cited source states this"
+    },
+    {
+      "claim_id": "c3",
+      "supported": true,
+      "quote": "Pricing for the data center GPU product was published alongside availability.",
+      "note": "the cited source states this"
+    }
+  ],
+  "started_at": "2026-08-18T09:20:00+00:00",
+  "completed_at": "2026-08-18T09:31:12+00:00",
+  "latency_seconds": 671.4,
+  "llm_calls_used": 28,
+  "revision_count": 1,
+  "quality_flag": null,
+  "notes": null
+}
