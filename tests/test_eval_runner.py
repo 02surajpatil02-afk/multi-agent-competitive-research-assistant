@@ -322,5 +322,19 @@ def test_the_judge_model_and_endpoint_default_to_the_environment(
     assert args.judge_base_url == "https://judge.invalid/v1"
 
 
+def test_requiring_judge_scores_is_off_by_default() -> None:
+    # It is a provider-health switch for the manual judge workflow, never something a
+    # deterministic run has an opinion about.
+    assert parse_args([]).require_judge_scores is False
+    assert parse_args(["--require-judge-scores"]).require_judge_scores is True
+
+
+def test_a_deterministic_run_never_fails_on_the_judge_health_switch(tmp_path: Path) -> None:
+    # No judge was attempted, so there is nothing for the switch to be unhappy about.
+    out = tmp_path / "out"
+
+    assert _run(_bench(tmp_path, _CASE), out, "--require-judge-scores") == 0
+
+
 def test_a_case_result_names_its_failing_metrics() -> None:
     assert CaseResult(case_id="a", split="dev", status="evaluated").failed_metrics == ()

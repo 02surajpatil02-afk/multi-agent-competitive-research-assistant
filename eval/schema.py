@@ -170,6 +170,21 @@ class EvalCase(BaseModel):
     an output carries a publication date that could be checked against it without re-fetching
     every source, which is the expensive thing this package exists to avoid."""
 
+    expect_failing_metrics: list[str] = Field(default_factory=list)
+    """**The regression contract**: exactly which metrics this case's committed output is
+    expected to fail, by name. Empty - the default - means it must fail none.
+
+    It is deliberately redundant with the expectations above, and the redundancy *is* the
+    check. `cmp-datadog-newrelic-half` fails `expected_entity_coverage` because its fixture
+    names one of two required entities; this field says so independently, so an evaluator that
+    quietly stops catching that defect breaks the contract instead of turning green
+    ([ADR 0018](../docs/adr/0018-the-ci-evaluation-gate-protects-the-contract-not-the-quality.md)).
+
+    Read by `eval/gate.py` and by nothing else. **No metric reads it**, and it is not an
+    expectation about a good answer - it is a statement about a file this repository committed.
+    Names are checked against the metric registry by the gate rather than here, because
+    `eval.metrics` imports this module and the dependency cannot run both ways."""
+
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
     """Why this case exists, in a sentence. Every `known-defect` case uses it to say what is

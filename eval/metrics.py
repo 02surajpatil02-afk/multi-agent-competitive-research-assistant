@@ -552,6 +552,19 @@ one line."""
 
 METRIC_NAMES: tuple[str, ...] = tuple(metric.__name__ for metric in DETERMINISTIC_METRICS)
 
+METRICS_VERSION = "det-v1"
+"""The deterministic evaluator set, as one version string, written into every report.
+
+It answers the first question anyone asks of two reports that disagree: *did the system change,
+or did the ruler?* Without it, a metric whose definition was tightened looks exactly like a
+regression in the thing it measures.
+
+**Bump it whenever a metric is added, removed, renamed, or has its scoring or pass rule
+changed** - and treat reports carrying two versions as two different measurements, the way
+`JUDGE_RUBRIC_VERSION` already asks. A new `details` key or a reworded explanation is not a
+version change: those cannot move a score.
+"""
+
 
 def evaluate_deterministic(output: ResearchOutput, case: EvalCase) -> list[MetricResult]:
     """Every deterministic metric, in order. Pure, and therefore reproducible."""

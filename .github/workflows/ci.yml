@@ -70,6 +70,48 @@ jobs:
       - name: Run offline suite
         run: uv run pytest -q
 
+  # The deterministic evaluation gate. Its own job rather than a step inside `unit`, because
+  # the two answer different questions and a build log should say which one broke: `unit`
+  # answers "does the code work", this answers "does the evaluation framework still hold its
+  # contract". It needs no service, no Docker, no provider and no network - the twelve metrics
+  # are pure functions over committed fixtures - so it is the cheapest job here.
+  #
+  # It gates the framework and the benchmark contract, and it gates NO metric score and NO
+  # judge score. docs/evaluation.md, "What is and is not gated", is the full list.
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      # No `--judge`, so no LLM client is constructed and no credential is read. The job's
+      # environment carries no provider variable at all, which is what keeps normal CI
+      # provider-independent (ADR 0018).
+      - name: Run the deterministic DEV benchmark
+        run: uv run python -m eval.run --run-id ci --csv
+      # A second command reading the first one's report, deliberately: producing the evidence
+      # and judging it are separate steps, so the judgement cannot quietly re-decide the
+      # measurement. Exit 1 is a contract violation; exit 2 is an unusable report.
+      - name: Check the evaluation regression contract
+        run: uv run python -m eval.gate measurements/eval/ci.json
+      # Kept whatever the outcome: the report is how a violation is diagnosed without
+      # re-running anything, and it holds only committed fixture text.
+      - name: Upload the evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.run_id }}
+          path: measurements/eval/
+          retention-days: 14
+
   postgres:
     runs-on: ubuntu-latest
     timeout-minutes: 20

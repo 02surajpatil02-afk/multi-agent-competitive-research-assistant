@@ -51,7 +51,14 @@ from database.queries import create_database_engine
 from eval.judge import JUDGE_RUBRIC_VERSION, Judge, JudgeOutcome
 from eval.metrics import evaluate_deterministic
 from eval.outputs import OutputError, ResearchOutput, load_output_file, load_output_from_database
-from eval.report import CaseResult, CaseStatus, EvalRun, write_csv, write_json
+from eval.report import (
+    CaseResult,
+    CaseStatus,
+    EvalRun,
+    judge_ran_but_scored_nothing,
+    write_csv,
+    write_json,
+)
 from eval.schema import Benchmark, BenchmarkError, EvalCase, load_benchmark
 from llm_client import LLMClient
 
@@ -121,6 +128,14 @@ def main(argv: list[str] | None = None) -> int:
     _emit(f"  report      : {report_path}")
     if args.csv:
         _emit(f"  csv         : {write_csv(run, args.out / f'{run.run_id}.csv')}")
+
+    if args.require_judge_scores and judge_ran_but_scored_nothing(run):
+        # A provider fault, not a quality result. The report is already written, so the
+        # failure costs nothing that was measured - it only stops a run where the judge
+        # answered nothing at all from being read as a run where it answered badly.
+        _emit("")
+        _emit("the judge was enabled and scored no cases at all; treating that as a failure")
+        return 1
     return 0
 
 
@@ -173,6 +188,7 @@ def _evaluate_case(
         metrics=metrics,
         judge=verdict,
         metadata=output.metadata,
+        expect_failing_metrics=tuple(case.expect_failing_metrics),
     )
 
 
@@ -207,6 +223,7 @@ def _bare(case: EvalCase, status: CaseStatus, error: str) -> CaseResult:
         tags=tuple(case.tags),
         output_ref=case.output_ref,
         error=error,
+        expect_failing_metrics=tuple(case.expect_failing_metrics),
     )
 
 
@@ -317,6 +334,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("EVAL_JUDGE_BASE_URL") or None,
         help="OpenAI-compatible endpoint for the judge (default: EVAL_JUDGE_BASE_URL, "
         "then LLM_BASE_URL)",
+    )
+    parser.add_argument(
+        "--require-judge-scores",
+        action="store_true",
+        help=(
+            "exit 1 when the judge was enabled and scored nothing - a provider fault. It is "
+            "not a score threshold and never fires on a low score"
+        ),
     )
     parser.add_argument(
         "--run-id",

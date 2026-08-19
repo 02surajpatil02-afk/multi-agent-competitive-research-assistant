@@ -107,9 +107,13 @@ dev = [
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
-# The repository root is the import root: `uvicorn app:app`, `python -m worker`, and
-# `python -m eval.run` all run from here (CLAUDE.md commands). Listed explicitly because
-# the layout is flat, so setuptools cannot auto-discover it.
+# The repository root is the import root: `uvicorn app:app`, `python -m worker`,
+# `python -m eval.run` and `python -m eval.gate` all run from here (CLAUDE.md commands).
+# Listed explicitly because the layout is flat, so setuptools cannot auto-discover it.
+#
+# `eval` and `scripts` are deliberately absent from both lists below: they are offline
+# harnesses rather than shipped application code, and `.dockerignore` keeps `eval` out of
+# the image for the same reason it keeps `tests` out.
 [tool.setuptools]
 py-modules = ["app", "config", "schemas", "llm_client", "jobqueue", "redisstore", "worker"]
 packages = ["agents", "database", "graph", "routes", "tools"]

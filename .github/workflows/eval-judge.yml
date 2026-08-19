@@ -1,0 +1,80 @@
+# The LLM-as-Judge evaluation, run by hand and never by a pull request.
+#
+# It exists so that running the judge has one reviewed place with one credential path, rather
+# than living only in whatever shell an operator happens to open. Three properties are the
+# point of the file:
+#
+#   * `workflow_dispatch` only. There is no `pull_request` and no `push` trigger, so this can
+#     never become a required check and normal CI stays provider-independent (ADR 0018).
+#   * The result is **observational**. No judge score is thresholded, compared, or allowed to
+#     fail this workflow - the rubric is uncalibrated (ADR 0017 decision 3) and the DEV
+#     benchmark is fixture-backed, so a number from it describes authored fixtures rather than
+#     research quality.
+#   * A provider fault and a low score end differently. `--require-judge-scores` fails the run
+#     when the judge answered *nothing at all* - a wrong model id, an expired key, an endpoint
+#     that is down - which is the failure that otherwise goes green with five dimensions
+#     silently missing everywhere.
+#
+# The credential arrives as a repository secret and is never echoed. Nothing here prints an
+# environment, and the runner logs a model id and an endpoint but never a key.
+name: Evaluation judge (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Judge model id (EVAL_JUDGE_MODEL)"
+        required: true
+        type: string
+      base_url:
+        description: "OpenAI-compatible endpoint for the judge (EVAL_JUDGE_BASE_URL)"
+        required: true
+        default: "https://integrate.api.nvidia.com/v1"
+        type: string
+      tag:
+        description: "Optional benchmark tag to limit the run - e.g. healthy, known-defect"
+        required: false
+        type: string
+
+# Same as CI: this workflow verifies, it does not publish or deploy.
+permissions:
+  contents: read
+
+jobs:
+  judge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.11"
+          enable-cache: true
+      - name: Install locked development dependencies
+        run: uv sync --frozen --extra dev
+      # The judge reads EVAL_JUDGE_MODEL / EVAL_JUDGE_BASE_URL and LLM_API_KEY, exactly as a
+      # person running it locally would (docs/evaluation.md §9). The benchmark is always the
+      # committed fixture set: there is deliberately no `--from-database` input, because that
+      # would put real report text into an uploaded artifact.
+      - name: Run the judge over the committed DEV benchmark
+        env:
+          EVAL_JUDGE_MODEL: ${{ inputs.model }}
+          EVAL_JUDGE_BASE_URL: ${{ inputs.base_url }}
+          LLM_API_KEY: ${{ secrets.EVAL_JUDGE_API_KEY }}
+        run: |
+          uv run python -m eval.run \
+            --judge \
+            --require-judge-scores \
+            --run-id judge \
+            --csv \
+            ${{ inputs.tag && format('--tag {0}', inputs.tag) || '' }}
+      - name: Upload the judge report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-judge-report-${{ github.run_id }}
+          path: measurements/eval/
+          retention-days: 14

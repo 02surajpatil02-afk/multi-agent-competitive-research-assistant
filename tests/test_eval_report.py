@@ -23,7 +23,14 @@ from pathlib import Path
 from eval.judge import JUDGE_DIMENSIONS, JudgeOutcome, JudgeVerdict
 from eval.metrics import MetricResult
 from eval.outputs import RunMetadata
-from eval.report import CSV_COLUMNS, CaseResult, EvalRun, write_csv, write_json
+from eval.report import (
+    CSV_COLUMNS,
+    CaseResult,
+    EvalRun,
+    judge_ran_but_scored_nothing,
+    write_csv,
+    write_json,
+)
 from eval.schema import CaseProblem
 
 _AT = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
@@ -315,3 +322,71 @@ def test_the_summary_lists_the_cases_that_did_not_run_and_the_ones_that_failed()
     assert "missing fixture" in lines
     assert "duplicate case_id" in lines
     assert "source_diversity" in lines
+
+
+# --- 8. Provider health, which is not a quality question ---------------------------------
+
+
+def test_a_judge_that_scored_nothing_is_reported_as_a_provider_fault() -> None:
+    # A wrong model id, an expired key, an endpoint that is down: the report looks calm and
+    # five dimensions are silently missing everywhere.
+    run = _run(_case("a", judge=JudgeOutcome("m", "v1", error="llm_call_failed: unreachable")))
+
+    assert judge_ran_but_scored_nothing(run) is True
+
+
+def test_one_scored_case_is_enough_to_say_the_provider_answered() -> None:
+    # Deliberately not a threshold. How well anything scored is not this predicate's business.
+    run = _run(
+        _case("a", judge=JudgeOutcome("m", "v1", verdict=_verdict(1))),
+        _case("b", judge=JudgeOutcome("m", "v1", error="llm_call_failed: unreachable")),
+    )
+
+    assert judge_ran_but_scored_nothing(run) is False
+
+
+def test_a_run_with_no_judge_at_all_is_not_a_provider_fault() -> None:
+    assert judge_ran_but_scored_nothing(_run(_case("a"))) is False
+
+
+# --- 9. Run identity for comparing two reports -------------------------------------------
+
+
+def test_the_report_names_the_evaluator_version_and_how_long_it_took(tmp_path: Path) -> None:
+    # "Did the system change, or did the ruler?" is the first question two disagreeing reports
+    # raise, and only the evaluator version answers it.
+    from eval.metrics import METRICS_VERSION
+
+    run = EvalRun(
+        run_id="eval-test",
+        started_at=_AT,
+        finished_at=datetime(2026, 8, 19, 12, 0, 3, tzinfo=UTC),
+        benchmark_path="eval/benchmarks/dev.json",
+        benchmark_version="dev-1",
+        split="dev",
+        judge_enabled=False,
+        results=(_case("a"),),
+    )
+
+    body = json.loads(write_json(run, tmp_path / "report.json").read_text(encoding="utf-8"))
+
+    assert body["evaluator_version"] == METRICS_VERSION
+    assert body["duration_seconds"] == 3.0
+
+
+def test_each_case_carries_its_declared_regression_contract(tmp_path: Path) -> None:
+    # It is here so `eval/gate.py` can be a pure function of one report file.
+    run = _run(
+        CaseResult(
+            case_id="defect-one",
+            split="dev",
+            status="failed",
+            metrics=(_metric("source_diversity", 0.2, False),),
+            expect_failing_metrics=("source_diversity",),
+        )
+    )
+
+    body = json.loads(write_json(run, tmp_path / "report.json").read_text(encoding="utf-8"))
+
+    assert body["cases"][0]["expect_failing_metrics"] == ["source_diversity"]
+    assert body["cases"][0]["failed_metrics"] == ["source_diversity"]

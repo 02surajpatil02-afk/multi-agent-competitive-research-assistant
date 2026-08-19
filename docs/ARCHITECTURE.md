@@ -162,7 +162,9 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | Redis: shared rate limiter, caches, URL dedupe | 3 | **Built** (2026-08-17, step 21) — `redisstore.py`. Fail-open caches and URL set, fail-closed limiter (§20 row 29), verified against a real Redis 7 |
 | The offline evaluation subsystem: benchmark schema, DEV benchmark, twelve deterministic metrics, the optional structured judge, and `python -m eval.run` | 4 | **Built** (2026-08-19, block A+B) — `eval/`, [ADR 0017](adr/0017-deterministic-evaluators-and-a-custom-structured-judge.md), `docs/evaluation.md`. It scores **already-produced outputs** and never runs the graph. The judge is off by default, so the default run needs no credential. **The DEV benchmark is fixture-backed and does not yet measure this system's research quality** (evaluation.md §5) |
 | LangSmith trace metadata (`job_id` / `agent` / `model` / `revision` under those names), structured JSON logging | 4 | Planned — steps 24 and 25. Evaluation was built not to depend on either: linkage is by `thread_id`, which LangGraph already sets |
-| Rubric calibration, and eval as a release gate | 4 | Planned — steps 27 and 28. **Deliberately not in block A+B**: a gate needs a distribution to calibrate against, and block A+B is what produces the first one (evaluation.md §14) |
+| The evaluation regression gate in CI, and the manual judge workflow | 4 | **Built** (2026-08-19, block C) — `eval/gate.py`, a seventh `eval` CI job, and `.github/workflows/eval-judge.yml`. **It gates the framework and the committed benchmark contract, not any score**: no percentage, no judge threshold ([ADR 0018](adr/0018-the-ci-evaluation-gate-protects-the-contract-not-the-quality.md)) |
+| Rubric calibration, and eval as a **semantic-quality** release gate | 4 | Planned — steps 27 and 28. Still deferred after block C, and for the same reason: the benchmark it would gate contains no real research, so there is nothing to threshold (evaluation.md §14, §15) |
+| Prometheus / Grafana, or any runtime metrics surface | 4/5 | **Not built, deliberately.** The repository exposes no metrics endpoint and has no client library; the recommended counters are written down for Phase 5's CloudWatch work instead (evaluation.md §18) |
 | AWS deployment, Cognito JWT, CloudWatch alarms | 5 | Planned |
 
 ---
@@ -2443,6 +2445,12 @@ to be duplicated to be correlatable (gl §14).
 is answered offline, over finished jobs, by `eval/` — see **`docs/evaluation.md`** and
 [ADR 0017](adr/0017-deterministic-evaluators-and-a-custom-structured-judge.md).
 
+**And it is deliberately not a third telemetry layer.** The repository exposes no metrics endpoint,
+no Prometheus client and no scrape configuration, and block C did not add any: a counter surface for
+a system with no deployment to scrape would be a second answer to *"is the infrastructure healthy?"*,
+which this section assigns to CloudWatch. The counters worth having when Phase 5 gives the system a
+deployment are listed in `docs/evaluation.md` §18 rather than built.
+
 It is worth stating here because of the no-duplication rule this section just made. Evaluation
 **reads** what these two layers already record — `jobs`, `findings`, `claims`, the audit trail — and
 adds no telemetry of its own, no third store, and no third dashboard. It does not read LangSmith at
@@ -3097,9 +3105,19 @@ third-party page text. So the benchmark exercises the evaluators end to end and 
 and does **not** yet measure this system's research quality. Closing that needs a run whose outputs
 can be committed, which is a decision about publishing report bodies.
 
-**Steps 27 and 28 are untouched and stay in that order.** Block C is where they land, and the reason
-is the one this table already applies to the reflection rubric: a gate needs a distribution to be
-calibrated against, and block A+B is what produces the first one.
+**Block C (2026-08-19) added a CI gate, and it is deliberately not step 28.** The distinction is the
+whole of [ADR 0018](adr/0018-the-ci-evaluation-gate-protects-the-contract-not-the-quality.md). The
+baseline was produced and read before any rule was chosen, and reading it ruled out every percentage:
+each mean describes authored fixtures, eight of twenty-six cases are deliberately broken, and four
+metrics have a scored population under 24. So what ships is a **regression contract** - the benchmark
+parses, every case ran, every metric ran on every case, and each committed output still fails exactly
+the metrics it declares - enforced by `eval/gate.py` from a seventh, provider-free `eval` CI job.
+
+**Steps 27 and 28 are still open and stay in that order.** Step 28's "no dimension may drop more than
+0.3" is a *semantic-quality* gate, and it needs two things that do not exist: a benchmark built from
+real committed outputs, and a rubric that has been checked against a human. `docs/evaluation.md` §15
+is the ten-step path, and its first step is a decision about publishing report bodies rather than an
+engineering task.
 
 ### Phase 5 — AWS
 

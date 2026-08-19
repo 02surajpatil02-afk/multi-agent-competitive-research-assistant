@@ -92,6 +92,18 @@ def test_a_value_outside_the_vocabulary_is_refused(field: str, value: Any) -> No
         EvalCase.model_validate({**_MINIMAL, field: value})
 
 
+def test_the_regression_contract_defaults_to_expecting_no_failure() -> None:
+    # Absent means "this output must fail nothing", which is what makes eighteen healthy cases
+    # need no extra line in the benchmark (ADR 0018).
+    assert EvalCase.model_validate(_MINIMAL).expect_failing_metrics == []
+
+
+def test_the_regression_contract_accepts_the_metrics_a_case_is_known_to_fail() -> None:
+    case = EvalCase.model_validate({**_MINIMAL, "expect_failing_metrics": ["source_diversity"]})
+
+    assert case.expect_failing_metrics == ["source_diversity"]
+
+
 def test_a_required_fact_needs_at_least_one_non_blank_phrase() -> None:
     with pytest.raises(ValueError):
         EvalCase.model_validate({**_MINIMAL, "required_facts": [{"id": "x", "any_of": []}]})
@@ -218,6 +230,15 @@ def test_every_known_defect_case_explains_itself(dev: Benchmark) -> None:
     assert len(defects) >= 5
     for case in defects:
         assert case.notes and "KNOWN DEFECT" in case.notes, case.case_id
+
+
+def test_only_known_defect_cases_declare_failing_metrics(dev: Benchmark) -> None:
+    # The regression contract and the label have to agree, or a reader cannot tell a
+    # deliberate failure from an undocumented one.
+    for case in dev.cases:
+        declared = bool(case.expect_failing_metrics)
+        labelled = "known-defect" in case.tags
+        assert declared == labelled, case.case_id
 
 
 def test_no_dev_case_carries_a_job_id(dev: Benchmark) -> None:

@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from eval.judge import JUDGE_DIMENSIONS, JudgeOutcome
-from eval.metrics import METRIC_NAMES, MetricResult
+from eval.metrics import METRIC_NAMES, METRICS_VERSION, MetricResult
 from eval.outputs import RunMetadata
 from eval.schema import CaseProblem
 
@@ -78,6 +78,14 @@ class CaseResult:
     error: str | None = None
     """Why this case is `skipped` or `errored`. `None` on a case that ran."""
 
+    expect_failing_metrics: tuple[str, ...] = ()
+    """The case's declared regression contract, carried through verbatim.
+
+    It is here so `eval/gate.py` can be a pure function of one report file: the gate compares
+    this against `failed_metrics` and needs nothing else open. It also makes the report
+    self-describing - a reader sees what each case was expected to fail beside what it did.
+    """
+
     @property
     def failed_metrics(self) -> tuple[str, ...]:
         return tuple(metric.metric for metric in self.metrics if metric.passed is False)
@@ -95,6 +103,7 @@ class CaseResult:
             "output_ref": self.output_ref,
             "error": self.error,
             "failed_metrics": list(self.failed_metrics),
+            "expect_failing_metrics": list(self.expect_failing_metrics),
             "metrics": [metric.to_json() for metric in self.metrics],
             "judge": None if self.judge is None else self.judge.to_json(),
             "run_metadata": None if self.metadata is None else self.metadata.to_json(),
@@ -122,11 +131,22 @@ class EvalRun:
     mode. Recorded because two reports over the same benchmark are only comparable when they
     covered the same cases, and that is not visible from the counts."""
 
+    @property
+    def duration_seconds(self) -> float:
+        """How long the run took. Reported because an evaluation that suddenly takes ten times
+        as long has changed in a way no metric shows - and because it is the number that says
+        whether this is still cheap enough to run on every prompt change."""
+        return round((self.finished_at - self.started_at).total_seconds(), 3)
+
     def to_json(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat(),
+            "duration_seconds": self.duration_seconds,
+            # Which ruler produced these numbers. Two reports are only comparable when both
+            # agree, which is why it sits beside the benchmark version rather than inside it.
+            "evaluator_version": METRICS_VERSION,
             "benchmark": {
                 "path": self.benchmark_path,
                 "version": self.benchmark_version,
@@ -320,6 +340,23 @@ class EvalRun:
         if not self.judge_enabled:
             return "disabled (deterministic metrics only, no provider call)"
         return f"{self.judge_model} @ {self.judge_base_url} | rubric {self.judge_rubric_version}"
+
+
+def judge_ran_but_scored_nothing(run: EvalRun) -> bool:
+    """Was the judge asked for, and did it come back with nothing at all?
+
+    **This is a provider-health question, not a quality one**, and the distinction is the whole
+    reason it exists as its own predicate. A judge run where every call failed - a wrong model
+    id, an expired key, an endpoint that is down - produces a report that looks calm: no
+    exception, exit 0, and five dimensions missing everywhere. Low scores and no scores must
+    never end the same way.
+
+    It is deliberately not a threshold. One scored case is enough to answer "did the provider
+    answer"; how well anything scored is not this function's business, and no caller may make
+    it so.
+    """
+    aggregates = run.judge_aggregates()
+    return bool(aggregates["attempted"]) and not aggregates["scored"]
 
 
 # --- Writing it out -------------------------------------------------------------------
