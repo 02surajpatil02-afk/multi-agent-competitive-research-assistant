@@ -1,8 +1,14 @@
 # WHY THIS FILE EXISTS
-#     The local shape of Phase 3's infrastructure: PostgreSQL 16, Redis 7, and LocalStack
-#     standing in for SQS and S3 (ARCHITECTURE.md §17). It starts services and nothing else -
-#     there is no application image here, because the API and the worker are not containerised
-#     yet and a Dockerfile that nothing runs would be a file to maintain for no requirement.
+#     The local shape of Phase 3: the infrastructure - PostgreSQL 16, Redis 7, and LocalStack
+#     standing in for SQS and S3 (ARCHITECTURE.md §17) - and, since step 22b/c, the two
+#     application processes that use it, built from the one image in `Dockerfile`.
+#
+#     **The application services are behind the `app` profile, and that is deliberate.**
+#     `docker compose up -d --wait` still starts infrastructure and nothing else, because that
+#     is the command the `postgres`, `integration` and `redis` test layers are documented
+#     against and those layers run from the host. Nothing about them should have to build an
+#     image. `docker compose --profile app up -d --wait` adds `migrate`, `api` and `worker` on
+#     top of exactly the same infrastructure.
 #
 #     **All four stores have application code behind them.** The API enqueues to the queue and
 #     `python -m worker` consumes it (step 20); the worker caches searches and fetches in Redis,
@@ -10,22 +16,37 @@
 #     and the export node writes `reports/{job_id}.json` to S3, which `GET /jobs/{id}/report`
 #     presigns (step 22a).
 #
-#     `docker compose up -d --wait` is the whole bootstrap. Each service's healthcheck is what
-#     `--wait` waits on, and LocalStack's deliberately checks for the queue and the bucket
-#     rather than for the process - so when the command returns, the resources exist. Startup is
-#     idempotent: the init script converges rather than creating, so running it again is a
-#     no-op.
+#     `docker compose up -d --wait` is the whole infrastructure bootstrap. Each service's
+#     healthcheck is what `--wait` waits on, and LocalStack's deliberately checks for the queue
+#     and the bucket rather than for the process - so when the command returns, the resources
+#     exist. Startup is idempotent: the init script converges rather than creating, so running
+#     it again is a no-op.
 #
 #     Credentials come from the environment with development defaults. They are local-container
 #     values, not secrets: nothing outside this machine can reach these ports, and anything that
 #     is not a local container sets its own (global CLAUDE.md §8).
 #
-#     The three host ports are overridable for one measured reason: a developer machine that
-#     already runs a PostgreSQL - another project's container is enough - refuses the whole
-#     `up` with `Bind for 0.0.0.0:5432 failed`. Set `POSTGRES_PORT` in `.env` and the rest of
-#     the stack is unaffected, because only `DATABASE_URL` names the port.
+#     The host ports are overridable for one measured reason: a developer machine that already
+#     runs a PostgreSQL - another project's container is enough - refuses the whole `up` with
+#     `Bind for 0.0.0.0:5432 failed`. Set `POSTGRES_PORT` in `.env` and the rest of the stack is
+#     unaffected, because only `DATABASE_URL` names the port. `REDIS_PORT`, `LOCALSTACK_PORT`
+#     and `API_PORT` do the same.
+#
+#     **A host port is not how a container reaches a service.** Everything under the `app`
+#     profile addresses PostgreSQL, Redis and LocalStack by their Compose service names on
+#     their real ports, because that is what resolves on the Compose network. `localhost`
+#     inside a container is the container.
 
 name: competitive-research
+
+# The one image, built once and run three ways (ARCHITECTURE.md §19, decision 25). The anchor
+# carries the build and the tag and nothing else: what actually distinguishes the three
+# services is the command they run and the environment they are given, and both are worth
+# reading service by service rather than inheriting.
+x-application: &application
+  build:
+    context: .
+  image: competitive-research:local
 
 services:
   # The database Phase 2 already writes to: the five application tables, and the
@@ -78,13 +99,12 @@ services:
       # The shape of the local queue, read by the init script below. Declared here so the
       # compose file is the one place that says what the local infrastructure looks like.
       #
-      # 1800s is ADR 0010 decision 8's number for local development, and it is derived rather
-      # than chosen: the invariant is
-      #     visibility > MAX_JOB_RUNTIME + 3 x LLM_MAIN_TIMEOUT_S + 10
-      # which at the production job bound (1200s) and this project's slow development endpoint
-      # (LLM_MAIN_TIMEOUT_S=180) requires more than 1750s. `tests/test_local_infrastructure.py`
-      # asserts that arithmetic against `config.py`, so the number cannot drift from the rule
-      # that produced it.
+      # Kept at 1800s by ADR 0015. The worker renews every one third (600s). A failed bounded SQS
+      # call retries halfway through the remaining safe-start window; even the full 93-second call
+      # envelope retries by 900s, preserving the existing 600-second margin rather than waiting
+      # until 1200s. Ownership no longer depends on a static maximum-node prediction.
+      # Keeping the established value avoids coupling this reliability correction to crash-recovery
+      # tuning that belongs with production SQS measurements.
       JOBS_QUEUE_NAME: research-jobs.fifo
       JOBS_DLQ_NAME: research-jobs-dlq.fifo
       JOBS_QUEUE_VISIBILITY_TIMEOUT: 1800
@@ -109,6 +129,172 @@ services:
       timeout: 10s
       retries: 30
       start_period: 20s
+
+  # --- The application, behind the `app` profile ----------------------------------------
+  #
+  # One image, three commands. `migrate` runs to completion first; `api` and `worker` then run
+  # against a schema that is already current, which is guidelines §19's deploy ordering
+  # expressed in the one place that can enforce it locally.
+
+  # `alembic upgrade head`, as its own one-off task (guidelines §19). **Neither the API nor
+  # the worker migrates**, and that is the point rather than a convenience: two processes
+  # racing `alembic upgrade head` against one database is a lock fight at best and a partly
+  # applied schema at worst, and in the deployment this is a separate ECS task that must exit
+  # 0 before the new service revision starts. `service_completed_successfully` below is the
+  # local shape of exactly that rule.
+  #
+  # It migrates the five application tables and nothing else. **LangGraph's checkpointer owns
+  # its own tables through `setup()`**, which the worker calls at startup and Alembic never
+  # touches (guidelines §19, and the deny-list in database/migrations/env.py).
+  migrate:
+    <<: *application
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      # The one variable Alembic needs. A migration does not need an LLM key, a queue or a
+      # bucket, and giving it none is the least-privilege table (guidelines §13) at the one
+      # point where it costs nothing.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-research}:${POSTGRES_PASSWORD:-research}@postgres:5432/${POSTGRES_DB:-research}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # One shot. A migration that failed should stay failed and be read, not retried in a loop
+    # against a database it has already half-changed.
+    restart: "no"
+    profiles: ["app"]
+
+  # `uvicorn app:app`. The control plane: it writes rows, enqueues pointer messages, and signs
+  # URLs. **No graph, no LLM client, no Tavily key** (ADR 0012) - which is why the environment
+  # below has four entries where the worker's has nine, and why that difference is worth
+  # looking at rather than tidying away.
+  api:
+    <<: *application
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-research}:${POSTGRES_PASSWORD:-research}@postgres:5432/${POSTGRES_DB:-research}
+      # Read for one thing: `/health` reports `checks.redis`, which is how a deployment finds
+      # out its workers cannot work. The API takes no token and caches nothing.
+      REDIS_URL: redis://redis:6379/0
+      # The queue and the bucket the `localstack` service declares above, addressed by service
+      # name. The names are repeated rather than interpolated because that declaration is the
+      # init script's input and not a compose variable - `tests/test_container_image.py` is
+      # what keeps the two from drifting.
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/research-jobs.fifo
+      S3_BUCKET: research-reports
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_ENDPOINT_URL: http://localstack:4566
+      # **Where a browser reaches the same bucket**, which is not where this container does.
+      # `GET /jobs/{id}/report` signs a URL for a client outside the Compose network, and
+      # SigV4 covers the host - so the address has to be right before the signature exists,
+      # not rewritten into the URL afterwards. Unset against real AWS, where the bucket's
+      # address is the same from both sides.
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:${LOCALSTACK_PORT:-4566}
+      # boto3 signs every request and refuses to build a client without something to sign
+      # with. LocalStack ignores the values (.env.example says so); these are placeholders,
+      # not credentials.
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      # The hashed key table (guidelines §16). The two entries below are a LOCAL DEVELOPMENT
+      # table whose plaintext keys are published in .env.example - they exist so a fresh
+      # checkout can call the API, and they must never reach a deployment, where the value
+      # comes from Secrets Manager. Set AUTH_KEYS in the environment to replace them.
+      AUTH_KEYS: ${AUTH_KEYS:-{"2e967d62fb9e8976e0138a32394affa1a9f69ea2590f341a1b2344d986f96ceb":{"user_id":"11111111-1111-4111-8111-111111111111","role":"submitter"},"e83bad8b60abd4cd1e58a945f9a3e2da369b809048116b126e7b353c1e14e68d":{"user_id":"22222222-2222-4222-8222-222222222222","role":"reviewer"}}}
+      APP_ENV: local
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      # **Loopback, not every interface.** `- "8000:8000"` binds 0.0.0.0, which publishes this
+      # API to every machine on the developer's network - and it is an API whose key table is
+      # two published development keys. `127.0.0.1:` keeps it reachable from this machine and
+      # from nowhere else, which is the whole requirement locally. A deployment publishes
+      # nothing this way: the task sits behind a target group (ARCHITECTURE.md §18).
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Not because the API calls Redis - it does not - but because `/health` reports it. A
+      # task that starts before Redis answers reports `degraded` truthfully and needlessly.
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # `python` rather than `curl`, because the runtime image has one and not the other, and
+      # adding a package to make a health check readable is the wrong trade. `urlopen` raises
+      # on the 503 that `/health` answers with when a dependency is down, so `degraded` really
+      # does mark the container unhealthy.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3)
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    profiles: ["app"]
+
+  # `python -m worker`. The only process that constructs an `LLMClient` or executes a node,
+  # and therefore the only one that needs an LLM endpoint and a search key. **No port**: it
+  # serves nothing and makes no authorization decision (ARCHITECTURE.md §19).
+  worker:
+    <<: *application
+    command: ["python", "-m", "worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-research}:${POSTGRES_PASSWORD:-research}@postgres:5432/${POSTGRES_DB:-research}
+      # Worker-required. The shared rate limiter fails closed, so this process refuses to
+      # start when Redis does not answer (guidelines §11).
+      REDIS_URL: redis://redis:6379/0
+      # The queue and the bucket the `localstack` service declares above, addressed by service
+      # name. The names are repeated rather than interpolated because that declaration is the
+      # init script's input and not a compose variable - `tests/test_container_image.py` is
+      # what keeps the two from drifting.
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/research-jobs.fifo
+      S3_BUCKET: research-reports
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      # **Passed through from the environment, never defaulted here.** These four are real
+      # credentials for a real endpoint, and a compose file in a repository is not a place a
+      # credential may have a value. Unset, `python -m worker` refuses to start and names the
+      # first one it is missing (`worker.required_credentials`) - which is the behaviour that
+      # should be visible, rather than a placeholder that starts a worker able to take a job
+      # it cannot run.
+      LLM_BASE_URL:
+      LLM_MODEL:
+      LLM_FAST_MODEL:
+      LLM_API_KEY:
+      TAVILY_API_KEY:
+      APP_ENV: local
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # ARCHITECTURE.md §19's worker row, locally: SIGTERM stops the next receive and the
+    # invocation in flight is allowed to return, checkpointing per node as it goes.
+    #
+    # **120s, matching the `stopTimeout` the production task definition must set** (§19). This is
+    # Fargate's maximum graceful-stop opportunity, not a guarantee that the current node finishes.
+    # The heartbeat continues while that node legitimately completes. ADR 0016's PostgreSQL job
+    # lock fences a redelivery if queue ownership expires first; after the synchronous checkpoint
+    # both lock and heartbeat stop so the unacknowledged message can resume safely.
+    #
+    # **It is mitigation, not a fix.** A node still in flight at 120s is SIGKILLed exactly as it
+    # was at 30s; what changes is how often that happens. The message is never deleted either
+    # way, so redelivery remains the recovery path - and the one case redelivery cannot cover,
+    # a hard kill on the *final* delivery, is still owned by the Phase 5 reconciliation sweep
+    # (ADR 0010 decision 9). ADR 0015's heartbeat and ADR 0016's execution fence close the live
+    # overlap race, not this final-delivery operational limitation.
+    stop_grace_period: 120s
+    profiles: ["app"]
+
 
 volumes:
   postgres-data:

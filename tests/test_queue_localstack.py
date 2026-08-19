@@ -19,9 +19,9 @@ WHY THIS FILE EXISTS
     difference from AWS.
 
     **Two kinds of test, deliberately not mixed.** The first few read the queue Compose
-    *declares*, because that is the one the worker will attach to and its numbers are what ADR
-    0010 derived. The rest create a throwaway queue with a one-second visibility timeout, so a
-    redelivery is a test that takes a second rather than half an hour.
+    *declares*, because that is the lease the worker renews. The rest create a throwaway queue
+    with a one-second visibility timeout, so redelivery and lease-extension tests take seconds
+    rather than half an hour.
 
     **No AWS credentials, and no AWS.** The fixture supplies the placeholder credentials boto3
     insists on and LocalStack ignores; nothing here can reach a real account, because
@@ -88,11 +88,6 @@ matches the design - and reading the same file the queue was built from would ag
 however it changed."""
 
 REGION = "ap-south-1"
-DEVELOPMENT_MAIN_TIMEOUT_S = "180"
-"""What `.env` sets locally, and what ADR 0010 decision 8's second row sizes the local queue's
-visibility timeout against. Restated here for the same reason `tests/test_local_infrastructure`
-restates it: `.env` is gitignored."""
-
 _ENV = {
     "LLM_BASE_URL": "https://example.invalid/v1",
     "LLM_MODEL": "main-model",
@@ -258,16 +253,12 @@ def test_the_job_queue_gives_up_after_three_deliveries(compose_queue: JobQueue) 
 def test_the_worker_would_start_against_the_queue_compose_creates(
     compose_queue: JobQueue,
 ) -> None:
-    """ADR 0010 decision 8's inequality, checked by the code that refuses to start without it.
+    """The worker derives its heartbeat from the attributes the queue actually has."""
+    settings = check_queue(compose_queue)
 
-    `tests/test_local_infrastructure.py` already checks the same arithmetic against the number
-    written in `docker-compose.yml`. This checks it against the number the queue **has**, which
-    is the one that matters if the bootstrap script and the compose file ever disagree.
-    """
-    development = load_config({**_ENV, "LLM_MAIN_TIMEOUT_S": DEVELOPMENT_MAIN_TIMEOUT_S})
-
-    assert check_queue(compose_queue, development) == 3
-    assert visibility_timeout(compose_queue.attributes()) == 1800
+    assert settings.final_delivery_at == 3
+    assert settings.visibility_timeout_s == 1800
+    assert visibility_timeout(compose_queue.attributes()) == settings.visibility_timeout_s
 
 
 # --- 2. What the boundary puts on the wire ----------------------------------------------
@@ -409,6 +400,27 @@ def test_a_message_that_is_not_deleted_comes_back_with_a_higher_delivery_count(
 
     assert (first.receive_count, second.receive_count) == (1, 2)
     assert first.job_id == second.job_id
+    queue.delete(second)
+
+
+def test_visibility_extension_keeps_the_message_owned_then_disappearance_allows_redelivery(
+    throwaway: tuple[JobQueue, str, str], sqs: Any
+) -> None:
+    """The real ChangeMessageVisibility boundary and the heartbeat-disappearance recovery."""
+    queue, url, _ = throwaway
+    job_id = new_job_id()
+    queue.send_start(job_id=job_id, user_id=USER, idempotency_key="key-1")
+
+    first = _receive(queue)
+    queue.extend_visibility(first, visibility_timeout_s=3)
+
+    time.sleep(1.5)  # beyond the queue's original one-second visibility
+    assert _peek(sqs, url) == []
+
+    time.sleep(2.0)  # no further heartbeat: the renewed lease now expires
+    second = _receive(queue)
+    assert second.receive_count == 2
+    assert second.job_id == first.job_id
     queue.delete(second)
 
 

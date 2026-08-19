@@ -10,6 +10,7 @@ __pycache__/
 # Tool caches
 .mypy_cache/
 .pytest_cache/
+.test-tmp/
 .ruff_cache/
 
 # Real-job measurements (scripts/measure_jobs.py). jobs.jsonl carries fetched third-party

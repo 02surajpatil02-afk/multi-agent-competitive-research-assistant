@@ -1,6 +1,7 @@
 # ADR 0005 — Graph-time persistence: one transaction per node event, keyed writes, loud failures
 
-- **Status:** Accepted
+- **Status:** Accepted. The persistence decisions remain current; the static-visibility premise in
+  Context is superseded by [ADR 0015](0015-visibility-leases-replace-static-duration-ownership.md).
 - **Date:** 2026-08-15
 - **Affects:** `database/queries.py` · `graph/build.py` · `docs/ARCHITECTURE.md` §8, §9, §11, §15 ·
   `docs/engineering-guidelines.md` §9, §17

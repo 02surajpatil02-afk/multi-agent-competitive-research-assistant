@@ -33,6 +33,7 @@ import llm_client
 from config import Config, load_config
 from llm_client import (
     JOB_FATAL_REASONS,
+    MAX_RETRY_AFTER_S,
     CallBudget,
     LLMCallFailed,
     LLMClient,
@@ -212,6 +213,25 @@ def test_an_empty_completion_is_treated_as_invalid_output() -> None:
     assert len(fake.completions.calls) == 2
 
 
+def test_each_validation_attempt_has_its_own_bounded_transport_retries(
+    slept: list[float],
+) -> None:
+    """The retry layers are nested: validation does not share a transport counter."""
+    invalid = json.dumps({"next": "reflection", "reason": "not an allowed route"})
+    client, fake = _client(
+        timeout_error(),
+        timeout_error(),
+        invalid,
+        timeout_error(),
+        timeout_error(),
+        _VALID,
+    )
+
+    assert _ask(client).next == "planner"
+    assert len(fake.completions.calls) == 6
+    assert slept == [2.0, 8.0, 2.0, 8.0]
+
+
 def test_validation_retries_are_counted_against_the_budget() -> None:
     bad = json.dumps({"reason": "missing the next field"})
     client, _ = _client(bad, _VALID)
@@ -287,6 +307,24 @@ def test_a_429_honours_retry_after_when_the_endpoint_sends_it(slept: list[float]
     assert slept == [12.0]
 
 
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("12", 12.0),
+        (str(MAX_RETRY_AFTER_S), MAX_RETRY_AFTER_S),
+        (str(MAX_RETRY_AFTER_S + 120), MAX_RETRY_AFTER_S),
+    ],
+)
+def test_numeric_retry_after_is_honoured_only_through_the_policy_cap(
+    header: str, expected: float, slept: list[float]
+) -> None:
+    client, _ = _client(rate_limit_error(retry_after=header), _VALID)
+
+    _ask(client)
+
+    assert slept == [expected]
+
+
 def test_a_429_without_retry_after_uses_the_documented_schedule(slept: list[float]) -> None:
     client, _ = _client(rate_limit_error(), rate_limit_error(), rate_limit_error(), _VALID)
 
@@ -301,6 +339,31 @@ def test_an_unparseable_retry_after_falls_back_to_the_schedule(slept: list[float
 
     assert _ask(client).next == "planner"
     assert slept == [2.0]
+
+
+@pytest.mark.parametrize("header", ["-1", "nan", "inf", "-inf"])
+def test_an_invalid_numeric_retry_after_falls_back_to_the_schedule(
+    header: str, slept: list[float]
+) -> None:
+    client, _ = _client(rate_limit_error(retry_after=header), _VALID)
+
+    assert _ask(client).next == "planner"
+    assert slept == [2.0]
+
+
+def test_repeated_provider_retry_after_values_cannot_create_an_unbounded_wait(
+    slept: list[float],
+) -> None:
+    client, _ = _client(
+        rate_limit_error(retry_after="86400"),
+        rate_limit_error(retry_after="86400"),
+        rate_limit_error(retry_after="86400"),
+        _VALID,
+    )
+
+    _ask(client)
+
+    assert slept == [MAX_RETRY_AFTER_S] * 3
 
 
 def test_rate_limiting_that_does_not_clear_fails_the_job(slept: list[float]) -> None:

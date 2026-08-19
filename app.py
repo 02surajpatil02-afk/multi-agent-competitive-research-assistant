@@ -23,6 +23,8 @@ WHO CALLS IT
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -56,6 +58,7 @@ def create_application(
     keys: dict[str, Identity] | None = None,
     redis: RedisProbe | None = None,
     artifacts: ReportPresigner | None = None,
+    on_shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Wire the routes to their collaborators.
 
@@ -69,8 +72,24 @@ def create_application(
     `artifacts` is what `GET /jobs/{id}/report` signs a URL with (step 22a), optional on the
     same terms. It is a **presigner**: the API's task role may sign for an object and the
     worker's writes one, and the Protocol the route layer declares is that half.
+
+    `on_shutdown` releases what the caller opened, once uvicorn has drained its requests. It
+    exists for one measured reason, found when the API was first containerised (step 22b/c):
+    the checkpoint reader's `ConnectionPool` was never closed, and psycopg's own finalizer
+    then waits **5 seconds per pool thread** at interpreter exit - four threads, so twenty
+    seconds against a ten-second stop grace period. The container logged a clean uvicorn
+    shutdown and was then SIGKILLed with 137 every single time. A test asserts this fires.
     """
-    application = FastAPI(title="Competitive Research API")
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
+        """Nothing to do on the way up - everything is built before this function is called.
+        The way down is the half that had been missing."""
+        yield
+        if on_shutdown is not None:
+            on_shutdown()
+
+    application = FastAPI(title="Competitive Research API", lifespan=lifespan)
     application.state.deps = RouteDeps(
         config=config,
         engine=engine,
@@ -122,28 +141,37 @@ def create_application(
     return application
 
 
-def _checkpoint_reader(database_url: str) -> PostgresSaver:  # pragma: no cover
+def _checkpoint_reader(database_url: str) -> tuple[PostgresSaver, ConnectionPool[Any]]:
     """A `PostgresSaver` the API only ever reads through (ADR 0012 decisions 1 and 3).
 
     **`setup()` is deliberately not called here.** It is DDL for tables LangGraph owns, and
     guidelines §13's least-privilege table gives the API no reason to run migrations. The worker
     calls it at startup; this process attaches to what the worker created.
 
-    The pool lives as long as the process, which is why this is not a context manager, and it is
-    small for the same reason the worker's is: the API's reads are one row.
+    The pool lives as long as the process, which is why this is not a context manager - but it
+    **is returned alongside the saver**, because "as long as the process" has to include the
+    end of the process. A pool nobody closes leaves psycopg waiting five seconds per thread at
+    interpreter exit, which is longer than a container's stop grace period; `_build` hands the
+    close to the lifespan above. It is small for the same reason the worker's is: the API's
+    reads are one row.
 
     `state_serde()` is shared with the worker unchanged - it exists precisely because "the
     answer does not depend on where the bytes go", and using it is what lets this process read
     what the worker wrote.
     """
-    pool = ConnectionPool(
+    pool: ConnectionPool[Any] = ConnectionPool(
         database_url,
         connection_class=Connection[DictRow],
         min_size=1,
         max_size=2,
         kwargs={"autocommit": True, "row_factory": dict_row},
+        # Stated rather than defaulted: psycopg is changing this default and warns about it, and
+        # the answer here is not the worker's. `postgres_checkpointer` opens lazily because it is
+        # a context manager; this pool is opened at startup because a first request should not
+        # pay for a connection, and it is closed by the lifespan above.
+        open=True,
     )
-    return PostgresSaver(pool, serde=state_serde())
+    return PostgresSaver(pool, serde=state_serde()), pool
 
 
 def _build() -> FastAPI:  # pragma: no cover - exercised by running the server
@@ -158,10 +186,11 @@ def _build() -> FastAPI:  # pragma: no cover - exercised by running the server
     database_url = required(config.database_url, "DATABASE_URL")
     queue_url = required(config.sqs_queue_url, "SQS_QUEUE_URL")
     bucket = required(config.s3_bucket, "S3_BUCKET")
+    checkpoints, pool = _checkpoint_reader(database_url)
     return create_application(
         config=config,
         engine=create_database_engine(database_url),
-        checkpoints=_checkpoint_reader(database_url),
+        checkpoints=checkpoints,
         queue=build_queue(
             queue_url, region=config.aws_region, endpoint_url=config.aws_endpoint_url
         ),
@@ -170,9 +199,19 @@ def _build() -> FastAPI:  # pragma: no cover - exercised by running the server
         redis=RedisHealth(build_redis(config.redis_url)),
         # Presigning only. The API holds no report bytes and writes no object; the worker is
         # the process with `PutObject` (guidelines §13).
+        #
+        # **Signed against the address the client will use**, which is not always the address
+        # this process would call. SigV4 covers the host, so it has to be right before the
+        # signature exists rather than patched into the URL afterwards. Against real AWS both
+        # are None and this reads exactly as it did.
         artifacts=build_artifact_store(
-            bucket, region=config.aws_region, endpoint_url=config.aws_endpoint_url
+            bucket,
+            region=config.aws_region,
+            endpoint_url=config.s3_public_endpoint_url or config.aws_endpoint_url,
         ),
+        # The one thing this process opens that will not close itself. Without it the container
+        # never exits on SIGTERM - see `create_application`.
+        on_shutdown=pool.close,
     )
 
 

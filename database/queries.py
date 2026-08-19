@@ -29,9 +29,10 @@ WHY THIS FILE EXISTS
     exception: it is append-only, and a node that genuinely ran twice truthfully has two
     rows.
 
-    The read-then-write in `_write_findings` is safe because one job has one writer. SQS's
-    visibility timeout (25 min) deliberately exceeds the hard job limit (20 min) precisely
-    so that two workers never process one job at once (ARCHITECTURE.md §11).
+    The read-then-write in `_write_findings` is safe only because one job has one execution writer.
+    ADR 0016 enforces that precondition with a session-scoped PostgreSQL advisory lock spanning the
+    complete worker invocation. SQS visibility renewal normally prevents redelivery; the database
+    lock remains the fence when queue ownership becomes unsafe while a node is still finishing.
 
 WHO CALLS IT
     The graph nodes in graph/build.py, as the job runs. The FastAPI routes from step 18,

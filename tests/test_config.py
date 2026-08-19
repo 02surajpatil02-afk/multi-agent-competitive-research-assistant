@@ -111,7 +111,7 @@ def test_required_returns_the_value_when_it_is_set() -> None:
     [
         ("llm_rpm_limit", 40),
         ("llm_main_timeout_s", 60.0),  # guidelines §17's main tier stays the default
-        ("max_job_runtime", 1200),  # guidelines §17's whole-job row; configured, not enforced
+        ("max_job_runtime", 1200),  # the worker's between-node no-new-node deadline
         ("redis_url", "redis://localhost:6379/0"),
         ("aws_region", "ap-south-1"),
         ("langsmith_tracing", False),

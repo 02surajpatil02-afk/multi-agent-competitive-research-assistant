@@ -313,6 +313,7 @@ dependencies = [
 dev = [
     { name = "mypy" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
@@ -331,6 +332,7 @@ requires-dist = [
     { name = "pypdf", specifier = "==6.15.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.1.1" },
     { name = "python-dotenv", specifier = "==1.2.2" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = "==6.0.3" },
     { name = "redis", specifier = "==8.1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.2" },
     { name = "sqlalchemy", specifier = "==2.0.52" },

@@ -71,8 +71,12 @@ MAX_LLM_CALLS_PER_SUBTOPIC = 3
 source, so a page that cannot be extracted costs one source rather than the subtopic."""
 
 SUBTOPIC_TIMEOUT_S = 120.0
-"""guidelines §17. Checked between sources rather than enforced mid-request: the tools own
-their own timeouts, and this bounds how many of them one subtopic may spend end to end."""
+"""guidelines §17's no-new-fetch deadline for one subtopic.
+
+It is checked between sources rather than enforced mid-request: the tools own finite request
+timeouts, and extraction calls already admitted by this deadline run to completion concurrently.
+It therefore bounds additional work, not the subtopic's wall-clock completion time.
+"""
 
 _SYSTEM = (
     "You extract research findings from one web page.\n"

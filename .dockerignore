@@ -1,0 +1,66 @@
+# WHY THIS FILE EXISTS
+#     The build context is what `docker build` uploads to the daemon and what any COPY in the
+#     Dockerfile can reach. Two different things depend on this list.
+#
+#     **Nothing here may carry a secret.** The Dockerfile copies named paths rather than `.`,
+#     so this list is the second lock rather than the only one - but a `.env` inside the
+#     context is one careless `COPY . .` away from being a layer that cannot be deleted,
+#     and an image layer is not a place a credential can be taken back out of.
+#
+#     **The context is also the build's cost.** `.venv/` and `.git/` are the two largest
+#     directories in this repository and neither belongs in an image, so excluding them is
+#     what makes the build fast enough to run repeatedly.
+#
+#     `docs/` is excluded for the first reason rather than the second: two of the files in it
+#     are gitignored personal working documents (CLAUDE.md's note on
+#     engineering-guidelines.md and interview-prep.md), and an image is a worse place to leak
+#     them from than a repository.
+
+# Version control
+.git
+.gitattributes
+.gitignore
+
+# Secrets, and anything shaped like one. `.env.example` is only a template, but the image has
+# no use for it either, so the whole family stays out.
+.env
+.env.*
+*.pem
+*.key
+
+# The developer's virtual environment. The image builds its own from uv.lock, and this one
+# holds Windows binaries that could not run in a Linux container anyway.
+.venv
+*.egg-info
+
+# Bytecode and tool caches
+__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# The test suite. It is not runtime code, and it carries the harnesses, the recorded web
+# responses and the fakes - none of which a production process may import.
+tests
+
+# Real-job measurement output: fetched third-party page text and report bodies (gitignored).
+measurements
+
+# Working documents, and the instruction file beside them. `docs/engineering-guidelines.md`,
+# `docs/interview-prep.md` and `CLAUDE.md` are all gitignored local files, and a build context
+# is sent whole to the daemon - which on a remote or shared builder is somewhere else
+# entirely.
+docs
+CLAUDE.md
+
+# Editor and OS files
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# The local infrastructure definition. Compose builds this image; the image does not run
+# Compose.
+docker-compose.yml
+docker

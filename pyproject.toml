@@ -92,6 +92,15 @@ dev = [
     "pytest==9.1.1", # the application test suite (CLAUDE.md commands, guidelines §18)
     "ruff==0.16.2",  # lint stage of the CI pipeline (guidelines §19)
     "mypy==2.3.0",   # type stage of the CI pipeline (guidelines §19)
+    # Reads docker-compose.yml as a document rather than as text, for the Compose contract
+    # tests added with the application image (step 22b/c). What they assert - that `api` and
+    # `worker` resolve to the same image, that the worker publishes no port, that every
+    # internal URL names a Compose service - is structure, and a regex over YAML is the kind
+    # of test that passes for the wrong reason. Anchors and merge keys make that worse: the
+    # shared build block is only visible after the document is parsed. Already present
+    # transitively under langgraph; pinned here because tests/ imports it directly, which is
+    # the same argument httpx carries above. **dev only** - no runtime module imports it.
+    "pyyaml==6.0.3",
 ]
 
 [build-system]
@@ -108,14 +117,18 @@ packages = ["agents", "database", "graph", "routes", "tools"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# Three markers, so a failure says which layer broke. Everything unmarked is the offline
-# suite: no service, no network (guidelines §18). Each marked layer needs one Compose service
-# and skips when its own variable is unset, so `pytest` stays offline by default and
+# Four markers, so a failure says which layer broke. Everything unmarked is the offline
+# suite: no service, no network (guidelines §18). Each marked layer needs something Compose
+# starts and skips when its own variable is unset, so `pytest` stays offline by default and
 # `pytest -m <marker>` runs exactly that layer.
 markers = [
     "postgres: needs the real PostgreSQL 16 from docker-compose.yml, via TEST_DATABASE_URL",
     "integration: needs LocalStack SQS from docker-compose.yml, via SQS_ENDPOINT_URL",
     "redis: needs the real Redis 7 from docker-compose.yml, via TEST_REDIS_URL",
+    # The fourth is the only one that needs the application image rather than a service: it
+    # drives the `app` profile's containers, so it needs `docker compose --profile app up`
+    # first. Opted in with TEST_CONTAINER_STACK.
+    "container: needs the built image and the `app` profile up, via TEST_CONTAINER_STACK",
 ]
 
 [tool.ruff]
@@ -123,7 +136,7 @@ line-length = 100
 target-version = "py313"
 # The documentation is authoritative and its Python blocks are illustrative sketches, not
 # code. Formatting them rewrites the specification, so ruff stays out of *.md entirely.
-extend-exclude = ["*.md"]
+extend-exclude = ["*.md", ".test-tmp"]
 
 [tool.ruff.lint]
 select = [
@@ -151,4 +164,11 @@ ignore_missing_imports = true
 # so the untyped surface stops at that one boundary - the same argument as tavily above.
 [[tool.mypy.overrides]]
 module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+# PyYAML ships no py.typed marker and its stubs are a separate package. One test module reads
+# docker-compose.yml through it, and converts the document to a typed mapping in one helper,
+# so the untyped surface stops at that helper - the same argument again.
+[[tool.mypy.overrides]]
+module = "yaml.*"
 ignore_missing_imports = true

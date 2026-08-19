@@ -25,9 +25,9 @@ queue_url() {
     awslocal sqs get-queue-url --queue-name "$1" --query QueueUrl --output text
 }
 
-# FIFO is the decision that keeps one job to one writer (ADR 0010 decision 4), and it can only
-# be set when the queue is created - which is why this is a create-if-absent rather than a
-# create-and-ignore-the-error.
+# FIFO preserves one job's message order (ADR 0010 decision 4), and it can only be set when the
+# queue is created. ADR 0016's PostgreSQL execution lock is the same-job writer fence if an expired
+# delivery overlaps its redelivery. This remains create-if-absent rather than create-and-ignore.
 ensure_fifo_queue() {
     if ! queue_url "$1" >/dev/null 2>&1; then
         awslocal sqs create-queue --queue-name "$1" --attributes FifoQueue=true >/dev/null

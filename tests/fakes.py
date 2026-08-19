@@ -389,6 +389,8 @@ class FakeQueue:
     def __init__(self) -> None:
         self.sent: list[SentMessage] = []
         self.deleted: list[str] = []
+        self.visibility_extensions: list[tuple[str, int]] = []
+        self.renewal_script: list[Exception | None] = []
         self.fail_next = False
         self._inbox: list[SentMessage] = []
         self._in_flight: list[SentMessage] = []
@@ -457,6 +459,14 @@ class FakeQueue:
         self._in_flight = [
             held for held in self._in_flight if held.deduplication_id != message.receipt_handle
         ]
+
+    def extend_visibility(self, message: Any, *, visibility_timeout_s: int) -> None:
+        """Record the heartbeat operation, optionally raising a scripted queue failure."""
+        self.visibility_extensions.append((message.receipt_handle, visibility_timeout_s))
+        if self.renewal_script:
+            failure = self.renewal_script.pop(0)
+            if failure is not None:
+                raise failure
 
     # --- what a test asks ---
 

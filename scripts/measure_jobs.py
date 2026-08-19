@@ -582,7 +582,7 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 def _number(row: dict[str, Any], key: str) -> float:
     value = row.get(key)
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    return float(value) if isinstance(value, int | float) else 0.0
 
 
 def _share(part: float, whole: float) -> str:
@@ -625,7 +625,7 @@ def _score_summary(update: object) -> str:
     scores = update.get("reflection_scores")
     if isinstance(scores, list) and scores:
         weighted = getattr(scores[-1], "weighted_score", None)
-        if isinstance(weighted, (int, float)):
+        if isinstance(weighted, int | float):
             return f"score {weighted:.2f} -> {getattr(scores[-1], 'route', '?')}"
     flag = update.get("quality_flag")
     return f"quality_flag {flag}" if flag else ""

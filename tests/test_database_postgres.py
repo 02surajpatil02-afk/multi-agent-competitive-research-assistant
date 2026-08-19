@@ -55,6 +55,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from database import queries
+from database.locks import JobExecutionLock, job_execution_lock_key
 from database.schema import (
     AuditAction,
     audit_events,
@@ -949,6 +950,69 @@ def test_the_application_engine_carries_the_five_second_statement_timeout(pg: En
     while the query keeps running."""
     with pg.connect() as conn:
         assert conn.execute(sa.text("SHOW statement_timeout")).scalar_one() == "5s"
+
+
+# --- Per-job worker execution ownership -----------------------------------------------
+
+
+def test_job_execution_lock_serializes_one_job_but_not_unrelated_jobs(pg: Engine) -> None:
+    job_j = "11111111-1111-4111-8111-111111111111"
+    job_k = "22222222-2222-4222-8222-222222222222"
+
+    with JobExecutionLock(pg, job_j) as owner_a:
+        assert owner_a.try_acquire()
+        with JobExecutionLock(pg, job_j) as owner_b:
+            assert not owner_b.try_acquire()
+            with JobExecutionLock(pg, job_k) as unrelated:
+                assert unrelated.try_acquire()
+
+        # Committing unrelated application transactions cannot shorten a session lock.
+        with pg.begin() as connection:
+            assert connection.execute(sa.text("SELECT 1")).scalar_one() == 1
+        with JobExecutionLock(pg, job_j) as still_blocked:
+            assert not still_blocked.try_acquire()
+
+    with JobExecutionLock(pg, job_j) as owner_b_after_release:
+        assert owner_b_after_release.try_acquire()
+
+
+def test_postgres_releases_a_job_lock_when_the_owner_connection_disappears(pg: Engine) -> None:
+    job_id = "33333333-3333-4333-8333-333333333333"
+    owner = JobExecutionLock(pg, job_id)
+    assert owner.try_acquire()
+    assert owner.backend_pid is not None
+    owner_pid = owner.backend_pid
+
+    with pg.connect() as killer:
+        assert killer.execute(
+            sa.text("SELECT pg_terminate_backend(:pid)"), {"pid": owner.backend_pid}
+        ).scalar_one()
+
+    with JobExecutionLock(pg, job_id) as replacement:
+        deadline = time.monotonic() + 3.0
+        while not replacement.try_acquire() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert replacement.acquired
+
+    # Release invalidates the dead SQLAlchemy connection; no ownership row needs cleanup.
+    owner.release()
+    with pg.connect() as connection:
+        lock_rows = connection.execute(
+            sa.text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = :pid"),
+            {"pid": owner_pid},
+        ).scalar_one()
+    assert lock_rows == 0
+
+
+def test_job_execution_lock_key_is_stable_and_collisions_fail_safe() -> None:
+    job_id = "11111111-1111-4111-8111-111111111111"
+
+    assert job_execution_lock_key(job_id) == job_execution_lock_key(job_id)
+    assert job_execution_lock_key(job_id) == -548867897566026953
+    assert job_execution_lock_key(job_id) != job_execution_lock_key(
+        "22222222-2222-4222-8222-222222222222"
+    )
+    assert -(2**63) <= job_execution_lock_key(job_id) < 2**63
 
 
 # --- Helpers --------------------------------------------------------------------------

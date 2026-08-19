@@ -10,8 +10,12 @@
 > answers a presigned URL (`artifacts.py`, step 22a), which is [ADR
 > 0009](adr/0009-recovering-an-export-that-failed-after-approval.md) built.
 >
-> **What is not built:** the application image and its two entrypoints, and CI (the rest of step 22,
-> and step 23), no AWS at all (Phase 5), and no eval set (Phase 4). §1's "built vs planned" table is
+> Also since **2026-08-18**, both processes run from **one application image** with two commands
+> (`Dockerfile`, step 22b/c), and Compose's `app` profile runs them beside the infrastructure. Step
+> 22 is complete.
+>
+> **What is not built:** CI (step 23) — so the image is only ever built locally and pushed nowhere —
+> no AWS at all (Phase 5), and no eval set (Phase 4). §1's "built vs planned" table is
 > the per-capability answer, and every section below marks what is implemented where the distinction
 > matters.
 >
@@ -147,11 +151,12 @@ the CLAUDE.md stack table. **None of it is deployed.**
 | MCP protocol client or server | — | **Not built, and not scheduled.** The boundary is in-process (§7) |
 | Postgres checkpointer; `jobs` / `findings` / `claims` / `claim_sources` / `audit_events` and their Alembic migration; the audit trail written as the graph runs; the export gate's write to `jobs.report_json` | 2 | **Built** (2026-08-15, steps 13–16) — `database/`, `graph/build.py`. Both stores are injected: the graph runs exactly as it did in Phase 1 without them ([ADR 0005](adr/0005-graph-time-persistence-semantics.md)) |
 | `POST /jobs/{id}/approve`, the reviewer payload, the API and API-key auth | 2 | **Built** (2026-08-16, steps 17–18) — `routes/`, `app.py`. The gate's resume moved to the worker on 2026-08-17 ([ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md)) |
-| Docker Compose: PostgreSQL 16, Redis 7, LocalStack for SQS + S3 | 3 | **Built** (2026-08-17, stage 1) — `docker-compose.yml`, `docker/`. Services only; there is no application image |
+| Docker Compose: PostgreSQL 16, Redis 7, LocalStack for SQS + S3 | 3 | **Built** (2026-08-17, stage 1) — `docker-compose.yml`, `docker/`. The application services joined them at step 22b/c, behind the `app` profile |
 | The queue and the async worker: pointer messages, FIFO groups, `queued`, the worker's start/resume/continue, the runtime bound, the DLQ path | 3 | **Built** (2026-08-17, stage 2, step 20) — `jobqueue.py`, `worker.py`, `rev_0002`. Against LocalStack, not AWS |
 | The API stops holding a graph or an LLM client | 3 | **Built** (2026-08-17) — [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). `uvicorn app:app` starts with no LLM or Tavily credential |
 | The S3 artifact write, `exported_at` meaning the artifact exists, the presigned-URL route, and the operator re-export | 3 | **Built** (2026-08-18, step 22a) — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`. [ADR 0009](adr/0009-recovering-an-export-that-failed-after-approval.md), verified against LocalStack S3 |
-| The application image and its two entrypoints, CI | 3 | Planned — the rest of step 22, and step 23 |
+| The application image and its two entrypoints | 3 | **Built** (2026-08-18, step 22b/c) — `Dockerfile`, `.dockerignore`, and the `migrate`/`api`/`worker` services. One image, three commands, a non-root user, and a fifth `container` test layer. Built locally; never pushed to a registry |
+| CI | 3 | Planned — step 23 |
 | Redis: shared rate limiter, caches, URL dedupe | 3 | **Built** (2026-08-17, step 21) — `redisstore.py`. Fail-open caches and URL set, fail-closed limiter (§20 row 29), verified against a real Redis 7 |
 | LangSmith tracing, eval dataset, eval as a release gate | 4 | Planned |
 | AWS deployment, Cognito JWT, CloudWatch alarms | 5 | Planned |
@@ -448,8 +453,8 @@ body rather than on the status alone (gl §12).
 | `SupervisorDecision.next` outside the transition table | Code check after validation | `finalize`, `status=failed` |
 | Empty or invalid plan after one retry | Planner | `finalize`, `status=failed` — never research an unplanned question |
 | `Report.sources` empty | Synthesizer schema validation | `finalize`, `status=failed` — never an unsourced report |
-| 429 after 3 attempts | LLM client | `finalize`, `status=failed`, reason `rate_limited` |
-| 20-minute job limit | Worker | `finalize`, `status=failed`, reason `job_timeout` |
+| 429 after the initial request plus 3 retries | LLM client | `finalize`, `status=failed`, reason `rate_limited` |
+| 20-minute no-new-node deadline reached after a durable update | Worker | `finalize`, `status=failed`, reason `job_timeout` |
 | Rate-limiter token unavailable after 2 retries | LLM client | `finalize`, `status=failed`, reason `rate_limiter_unavailable` |
 | Any uncited claim at export | Export gate | `finalize`, `status=failed`, uncited claims listed |
 | S3 artifact write exhausted after 2 retries | Export node | `finalize`, `status=failed`, reason `export_write_failed`, **report and audit trail preserved** |
@@ -1749,13 +1754,14 @@ approved" into "this person approved it", which is the only version worth auditi
 > Three things in this section were corrected by
 > [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) as it was implemented,
 > and the text below now carries the corrected ones: the message has **no `attempt` field**, the
-> visibility timeout is **derived rather than asserted**, and `MAX_JOB_RUNTIME` bounds **one
-> invocation** rather than a job's lifetime. Where this section and an ADR still disagree, the ADR
-> wins and this section is the thing to fix.
+> visibility timeout was originally derived rather than asserted, and `MAX_JOB_RUNTIME` bounds **one
+> invocation** rather than a job's lifetime. [ADR 0015](adr/0015-visibility-leases-replace-static-duration-ownership.md)
+> now supersedes ADR 0010 decision 8: active visibility renewal, not a predicted static duration, is
+> the ownership mechanism. Where this section and an ADR disagree, the ADR wins.
 >
-> What is **not** built: the DLQ alarm (there is no CloudWatch), the S3 write in the flow below
-> the application image and its two entrypoints (the rest of step 22), and any worker on AWS. The
-> queue and the bucket are LocalStack's.
+> What is **not** built: the DLQ alarm (there is no CloudWatch), and any worker on AWS. The queue
+> and the bucket are LocalStack's, and the image the worker runs from (step 22b/c) is built locally
+> and pushed nowhere.
 
 ### The flow
 
@@ -1767,10 +1773,10 @@ flowchart TD
     C -->|"inserted"| D["enqueue pointer message"]
     D -->|"send failed"| FAIL503["503 enqueue_failed<br/>the row stays queued"]
     D --> E["202 + job_id, status queued"]
-    D --> Q["SQS FIFO - group = job_id<br/>visibility > runtime bound + one node"]
+    D --> Q["SQS FIFO - group = job_id<br/>visibility lease renewed while owned"]
     Q --> W["worker: receive message"]
     W --> LOAD["load checkpoint for thread_id = job_id<br/>start / resume / continue"]
-    LOAD --> RUN["queued -> running<br/>run the graph, checkpoint per node"]
+    LOAD --> RUN["queued -> running<br/>heartbeat independent of graph<br/>checkpoint per node"]
     RUN --> INT["interrupt at human_gate<br/>status = awaiting_approval"]
     INT --> DEL["delete the message - worker released"]
     DEL --> APPROVE["POST /jobs/id/approve<br/>records actor + decision, claims the gate"]
@@ -1804,7 +1810,7 @@ number that can is `ApproximateReceiveCount`, read at receive time.
 
 | Attribute | Value | What it buys |
 |---|---|---|
-| `MessageGroupId` | `job_id` | At most one message per job in flight, whatever mix of starts, resumes, retries and redeliveries produced them — which is ADR 0005's single-writer precondition, provided by the queue rather than by application code |
+| `MessageGroupId` | `job_id` | Orders starts, resumes, retries and redeliveries for one job. It normally keeps one message in flight; ADR 0016's PostgreSQL job lock fences the expired-delivery overlap FIFO cannot prevent and enforces ADR 0005's single writer |
 | `MessageDeduplicationId` | the job's `idempotency_key` for a start; `f"{job_id}:{calls_used}"` for a resume | A resubmission, or a gate decision retried inside SQS's window, collapses to one message. The resume key is ADR 0007's gate-visit key — one key, three places |
 
 **There is no message type.** The message says *which job*; the checkpoint says what to do with it:
@@ -1827,7 +1833,7 @@ the other:
 | Duplicate | Where it is stopped | How |
 |---|---|---|
 | The same **request** submitted twice | `POST /jobs`, in the API | `UNIQUE` on `jobs.idempotency_key`. The insert fails, the API returns `409` with the existing `job_id`, and **no second message is enqueued** |
-| The same **message** delivered twice | The worker | The message carries `job_id`; the worker loads the checkpoint for `thread_id = job_id` and resumes at the last completed node |
+| The same **message** delivered twice | The worker | The message carries `job_id`; the worker acquires its PostgreSQL execution lock, loads the fresh checkpoint for `thread_id = job_id`, and resumes at the last completed node |
 
 SQS guarantees **at-least-once** delivery, so duplicate delivery is expected behaviour, not an
 incident. Because the message is a pointer rather than state, a redelivery cannot restart a job — it
@@ -1838,32 +1844,79 @@ that job row already won the uniqueness race.
 create two jobs, two threads, and two full sets of LLM calls for one question — 60 calls of budget
 spent to produce a duplicate the reviewer then has to read twice.
 
-### Visibility timeout vs job runtime
+### Visibility lease and job runtime
 
-**The invariant is not `visibility > MAX_JOB_RUNTIME`**
-([ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 8). The runtime
-bound can only be checked *between* nodes — a node in flight is inside a blocking LLM request — so the
-queue has to cover the bound plus the longest a single node can take:
+The old static inequality in ADR 0010 decision 8 was not a valid proof of ownership. A structured
+LLM call has two validation attempts, each with its own three-attempt transport loop; 429 retries have
+an independent counter; a Researcher node may run several extractions concurrently; and a
+Fact-Checker node fetches its sources before its LLM call. There is no honest single-node formula of
+`3 × LLM_MAIN_TIMEOUT_S + 10`. ADR 0015 therefore supersedes that decision without rewriting its
+history.
 
-```text
-visibility_timeout  >  MAX_JOB_RUNTIME + 3 x LLM_MAIN_TIMEOUT_S + 10
-```
+**Ownership is an actively renewed visibility lease.** After the worker commits to processing a
+delivery, a background heartbeat calls `ChangeMessageVisibility` independently of the graph thread.
+Its cadence is derived from the queue attribute rather than a second setting:
 
-| Environment | `LLM_MAIN_TIMEOUT_S` | `MAX_JOB_RUNTIME` | Required | Set to |
-|---|---:|---:|---:|---:|
-| Production defaults | 60s | 1200s | > 1390s | **1500s** |
-| Local Compose | 180s | 1200s | > 1750s | **1800s** |
+| Queue visibility `V` | Renewal cadence | First failed renewal retried at | Margin after that retry |
+|---:|---:|---:|---:|
+| Local Compose: 1800s | `V / 3` = 600s | No later than 900s after receipt/last success under the full 93s failed-call envelope | At least 807s before estimated expiry |
 
-**`MAX_JOB_RUNTIME` bounds one worker invocation, not a job's lifetime** (decision 7). A job that
-waits three days at the gate must not fail on resume, and the bound exists to protect a *per-delivery*
-visibility timeout. Three deliveries can therefore spend up to `3 x MAX_JOB_RUNTIME` in total; each
-resumes from a checkpoint rather than repeating work, and `MAX_LLM_CALLS_PER_JOB` still bounds the
-spend. Over the bound, the worker ends the job `failed` with `failure_reason="job_timeout"`.
+The SQS client's conservative call envelope is `3 × (5s connect + 25s read) + 1s + 2s` = 93s.
+The latest safe attempt start is `estimated_expiry - V/3 - 93s`. After one failed SDK operation the
+retry is placed halfway between the failure time and that latest start, retaining equal scheduling
+headroom on both sides; a full-envelope first failure at 600s therefore retries at 900s rather than
+waiting until 1200s. If no bounded attempt fits before the existing one-third safety margin,
+ownership becomes unsafe without making a late call. A successful renewal estimates expiry from the
+attempt's monotonic **start**, because SQS may apply the extension before the response arrives and
+completion time could overstate ownership by the whole response delay.
 
-> **The worker reads its queue's attributes at startup and refuses to run** when the inequality fails,
-> or when the queue is not FIFO. A derived number that nothing checks is a number that drifts.
-> `tests/test_local_infrastructure.py` checks the same arithmetic against `docker-compose.yml`, and
-> the `integration` layer checks it against the queue LocalStack actually created.
+The lease records receipt/lease start, last attempt start, last successful attempt start,
+conservative estimated expiry, current monotonic time, remaining lease, next attempt, scheduler
+lateness and consecutive failures. One transient failure is logged and retried. A second consecutive
+failure, or an invalid/expired receipt handle, marks ownership unsafe. The worker lets only the node
+already in flight reach its next durable checkpoint, starts no further node, stops the heartbeat,
+leaves the message unacknowledged, and lets SQS redeliver. The heartbeat stops and joins before any
+successful `DeleteMessage`, so it cannot extend an acknowledged delivery afterward.
+
+### Per-job execution fence
+
+**FIFO plus heartbeat is not the final single-writer fence.** If a lease expires while Worker A is
+still completing an admitted node, SQS may hand the receipt to Worker B. ADR 0005's findings
+read-then-insert, wholesale claims replacement, audit guards, same-thread checkpoint progression and
+the database/checkpoint/S3 export sequence are safe for sequential replay, not concurrent same-job
+execution. [ADR 0016](adr/0016-postgresql-fences-per-job-execution.md) therefore enforces one writer
+with a session-scoped PostgreSQL advisory lock derived from `job_id`.
+
+The heartbeat starts before lock acquisition. A redelivered worker polls the non-blocking lock while
+renewing its own receipt and runs no graph work. Only after acquisition does it read the job row,
+checkpoint and reviewer decision, so a long waiter never executes from stale state. It holds the
+dedicated lock connection through the admitted node, synchronous checkpoint, reconciliation and
+terminal handling, then releases the lock before stopping the heartbeat and acknowledging. Process
+or database-session death releases the advisory lock automatically; unrelated job keys remain
+concurrent. Waiting is delivery time, so `MAX_JOB_RUNTIME` begins after acquisition.
+
+LangGraph iteration needed one additional boundary: requesting the next stream item starts the node
+before the loop body can recheck a flag. The worker now invokes one node/superstep with
+`interrupt_after="*"` and synchronous durability, then returns to an atomic admission gate. Lease
+loss or SIGTERM recorded before admission starts no node; a node admitted first may finish while the
+same worker retains the PostgreSQL lock. This is still at-least-once provider execution, not
+mathematical exactly-once behavior under crashes.
+
+The existing 1800-second local visibility remains deliberately unchanged. It is now a lease period,
+not a prediction of job duration, and gives the cadence above enough space for scheduling jitter, one
+ordinary SQS failure, and network latency. Losing a worker may therefore delay local recovery by up to
+the remaining lease; shortening that trade-off is a deployment decision, not required for correctness.
+
+**`MAX_JOB_RUNTIME=1200` is a no-new-node deadline for one worker invocation, not a hard wall and not
+a job's lifetime.** It is checked after durable node updates. Once reached, the worker starts no more
+nodes and finalizes with `failure_reason="job_timeout"`; a node already in progress may make a finite
+overrun while the heartbeat remains active. Provider waits are bounded independently. A job that
+waits days at the human gate gets a fresh invocation deadline on resume.
+
+> **The worker reads its queue's attributes at startup and refuses to run** when the queue is not FIFO,
+> its visibility timeout is not positive, or a healthy `V/3` attempt plus the 93-second bounded call
+> cannot retain another `V/3` margin. `tests/test_local_infrastructure.py` checks the 1800/600 lease
+> derivation offline, and the `integration` layer exercises real visibility changes in LocalStack.
 
 ### Retries and the DLQ
 
@@ -1876,6 +1929,13 @@ the graph interrupted at the gate, the job reached a terminal status, or the job
 when the message arrived. Every other path leaves the message, which is what makes redelivery the
 retry rather than something the worker has to remember to arrange.
 
+Those outcomes must be durably usable before acknowledgement. A timeout is acknowledged only after
+its failure checkpoint and terminal `jobs` projection have both been written and reread; redelivery
+of a partial timeout marker retries finalization without starting another graph node. A gate is
+acknowledged only when the durable row is already `awaiting_approval`, or after a fresh checkpoint
+reread successfully repairs and verifies that projection. Checkpoint, reconciliation, or terminal
+write uncertainty therefore leaves the receipt unacknowledged.
+
 **The final delivery is the exception that proves the rule.** On it, an unhandled failure ends the job
 `failed` with `failure_reason="job_dead_lettered"` **and still leaves the message** (decision 9), so
 the job stops being pollable *and* the DLQ alarm fires. Those are two requirements, not one: an alarm
@@ -1883,9 +1943,10 @@ tells an operator, and it does not tell `GET /jobs/{id}`.
 
 ### Worker crash — what happens if a worker dies halfway
 
-1. The message was never deleted, so after the 25-minute visibility timeout SQS makes it visible
-   again.
-2. A worker receives it, loads the checkpoint for `thread_id = job_id`, and resumes.
+1. The message was never deleted and its heartbeat disappeared, so after the remaining visibility
+   lease (up to 1800 seconds in local Compose) SQS makes it visible again.
+2. A worker receives it, acquires the per-job PostgreSQL execution lock, then loads the fresh
+   checkpoint for `thread_id = job_id` and resumes.
 3. **Completed nodes are not re-executed.** Checkpoints are written per node, so the most that is
    lost is the single node that was in flight — at worst a few LLM calls, not a whole job.
 4. `findings` and `verdicts` use `operator.add` reducers, so the re-executed node appends rather than
@@ -1894,16 +1955,39 @@ tells an operator, and it does not tell `GET /jobs/{id}`.
 
 ### Graceful shutdown
 
-On SIGTERM the worker stops taking new messages and **lets the invocation in flight return**, which
-leaves the checkpoint and the database agreeing. The signal sets a flag rather than raising: raising
-out of a handler could unwind the middle of a graph invocation and leave the checkpoint behind the
-database, which is the one thing ADR 0005 decision 2 says to avoid.
+On SIGTERM the worker stops taking new work and **lets the node in flight finish if the platform gives
+it enough time**, then stops — it does not carry on to the next node. The visibility heartbeat keeps
+renewing while that already-owned node legitimately completes, so the message does not become visible
+under the still-running worker. The signal sets a flag rather than raising: raising out of a handler
+could unwind the middle of a node and leave the checkpoint behind the database, which is the one thing
+ADR 0005 decision 2 says to avoid.
+
+**The stop is enforced at two boundaries.** The flag is read before a message is started — including
+immediately after a `receive()` returns, because a twenty-second long poll can be entered before the
+signal and return after it. During execution, the flag atomically closes the next-node admission
+gate. Each admitted graph call runs one node/superstep with synchronous checkpoint durability, so a
+signal may let only the already-admitted node finish and cannot lose a check/start race to iterator
+advancement.
+
+**A delivery stopped that way is not acknowledged.** Nothing is written to say the job was
+interrupted, because nothing about it changed; the message is left, and the next delivery continues
+from the checkpoint without replaying the node that completed. The exception is the case that is not
+an interruption at all: if the graph ran out of nodes — the gate interrupted, or the job ended — that
+delivery genuinely finished and the message is deleted as ADR 0010 decision 6 has always said.
 
 A second signal is **not** escalated to a hard exit. The container runtime already escalates — SIGTERM,
 then SIGKILL after its grace period — and a worker that killed itself faster would only lose the
-checkpoint the first signal was trying to protect. Fargate's 30-second grace period is enough for a
-node, not for a whole job, so a worker killed harder than SIGTERM leaves its message undeleted; that is
-the recovery path rather than a hole (gl §12).
+checkpoint the first signal was trying to protect. **The grace period is 120 seconds** — Compose's
+`stop_grace_period` locally, and the `stopTimeout` the production task definition must set (§19). It is
+the maximum best-effort opportunity to reach a checkpoint boundary, not a guaranteed node bound. A
+worker killed harder than SIGTERM leaves its message undeleted and its heartbeat disappears; expiry
+and checkpoint-based redelivery are the recovery path (gl §12).
+
+**120 seconds is mitigation and not a fix.** It was 30, and raising it narrows how often a node in
+flight is killed rather than removing the possibility. The residual case is unchanged and still owned
+elsewhere: a hard kill on the *final* delivery leaves a job non-terminal with no redelivery to recover
+it, which is [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 9's
+Phase 5 reconciliation sweep (step 32).
 
 ### Worker concurrency
 
@@ -2369,8 +2453,8 @@ still live in exactly one place.
 |---|---|---|---|
 | **LLM timeout (main)** | `LLM_MAIN_TIMEOUT_S`, default 60s — **one value for every main-tier caller** | 2 retries, backoff 2s, 8s | Fail the node, record the reason → `finalize`, `status=failed` |
 | **LLM timeout (fast)** | 30s timeout | 2 retries, backoff 1s, 4s | Same |
-| **LLM 429** | HTTP 429 | 3 attempts; `Retry-After` if present, else 2s, 8s, 30s | Fail the **job**, reason `rate_limited`. A rate-limited job fails visibly; it never silently produces a shorter report |
-| **Malformed structured output** | Schema validation fails | **1 retry, with the validation error in the prompt** | Fail explicitly. **Never substitute a default** — a wrong value survives into the report and looks deliberate |
+| **LLM 429** | HTTP 429 | Initial request + 3 retries; numeric `Retry-After` clipped to 30s, malformed/missing/negative/non-finite values fall back to 2s, 8s, 30s | Fail the **job**, reason `rate_limited`. A rate-limited job fails visibly; it never silently produces a shorter report |
+| **Malformed structured output** | Schema validation fails | **1 validation retry, with the validation error in the prompt; each validation attempt receives a fresh three-attempt transport loop** | Fail explicitly. **Never substitute a default** — a wrong value survives into the report and looks deliberate |
 | **Search failure** | 15s timeout, or tool error | 2 retries, backoff 1s, 4s | That query yields no findings for the subtopic; the Researcher may still have budget for another query |
 | **Empty search results** | Zero usable results | Remaining subtopic budget (3 calls) may try another query | Zero findings after retries → subtopic `unresearched`, job **continues**, gap carried into the report, reflection scores completeness down |
 | **Source unavailable** | Fetch 10s timeout, non-2xx, > `MAX_FETCH_BYTES`, disallowed content type, robots-blocked | 1 retry, backoff 2s | Source marked `unreachable`. At fact-check: `supported=false`, `note="source unreachable"` — never a guess |
@@ -2379,9 +2463,11 @@ still live in exactly one place.
 | **Reflection scoring call fails, no report yet** | Same | Same | Nothing to gate: fail the node per gl §17 → `finalize`, `status=failed` |
 | **Revision limit reached** | `revision_count >= MAX_REVISIONS` with a failing score | none — the loop is over | Job continues with `quality_flag="below_threshold"`, breakdown attached, **the reviewer decides**. Citation coverage still blocks export regardless |
 | **Supervisor guard trips** | `hop_count >= 24` or `llm_calls_used >= 60` | none | `finalize`, `status=failed`, `failure_reason` set |
-| **Whole job exceeds 20 min** | Worker job timer | none | `finalize`, `status=failed`, reason `job_timeout` |
-| **SQS retry / duplicate delivery** | Message redelivered after 25-min visibility timeout | 3 deliveries | Then DLQ + CloudWatch alarm. A duplicate resumes from the checkpoint; it never restarts the job |
-| **Worker crash** | Visibility timeout expires without a delete | Redelivery, resume from the last per-node checkpoint | At most the in-flight node is re-executed. After 3 deliveries → DLQ |
+| **Invocation reaches its 20-minute no-new-node deadline** | Worker checks after a durable node update | none | Start no further node; `finalize`, `status=failed`, reason `job_timeout`. A node already in flight may finish after the deadline |
+| **Visibility renewal fails once** | Heartbeat receives a queue/network error | Retry halfway through the remaining safe-start window (`expiry - V/3 - 93s`); never make an attempt that cannot finish with the margin intact | Keep processing; successful renewal resets the failure count and restores `V/3` cadence |
+| **Visibility ownership becomes unsafe** | Two consecutive renewal failures, SQS rejects the receipt, or no bounded call fits before the safe deadline | none | Let only the atomically admitted node checkpoint while retaining the PostgreSQL job lock; start no next node, stop heartbeat, do not acknowledge |
+| **SQS retry / duplicate delivery** | Message redelivered after its unrenewed lease expires | 3 deliveries | Then DLQ + Phase 5 alarm. A duplicate heartbeats while waiting for the PostgreSQL job lock, rereads the fresh checkpoint, and never runs beside the old owner |
+| **Worker crash** | Heartbeat disappears and visibility expires without a delete | Redelivery, resume from the last per-node checkpoint | At most the in-flight node is re-executed. After 3 deliveries → DLQ |
 | **PostgreSQL failure** | 5s query timeout | **0 retries** | Fail loudly. `/health` reports `db` unhealthy → `503` → the ECS target group takes the task out of service |
 | **Redis failure — cache or dedupe** | Connection error on `cache:*` or `job:{id}:urls` | **Fail open.** Treat as a miss; log it | The job continues. Cost is a repeated call or a duplicate fetch, both bounded by `MAX_LLM_CALLS_PER_JOB` |
 | **Redis failure — rate limiter** | Connection error on `ratelimit:llm` | 5s timeout, 2 retries at 2s, 8s (gl §17) | **Fail closed.** No token, no LLM call → `finalize`, `status=failed`, reason `rate_limiter_unavailable`. A limiter that fails open is not a limiter |
@@ -2425,7 +2511,7 @@ saturate the development tier.** That is a development constraint to plan around
 | **Batching** | Fact-Checker: all claims in **one** call per pass | A contract in gl §2.5, tested as a contract |
 | **Model tiers** | `LLM_FAST_MODEL` for the Supervisor and the reflection node; `LLM_MODEL` for everything else | Config, not code |
 | **Caching** | Redis `cache:search:*`, `cache:fetch:*`, 24h TTL | In the MCP tool layer, so both agents get it for free. Hits and misses logged |
-| **429 backoff** | The single OpenAI-compatible LLM client | `Retry-After`, else 2s/8s/30s, 3 attempts, then fail the job |
+| **429 backoff** | The single OpenAI-compatible LLM client | Initial request + 3 retries; numeric `Retry-After` capped at 30s, otherwise 2s/8s/30s, then fail the job |
 | **Input size cap** | `MAX_PAGE_CHARS` = 24,000, applied at fetch | Caps the token cost of a Researcher call before the call is made |
 | **In-job concurrency** | `RESEARCHER_CONCURRENCY` = 3, checked at startup (ADR 0002) | The Researcher's extraction pool. **The only bound on how many requests one job holds open until the shared limiter arrives in Phase 3** |
 
@@ -2585,13 +2671,12 @@ most needs to get right. For **tests**, the opposite is true, and this is built:
 answers, supports tool calling and JSON mode, and reports the observed rate limit. Run it after any
 model change (CLAUDE.md).
 
-### What Compose starts today — Phase 3 stage 1, 2026-08-17
+### What Compose starts today — Phase 3 stage 1, 2026-08-17; the application, step 22b/c, 2026-08-18
 
-`docker-compose.yml` exists and `docker compose up -d --wait` starts three services. **It is
-infrastructure only.** There is no application image and no application container: the API and the
-worker are not containerised yet, and a Dockerfile nothing runs would be a file to maintain for no
-requirement. That, and step 21, are why **step 22 is not closed** — step 20 closed on 2026-08-17, and
-the worker it added runs from the host like everything else here.
+`docker compose up -d --wait` starts three services, and **it is still infrastructure only**. The
+application is behind Compose's `app` profile, deliberately: the `postgres`, `integration` and
+`redis` test layers are documented against that command and they run from the host, so none of them
+should have to build an image to get a database.
 
 | Service | Image | Status in the application |
 |---|---|---|
@@ -2606,20 +2691,59 @@ resources are there. The two scripts in `docker/` converge rather than create: e
 checked, created if absent, and then has its attributes set unconditionally, so repeated startup is
 safe and a changed number in `docker-compose.yml` actually lands.
 
-**Migrations run from the host**, since there is no application image to run them in:
-`DATABASE_URL=... alembic upgrade head`. The deployment ordering in gl §19 — its own task, exit 0
-before the new revision starts — is unchanged and arrives with the image.
+### The application services — `docker compose --profile app up -d --wait`
 
-**The queue is declared with the shape ADR 0010 decided**, and the worker now checks it: FIFO,
-`maxReceiveCount = 3` onto a FIFO dead-letter queue, and a visibility timeout of 1800s. That last
-number is derived, not chosen — decision 8's inequality is
-`visibility > MAX_JOB_RUNTIME + 3 × LLM_MAIN_TIMEOUT_S + 10`, which at the 1200s job bound and this
-project's 180s development timeout requires more than 1750s.
+**One image, three commands** (§19, decision 25). `Dockerfile` builds it: uv installs `uv.lock` into
+`/opt/venv` in a first stage and is left behind, and the runtime stage carries that venv, the named
+application sources, and a non-root `app` user (uid 10001). No `.env`, no credential, no package
+manager, and no `COPY . .`.
 
-The arithmetic is checked in three places, deliberately, because each catches a different drift:
-`tests/test_local_infrastructure.py` compares `docker-compose.yml` against `config.py` offline; the
-`integration` layer compares the queue LocalStack actually created against the same rule; and
-`python -m worker` refuses to start when the queue it is attached to fails it.
+| Service | Command | Notes |
+|---|---|---|
+| `migrate` | `alembic upgrade head` | One shot, `restart: "no"`, and given `DATABASE_URL` and nothing else |
+| `api` | `uvicorn app:app --host 0.0.0.0 --port 8000` | Published on `127.0.0.1:${API_PORT:-8000}` — **loopback**, because the local key table is two keys published in `.env.example`. Its environment carries **no LLM and no Tavily variable**, which is [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md) as configuration rather than as intent |
+| `worker` | `python -m worker` | **No published port.** `stop_grace_period: 120s`, the same number §19 requires of the production `stopTimeout` |
+
+**Migrations are their own task and neither long-running process runs one.** `api` and `worker`
+declare `service_completed_successfully` on `migrate`, which is gl §19's "exit 0 before the new
+service revision starts" expressed where Compose can enforce it — and it is what stops two processes
+racing `alembic upgrade head` against one database. The checkpointer still owns its own tables
+through `setup()`, called by the worker; Alembic never touches them.
+
+**Inside the network a service is reached by its name** — `postgres:5432`, `redis:6379`,
+`localstack:4566`. `POSTGRES_PORT`, `REDIS_PORT`, `LOCALSTACK_PORT` and `API_PORT` move the *host*
+port and change no container's configuration. Running from the host instead, migrations run from the
+host: `DATABASE_URL=... alembic upgrade head`.
+
+**Presigned URLs are signed against the client's address, not the worker's.** The API is given
+`S3_PUBLIC_ENDPOINT_URL` and nothing else is: SigV4 covers the host, so the address in a
+presigned URL has to be correct before the signature exists and can never be rewritten
+afterwards. Signed against `AWS_ENDPOINT_URL` the URL named `localstack:4566` and no browser
+could resolve it. Against real AWS the variable is unset and the bucket's address is the same
+from both sides. The worker's `PutObject` keeps the internal endpoint, which is where a real
+write belongs (gl §13).
+
+**`/health` carries a third check, `checks.checkpoints`.** The API reads LangGraph's tables and
+owns none of them — Alembic never touches them and this process never calls `setup()`
+(ADR 0012) — so between `migrate` exiting 0 and the first worker starting they do not exist.
+That is a deployment in which no job can run, which is the same thing the Redis row reports, and
+it is answered by one read through the saver interface. The API still creates nothing.
+
+**Containerising the API found a defect that only a container could find.** `app._build()` opened a
+checkpoint-reader `ConnectionPool` that nothing closed, and psycopg waits five seconds per pool
+thread at interpreter exit — four threads against a ten-second stop grace period. uvicorn logged a
+clean shutdown, the process stayed alive, and every stop ended in SIGKILL and exit 137, which would
+have stalled every rolling deploy and every rollback in §19's diagram. A FastAPI lifespan now closes
+the pool, and both an offline test and a container test hold it.
+
+**The queue keeps ADR 0010's FIFO and redrive shape**: `maxReceiveCount = 3` onto a FIFO dead-letter
+queue, with an initial visibility lease of 1800s. ADR 0015 supersedes only the static-duration proof.
+The worker reads the actual queue value and renews every third of it: 600s locally. A failed renewal
+retries halfway through the remaining safe-start window bounded by the 93-second SQS call envelope;
+a full-envelope first failure therefore retries at 900s, not 1200s. It refuses a non-FIFO queue,
+non-positive lease, or a lease that cannot retain the safety margin. `tests/test_local_infrastructure.py`
+checks that derivation offline; the integration layer
+performs a real `ChangeMessageVisibility` against LocalStack and proves that renewal delays redelivery.
 
 **Two ways to reach the queue locally.** `SQS_QUEUE_URL=http://localhost:4566/000000000000/research-jobs.fifo`
 with `AWS_ENDPOINT_URL=http://localhost:4566` points the API and the worker at it; `SQS_ENDPOINT_URL`
@@ -2731,10 +2855,26 @@ scan, and the tag bookkeeping to separate code that is already separated by modu
 |---|---|
 | **Runs** | `python -m worker` |
 | **Owns** | SQS consumption, LangGraph execution, all five agents, the reflection node, the tool layer, checkpointing, persistence of findings and claims, the export gate and the S3 write |
-| **Talks to** | SQS (receive/delete), Postgres (read/write), Redis, MCP/Tavily, the LLM endpoint, S3 (write), LangSmith, Secrets Manager |
+| **Talks to** | SQS (receive/renew/delete), Postgres (read/write), Redis, MCP/Tavily, the LLM endpoint, S3 (write), LangSmith, Secrets Manager |
 | **Never** | Serves HTTP or makes an authorization decision |
 | **Scaling** | **Fixed.** 1 locally, 2 in AWS, bounded by the LLM rate limit |
-| **Shutdown** | SIGTERM → stop taking new messages → let the invocation in flight return (checkpointing per node as it goes) → exit. A worker killed harder leaves its message undeleted, which is the recovery path |
+| **Shutdown** | SIGTERM → stop taking new work or waiting for a job lock → atomically close next-node admission → keep renewing while the already-admitted **node** finishes if possible → synchronous checkpoint → release the job lock → stop heartbeat → exit. The delivery is left unacknowledged unless the graph genuinely reached the gate or a terminal state. A harder kill releases both heartbeat and PostgreSQL session ownership, enabling redelivery and resume |
+| **Stop timeout** | **120 seconds.** `stop_grace_period: 120s` locally, and the task definition **must set `stopTimeout: 120`** when Phase 5 writes one — the default is 30, and the two numbers have to match or local behaviour stops predicting deployed behaviour |
+
+**Why 120, and what it does not buy.** It is the maximum graceful-stop opportunity available in
+Fargate, and Compose matches it so local shutdown predicts deployment. It is not a proven node bound:
+structured validation and transport retries are nested, tools can precede or accompany LLM work, and a
+node already in progress may legitimately exceed 120 seconds. `MAX_JOB_RUNTIME` would be the wrong stop
+timeout — it is a no-new-node deadline, not cancellation — and the visibility heartbeat continues
+during the current node until a checkpoint or hard platform stop.
+
+**It is mitigation only.** A node still in flight when the timeout lapses is SIGKILLed at 120 seconds
+exactly as it was at 30; what changes is how often. The message is never deleted either way, so
+redelivery stays the recovery path — and the one case redelivery cannot cover, a hard kill on the
+**final** delivery, is untouched by this and remains
+[ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md) decision 9's Phase 5
+reconciliation sweep (step 32). **No ECS task definition exists yet**; this records the requirement the
+one Phase 5 writes has to satisfy.
 
 ### Why they must be separate
 
@@ -2744,8 +2884,9 @@ scan, and the tag bookkeeping to separate code that is already separated by modu
 3. **Different IAM roles.** Least privilege means the worker's role reads its queue and writes its
    bucket prefix and nothing else; the API's role cannot consume the queue. One container would need
    the union of both.
-4. **Different shutdown semantics.** The API drains requests in milliseconds; the worker must finish
-   a node and write a checkpoint within Fargate's 30-second grace period.
+4. **Different shutdown semantics.** The API drains requests in milliseconds; the worker gets a
+   **120-second best-effort opportunity** to finish its current node and write a checkpoint while
+   renewing visibility. The platform may still kill a longer node at that limit.
 5. **Different blast radius.** A worker crash loop must not take the status API down with it — the
    status API is how anyone finds out there is a crash loop.
 
@@ -2890,8 +3031,8 @@ holding a graph and an `LLMClient` altogether
 the database tests use a temporary SQLite file, and Compose provides the real one at step 22." The
 SQLite half is still true and still the offline suite. The rest is not: Phase 3 stage 1 brought the
 Compose PostgreSQL 16 forward on its own, and everything steps 13–18 built is now verified against it
-as well (§17). **Step 22 is still open** — it also owns the application image and the two
-entrypoints, and neither exists.
+as well (§17). **Step 22 closed on 2026-08-18**, when 22b/c added the application image and the two
+entrypoints.
 
 | # | Step | Depends on | Why here |
 |---|---|---|---|
@@ -2909,7 +3050,7 @@ entrypoints, and neither exists.
 |---|---|---|---|
 | 20 | **SQS worker** — pointer message, idempotency key unique in `jobs`, visibility timeout, DLQ, graceful shutdown | 18 | Needs the job row and the checkpoint to resume against. **Done (2026-08-17).** `jobqueue.py`, `worker.py`, `rev_0002`'s `queued`, the API's enqueue on both write routes, and the gate resume moved off the request — [ADR 0010](adr/0010-job-dispatch-and-status-across-api-queue-and-worker.md), [ADR 0011](adr/0011-the-human-gate-resume-moves-to-the-worker.md), [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md). Verified offline against a `FakeQueue` and again against real LocalStack SQS (`pytest -m integration`), and `rev_0002` against real PostgreSQL 16 |
 | 21 | **Redis** — shared rate limiter, URL dedupe set, search and fetch caches, with hit/miss logging | 7, 20 | The shared bucket only matters once more than one process makes LLM calls. **Done (2026-08-17).** `redisstore.py`, wired through `worker.py`; two failure policies in one file (gl §11, §20 row 29), `checks.redis` on `/health`, and a fourth test layer against the real Redis 7 |
-| 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists. **Partly done.** 2026-08-17: the three services, their healthchecks, and the queue/DLQ/bucket bootstrap, with the real-PostgreSQL and LocalStack SQS suites running on them. 2026-08-18 (**step 22a**): the S3 artifact write, the presigned-URL route, and the operator re-export — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`, verified against LocalStack S3. **The image and the two entrypoints are still not built**, so the step stays open |
+| 22 | **Docker Compose** — Postgres 16, Redis 7, LocalStack for SQS and S3; one image, two entrypoints | 20, 21 | The first point at which the full local shape exists. **Partly done.** 2026-08-17: the three services, their healthchecks, and the queue/DLQ/bucket bootstrap, with the real-PostgreSQL and LocalStack SQS suites running on them. 2026-08-18 (**step 22a**): the S3 artifact write, the presigned-URL route, and the operator re-export — `artifacts.py`, `rev_0003`, `scripts/reexport_job.py`, verified against LocalStack S3. 2026-08-18 (**step 22b/c**): `Dockerfile`, `.dockerignore`, and the `migrate`/`api`/`worker` services behind the `app` profile, with a fifth `container` test layer driving them. **Done** |
 | 23 | **CI** — ruff, mypy, pytest, gitleaks, image build to ECR | 19, 22 | Every later step ships through it |
 
 ### Phase 4 — observability and evaluation

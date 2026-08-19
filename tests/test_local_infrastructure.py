@@ -1,16 +1,13 @@
 """
 WHY THIS FILE EXISTS
-    docker-compose.yml declares numbers that other documents derive. The one that matters is
-    the queue's visibility timeout, because [ADR 0010](../docs/adr/0010-*.md) decision 8 does
-    not assert it - it derives it:
+    docker-compose.yml declares the SQS visibility lease that ADR 0015's worker renews. The
+    cadence is derived from that real queue value:
 
-        visibility_timeout > MAX_JOB_RUNTIME + 3 x LLM_MAIN_TIMEOUT_S + 10
+        renewal_interval = visibility_timeout / 3
 
-    A worker will check that inequality at startup and refuse to run when it fails. That worker
-    is a later stage. Until it exists the arithmetic is a sentence in a document, and a sentence
-    is exactly the thing that goes stale when someone changes a timeout - so it is checked here
-    instead, against `config.py`'s real defaults, from the moment the queue is declared rather
-    than from the moment something consumes it.
+    That leaves one interval for the first renewal, one for a retry after a transient failure,
+    and one as the remaining safety margin. This file keeps Compose and that derivation tied
+    together without asserting the invalid static node-duration proof ADR 0015 supersedes.
 
     **Nothing here starts a container or opens a socket.** These are file contents compared
     against configuration, which is why they belong in the offline suite: a broken relationship
@@ -25,58 +22,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from config import load_config
+from worker import visibility_renewal_interval
 
 _ROOT = Path(__file__).resolve().parent.parent
 
 _COMPOSE = (_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
-_ENV = {
-    "LLM_BASE_URL": "https://example.invalid/v1",
-    "LLM_MODEL": "main-model",
-    "LLM_API_KEY": "key",
-    "TAVILY_API_KEY": "key",
-}
 
-DEVELOPMENT_MAIN_TIMEOUT_S = 180.0
-"""What `.env` sets `LLM_MAIN_TIMEOUT_S` to, and what ADR 0010 decision 8's second row sizes
-the local queue for. The NIM tier generates at roughly 15-20 tokens/second, so 60s would cap a
-Synthesizer pass below a full report - the override is measured, not preference.
-
-Restated here rather than read from `.env`, because that file is gitignored: a test that read
-it would pass on this machine and have nothing to read on a clean checkout.
-"""
-
-BACKOFF_SECONDS = 10
-"""guidelines §17's retry schedule for a main-tier call: 2s + 8s between three attempts."""
-
-
-def test_the_local_queue_outlives_the_longest_a_worker_invocation_can_take() -> None:
-    """ADR 0010 decision 8, checked rather than quoted.
-
-    The bound is not `visibility > MAX_JOB_RUNTIME`. The runtime bound can only be checked
-    *between* nodes - a node in flight is inside a blocking LLM request - so the real figure is
-    the runtime bound plus the longest a single node can take, which is three attempts at the
-    main-tier timeout plus the backoff between them.
-    """
-    config = load_config({**_ENV, "LLM_MAIN_TIMEOUT_S": str(DEVELOPMENT_MAIN_TIMEOUT_S)})
-    worst_case_node = 3 * config.llm_main_timeout_s + BACKOFF_SECONDS
-
+def test_the_local_queue_derives_a_three_part_visibility_lease() -> None:
     visibility = _compose_number("JOBS_QUEUE_VISIBILITY_TIMEOUT")
+    interval = visibility_renewal_interval(visibility)
 
-    assert visibility > config.max_job_runtime + worst_case_node
-
-
-def test_the_local_queue_also_covers_the_production_timeouts() -> None:
-    """The same inequality at the documented defaults, which is what a developer runs when they
-    have not overridden anything. It has far more headroom, and saying so keeps the local number
-    from looking like it was sized for the wrong case."""
-    config = load_config(_ENV)
-    worst_case_node = 3 * config.llm_main_timeout_s + BACKOFF_SECONDS
-
-    visibility = _compose_number("JOBS_QUEUE_VISIBILITY_TIMEOUT")
-
-    assert visibility > config.max_job_runtime + worst_case_node
+    assert visibility == 1800  # unchanged by the heartbeat work
+    assert interval == 600
+    assert visibility - 2 * interval == interval  # margin after one failed retry
 
 
 def test_the_queue_gives_up_after_three_deliveries() -> None:

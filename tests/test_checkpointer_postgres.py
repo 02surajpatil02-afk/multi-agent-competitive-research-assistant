@@ -44,6 +44,9 @@ import sqlalchemy as sa
 from alembic.autogenerate import compare_metadata, produce_migrations
 from alembic.migration import MigrationContext
 from dbharness import AUTOGENERATE_OPTS, new_job_id
+from fakes import FakeQueue
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from harness import (
     Answer,
     FakeLLM,
@@ -62,12 +65,16 @@ from openai import OpenAI
 from pgharness import URL_VARIABLE, empty_database, migrated_engine, postgres_url, upgrade_to_head
 from sqlalchemy.engine import Engine
 
+from app import _checkpoint_reader, create_application
 from config import load_config
 from database import queries
+from database.queries import create_database_engine
 from database.schema import CHECKPOINTER_TABLES, metadata
 from graph.build import ResearchGraph, build_graph, postgres_checkpointer
 from graph.state import ResearchState, new_state, run_config
+from jobqueue import JobQueue
 from llm_client import LLMClient
+from routes.auth import Identity, hash_key
 from schemas import Finding, Report, ResearchPlan, Verdict
 
 pytestmark = pytest.mark.postgres
@@ -83,6 +90,9 @@ _ENV = {
     "LLM_API_KEY": "key",
     "TAVILY_API_KEY": "key",
 }
+
+_REVIEWER_ID = "11111111-1111-4111-8111-111111111111"
+"""`jobs.user_id` is a UUID column, so the identity behind an API key has to be one."""
 
 _QUESTION = "Compare TCS and Infosys on cloud strategy."
 _SUBTOPICS = (
@@ -235,6 +245,95 @@ def test_the_migration_can_run_after_a_worker_has_already_started(empty_pg: str)
     tables = _tables(empty_pg)
     assert set(_APPLICATION_TABLES) <= tables
     assert set(CHECKPOINTER_TABLES) <= tables
+
+
+# --- The window between the migration and the first worker ------------------------------
+#
+# `migrate` exits 0 and `api` starts; the checkpointer's tables arrive later, when a worker
+# calls `setup()`. A 2026-08-18 review found the API reporting healthy in that window and
+# answering `500` where the contract promises `409`. Both are checked here against the real
+# thing, because the failure is a PostgreSQL error class - `UndefinedTable` - and a fake can
+# only imitate it.
+
+
+def test_health_reports_the_missing_checkpoint_tables_and_then_recovers(empty_pg: str) -> None:
+    """False readiness, and the only cure that keeps ADR 0012 intact.
+
+    The API may not create these tables: Alembic does not own them (guidelines §19) and this
+    process never calls `setup()` (ADR 0012 decisions 1 and 3). So the honest answer while they
+    are absent is `degraded` - a deployment in which no job can run - and the recovery is a
+    worker starting, not anything the API does.
+    """
+    upgrade_to_head(empty_pg)
+    assert not set(CHECKPOINTER_TABLES) <= _tables(empty_pg)
+
+    with TestClient(_api_against(empty_pg)) as client:
+        before = client.get("/health")
+
+        assert before.status_code == 503
+        assert before.json()["checks"] == {"db": True, "redis": True, "checkpoints": False}
+        # Reading did not repair it, which is the ADR 0012 half of the claim.
+        assert not set(CHECKPOINTER_TABLES) <= _tables(empty_pg)
+
+    with postgres_checkpointer(empty_pg):  # a worker starts
+        pass
+
+    with TestClient(_api_against(empty_pg)) as client:
+        recovered = client.get("/health")
+
+    assert recovered.status_code == 200
+    assert recovered.json()["checks"]["checkpoints"] is True
+
+
+def test_deciding_before_any_worker_has_started_is_a_conflict_not_a_500(empty_pg: str) -> None:
+    """The ordering fix, against the real `UndefinedTable`.
+
+    `POST /jobs/{id}/approve` read the gate-visit key from the checkpointer before checking the
+    job's status, so a `queued` job on this database raised inside `_gate_visit` and the
+    reviewer got `500 internal_error` where guidelines §12 promises `409`. A queued job has
+    never been invoked - no checkpoint, no possible decision - so refusing it first is both
+    correct and sufficient.
+    """
+    upgrade_to_head(empty_pg)
+    engine = create_database_engine(empty_pg)
+    job_id = new_job_id()
+    queries.create_job(
+        engine,
+        job_id=job_id,
+        user_id=_REVIEWER_ID,
+        question=_QUESTION,
+        idempotency_key=f"key-{job_id}",
+        actor=_REVIEWER_ID,
+    )
+
+    with TestClient(_api_against(empty_pg, engine=engine)) as client:
+        response = client.post(
+            f"/jobs/{job_id}/approve",
+            json={"decision": "approve"},
+            headers={"Authorization": "Bearer reviewer-key"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "job_not_awaiting_approval"
+    row = queries.read_job(engine, job_id)
+    assert row is not None and row.status == "queued"  # nothing was claimed or recorded
+
+
+def _api_against(url: str, *, engine: Engine | None = None) -> FastAPI:
+    """The real application, wired to a real `PostgresSaver` **that nobody has `setup()`**.
+
+    `app._checkpoint_reader` is the production wiring and is used unchanged, because the point
+    is what the deployed reader does against this database rather than what a fake would do.
+    """
+    checkpoints, _pool = _checkpoint_reader(url)
+    return create_application(
+        config=load_config(_ENV),
+        engine=engine if engine is not None else create_database_engine(url),
+        checkpoints=checkpoints,
+        queue=cast(JobQueue, FakeQueue()),
+        # The table holds hashes, never keys (guidelines §16).
+        keys={hash_key("reviewer-key"): Identity(user_id=_REVIEWER_ID, role="reviewer")},
+    )
 
 
 # --- What the checkpoint holds ----------------------------------------------------------

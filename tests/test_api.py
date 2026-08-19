@@ -60,7 +60,7 @@ from harness import (
 from langgraph.checkpoint.memory import InMemorySaver
 from openai import OpenAI
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 import artifacts as artifacts_module
 import scripts.reexport_job as reexport_job
@@ -231,6 +231,20 @@ class _RaisingRedis:
 
     def reachable(self) -> bool:
         raise ConnectionError("boom: redis went away mid-check")
+
+
+class _UncreatedCheckpoints(InMemorySaver):
+    """A checkpoint store whose tables do not exist yet.
+
+    This is a **fresh database that Alembic has migrated and no worker has started against**.
+    The API never calls `setup()` (ADR 0012 decisions 1 and 3) and Alembic never owns LangGraph's
+    tables (guidelines §19), so between those two events every read of them raises - which is
+    what a real `PostgresSaver` does with `UndefinedTable`, and what this stands in for offline.
+    The `postgres`-marked suite drives the real thing.
+    """
+
+    def get_tuple(self, config: Any) -> Any:
+        raise ProgrammingError('relation "checkpoints" does not exist', {}, Exception("undefined"))
 
 
 @pytest.fixture
@@ -416,7 +430,10 @@ def test_health_is_the_one_route_that_needs_no_key(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "checks": {"db": True, "redis": True}}
+    assert response.json() == {
+        "status": "ok",
+        "checks": {"db": True, "redis": True, "checkpoints": True},
+    }
 
 
 def test_health_says_nothing_a_stranger_should_not_know(client: TestClient) -> None:
@@ -428,7 +445,7 @@ def test_health_says_nothing_a_stranger_should_not_know(client: TestClient) -> N
     assert all(isinstance(value, bool) for value in body["checks"].values())
     # One boolean per dependency the process actually reaches, and `redis` joined that list
     # at step 21 - before which it was deliberately absent rather than false (guidelines §12).
-    assert set(body["checks"]) == {"db", "redis"}
+    assert set(body["checks"]) == {"db", "redis", "checkpoints"}
     assert "sqlite" not in str(response).lower()
 
 
@@ -456,7 +473,10 @@ def test_health_reports_redis_and_degrades_when_it_is_gone(
         response = client.get("/health")
 
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "checks": {"db": True, "redis": False}}
+    assert response.json() == {
+        "status": "degraded",
+        "checks": {"db": True, "redis": False, "checkpoints": True},
+    }
 
 
 def test_a_redis_probe_that_raises_is_a_failed_check_not_a_failed_request(
@@ -477,8 +497,161 @@ def test_a_redis_probe_that_raises_is_a_failed_check_not_a_failed_request(
         response = client.get("/health")
 
     assert response.status_code == 503
-    assert response.json()["checks"] == {"db": True, "redis": False}
+    assert response.json()["checks"] == {"db": True, "redis": False, "checkpoints": True}
     assert "boom" not in response.text
+
+
+# --- A database Alembic has migrated and no worker has started against ----------------
+
+
+def test_health_says_so_when_the_checkpoint_tables_do_not_exist_yet(
+    config: Config, db: Engine, queue: FakeQueue
+) -> None:
+    """FINDING 4. The window is narrow and real: `migrate` exits 0, the API comes up, and until
+    a worker calls `setup()` LangGraph's tables are not there.
+
+    Reported rather than hidden, for the reason the Redis row is: the API itself still works -
+    it can accept jobs and answer their status - but **no job can ever run** in that state, and
+    that is what a person needs told. It is `False` only once per database: the tables are
+    created by the first worker and never go away.
+    """
+    application = create_application(
+        config=config,
+        engine=db,
+        checkpoints=_UncreatedCheckpoints(),
+        queue=cast(Any, queue),
+        keys=_KEYS,
+    )
+
+    with TestClient(application) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "degraded",
+        "checks": {"db": True, "redis": True, "checkpoints": False},
+    }
+
+
+def test_the_api_never_creates_the_checkpoint_tables_itself(
+    config: Config, db: Engine, queue: FakeQueue
+) -> None:
+    """ADR 0012 decisions 1 and 3, which the fix above must not weaken.
+
+    The check is a **read**. If `/health` were allowed to repair what it found, the API would be
+    running DDL for tables it does not own, Alembic's ownership boundary would have a second
+    author, and guidelines §13's least-privilege table would need a migration grant on the API's
+    role. The probe raises, the check reports `False`, and nothing is created.
+    """
+    saver = _UncreatedCheckpoints()
+    application = create_application(
+        config=config,
+        engine=db,
+        checkpoints=saver,
+        queue=cast(Any, queue),
+        keys=_KEYS,
+    )
+
+    with TestClient(application) as client:
+        assert client.get("/health").status_code == 503
+        assert client.get("/health").status_code == 503  # still broken: nothing healed it
+
+    with pytest.raises(ProgrammingError):
+        saver.get_tuple(run_config("any-job"))
+
+
+def test_deciding_on_a_queued_job_is_a_conflict_and_not_an_internal_error(
+    config: Config, db: Engine, queue: FakeQueue
+) -> None:
+    """FINDING 4's correctness half, and the reason it is an ordering fix.
+
+    A `queued` job has never been invoked, so nothing has written a checkpoint for it and no
+    gate visit can carry a decision. The visit key was read before the status was checked,
+    though - so on the fresh database above, `POST /jobs/{id}/approve` raised inside
+    `_gate_visit` and the reviewer got `500 internal_error` where guidelines §12 promises
+    `409 job_not_awaiting_approval`.
+
+    Refusing `queued` before that read is the whole change. Nothing else moves: `running` and
+    `awaiting_approval` still fall through, which is what keeps ADR 0007's retry - the same
+    decision arriving again after the worker has already resumed, and so after the row says
+    `running` - working.
+    """
+    application = create_application(
+        config=config,
+        engine=db,
+        checkpoints=_UncreatedCheckpoints(),
+        queue=cast(Any, queue),
+        keys=_KEYS,
+    )
+
+    with TestClient(application) as client:
+        job_id = _submitted(client)
+        response = client.post(
+            f"/jobs/{job_id}/approve", json={"decision": "approve"}, headers=_REVIEWER_AUTH
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "job_not_awaiting_approval"
+    assert _status(db, job_id) == "queued"  # and nothing was claimed or recorded
+    assert _decisions(db, job_id) == []
+
+
+def test_reading_the_gate_of_a_queued_job_was_already_a_conflict(
+    config: Config, db: Engine, queue: FakeQueue
+) -> None:
+    """The same question asked of the other checkpoint-reading route, which was already right.
+
+    `GET /jobs/{id}/gate` refuses on status *before* it touches the checkpointer, so it never
+    had the defect the approval path had. Recorded as a test so the two routes cannot drift
+    back apart.
+    """
+    application = create_application(
+        config=config,
+        engine=db,
+        checkpoints=_UncreatedCheckpoints(),
+        queue=cast(Any, queue),
+        keys=_KEYS,
+    )
+
+    with TestClient(application) as client:
+        job_id = _submitted(client)
+        response = client.get(f"/jobs/{job_id}/gate", headers=_REVIEWER_AUTH)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "job_not_awaiting_approval"
+
+
+# --- Shutdown -------------------------------------------------------------------------
+
+
+def test_the_application_releases_what_it_opened_when_it_shuts_down(
+    config: Config, db: Engine, saver: InMemorySaver, queue: FakeQueue
+) -> None:
+    """Found when the API was first containerised (step 22b/c), and it cost every deploy.
+
+    `_build` opens a `ConnectionPool` for the checkpoint reader and nothing closed it. psycopg
+    then waits **5 seconds per pool thread** at interpreter exit - four threads, twenty
+    seconds, against a ten-second stop grace period - so uvicorn logged a clean shutdown, the
+    process stayed alive, and the container was SIGKILLed with 137 every time.
+
+    A container that cannot exit on SIGTERM stalls every rolling deploy and every rollback,
+    which is the recovery path guidelines §19 depends on.
+    """
+    released: list[str] = []
+    application = create_application(
+        config=config,
+        engine=db,
+        checkpoints=saver,
+        queue=cast(Any, queue),
+        keys=_KEYS,
+        on_shutdown=lambda: released.append("pool"),
+    )
+
+    with TestClient(application) as client:
+        assert client.get("/health").status_code == 200
+        assert released == []  # not on the way up
+
+    assert released == ["pool"]
 
 
 # --- Authorization ------------------------------------------------------------------
@@ -1390,7 +1563,7 @@ def test_every_route_answers_with_no_llm_or_tavily_variable_set(
 
         assert client.get("/health").json() == {
             "status": "ok",
-            "checks": {"db": True, "redis": True},
+            "checks": {"db": True, "redis": True, "checkpoints": True},
         }
         assert client.get(f"/jobs/{job_id}", headers=_SUBMITTER_AUTH).status_code == 200
         assert list(_gate_body(client, job_id)) == _GATE_KEYS

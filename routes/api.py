@@ -115,6 +115,13 @@ The reason it needs a cap at all is the same reason the question does: `edits` r
 Synthesizer's prompt, and both fields reach `audit_events.detail`.
 """
 
+PROBE_THREAD_ID = "health-probe"
+"""The thread id `/health` reads to find out whether the checkpoint store answers.
+
+Not a job id, and it cannot collide with one: job ids are UUIDs. The read is expected to find
+nothing - what is under test is whether the store can be asked at all.
+"""
+
 
 # --- What comes in and goes out -----------------------------------------------------
 
@@ -428,9 +435,19 @@ def decide(job_id: str, body: GateDecision, request: Request) -> DecisionRespons
     body = _clean_decision(body)
     job = _job_or_404(deps.engine, job_id)
 
-    if job.status in TERMINAL_STATUSES:
+    if job.status in TERMINAL_STATUSES or job.status == "queued":
         # A finished job has no gate to answer, however this request is phrased. The retry
         # rule below is scoped to a visit that has not finished.
+        #
+        # **`queued` is refused here rather than three lines further down**, and the ordering
+        # is the point. A queued job has never been invoked: nothing has written a checkpoint
+        # for it and no gate visit can carry a decision, so there is nothing for the read
+        # below to learn - and on a database where Alembic has run but no worker has started
+        # yet, LangGraph's own tables do not exist and that read raises. The caller would get
+        # `500 internal_error` where the contract promises `409 job_not_awaiting_approval`.
+        # Nothing else moves: `running` and `awaiting_approval` both fall through exactly as
+        # before, which is what keeps ADR 0007's retry - a second identical decision arriving
+        # after the worker has already resumed, and so after the row says `running` - working.
         raise ApiError(
             status.HTTP_409_CONFLICT,
             "job_not_awaiting_approval",
@@ -646,9 +663,22 @@ def health(request: Request) -> JSONResponse:
     made anywhere in the deployment. Failing this check is what takes the task out of the
     target group so new jobs stop arriving in the first place (ARCHITECTURE.md §8), which
     beats accepting jobs that would sit `queued` while every worker fails its first node.
+
+    **`checkpoints` appeared with step 22b/c, and it reports the same kind of fact.** The API
+    reads LangGraph's tables and owns none of them: Alembic never touches them (guidelines
+    §19) and this process never calls `setup()` (ADR 0012 decisions 1 and 3), so on a database
+    that has been migrated but never had a worker start against it, they do not exist. That is
+    not a broken API - it can still accept jobs and report their status - it is a deployment
+    in which **no job can ever run**, which is exactly what the Redis row above reports and
+    exactly what a person needs told. It is `False` only in that one window: the tables are
+    created once by the first worker and never go away.
     """
     deps = _deps(request)
-    checks = {"db": _database_reachable(deps.engine), "redis": _redis_reachable(deps.redis)}
+    checks = {
+        "db": _database_reachable(deps.engine),
+        "redis": _redis_reachable(deps.redis),
+        "checkpoints": _checkpoints_readable(deps.checkpoints),
+    }
     healthy = all(checks.values())
     return JSONResponse(
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -808,6 +838,26 @@ def _database_reachable(engine: Engine) -> bool:
             conn.execute(sa.text("SELECT 1"))
     except Exception:  # noqa: BLE001 - the reason goes to the log, never to the caller
         logger.exception("health check could not reach the database")
+        return False
+    return True
+
+
+def _checkpoints_readable(checkpoints: BaseCheckpointSaver[Any]) -> bool:
+    """Whether the checkpoint store can be read, for `/health` and for nothing else.
+
+    **One read, of a thread id no job can have, and never a write.** `get_tuple` on an unknown
+    thread answers `None` when the store is there and raises when it is not, which is the
+    whole question - and it asks it through the saver interface, so no table name, no SQL
+    dialect and no DDL enters this layer. ADR 0012 is untouched: the API reads what the worker
+    created and creates nothing.
+
+    A probe id rather than a real job id, because a health check must not depend on a job
+    existing, and `PROBE_THREAD_ID` cannot collide with one - job ids are UUIDs.
+    """
+    try:
+        checkpoints.get_tuple(run_config(PROBE_THREAD_ID))
+    except Exception:  # noqa: BLE001 - the reason goes to the log, never to the caller
+        logger.exception("health check could not read the checkpoint store")
         return False
     return True
 

@@ -116,6 +116,24 @@ class Config:
     the same client, the same calls, a different address.
     """
 
+    s3_public_endpoint_url: str | None
+    """Where a **client outside the deployment** reaches the same S3, when that differs.
+
+    `GET /jobs/{id}/report` answers a presigned URL, and a presigned URL is a signed *address*:
+    SigV4 covers the host, so the host cannot be rewritten after signing without invalidating
+    the signature. The address must therefore be correct at the moment the URL is signed.
+
+    Against real AWS it is None and nothing changes - the bucket's public address is the one
+    the client already talks to. It exists for the local stack, where the two are genuinely
+    different machines' idea of the same service: the worker writes through `localstack:4566`
+    on the Compose network, and a browser on the developer's machine can only reach
+    `localhost:4566`. Signing the worker's address would hand out a URL that resolves nowhere.
+
+    **It is read by the API and by nothing else** (`app.py`). The worker and the re-export
+    script perform real S3 operations and use `aws_endpoint_url`, which keeps `PutObject` on
+    the internal address where it belongs (guidelines §13's least-privilege table).
+    """
+
     # Observability.
     langsmith_tracing: bool
     langsmith_api_key: str | None = field(repr=False)
@@ -161,13 +179,12 @@ class Config:
     """
 
     max_job_runtime: int
-    """How long one job may run, in seconds. guidelines §17's whole-job row.
+    """The no-new-node deadline for one worker invocation, in seconds.
 
-    **Configured, not enforced.** Nothing in the graph reads this yet: the whole-job timeout
-    arrives with the worker in Phase 3, which is the first component that owns a job's
-    lifetime. It is here so the number has one home and the measurement harness can say when
-    a run went over it - not so that anything currently stops at it. A value the code claims
-    to honour and does not is worse than no value (guidelines §17).
+    The worker checks it after each durable LangGraph checkpoint. Once reached, it starts no
+    further node and records `job_timeout`; a node already in flight may finish after the deadline.
+    It is therefore a soft between-node deadline, not a thread-cancelling hard wall and not the
+    lifetime of a job that may wait days at the human gate (ADR 0010 decision 7, ADR 0015).
     """
 
     # Content caps, enforced at the tool boundary before any byte reaches a prompt.
@@ -233,6 +250,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         s3_bucket=_optional(source, "S3_BUCKET"),
         aws_region=_optional(source, "AWS_REGION") or "ap-south-1",
         aws_endpoint_url=_optional(source, "AWS_ENDPOINT_URL"),
+        s3_public_endpoint_url=_optional(source, "S3_PUBLIC_ENDPOINT_URL"),
         langsmith_tracing=langsmith_tracing,
         langsmith_api_key=langsmith_api_key,
         langsmith_project=_optional(source, "LANGSMITH_PROJECT") or "competitive-research",
@@ -248,7 +266,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         # ADR 0006's bound on the reviewer-edit path. 3 keeps the hop ceiling at 23.
         max_reviewer_edits=_int(source, "MAX_REVIEWER_EDITS", default=3),
         researcher_concurrency=_researcher_concurrency(source),
-        # guidelines §17's whole-job row, 20 minutes. Configured only - see the field.
+        # guidelines §17's per-invocation no-new-node deadline, 20 minutes.
         max_job_runtime=_int(source, "MAX_JOB_RUNTIME", default=1200),
         max_fetch_bytes=_int(source, "MAX_FETCH_BYTES", default=2_097_152),
         max_page_chars=_int(source, "MAX_PAGE_CHARS", default=24_000),

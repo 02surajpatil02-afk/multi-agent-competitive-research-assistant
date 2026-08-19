@@ -1,6 +1,8 @@
 # ADR 0010 — Job dispatch and status across API → SQS → worker
 
-- **Status:** **Accepted, 2026-08-17.** Not built. Blocks implementation step 20. Accepted unchanged
+- **Status:** **Accepted, 2026-08-17; decision 8 superseded by
+  [ADR 0015](0015-visibility-leases-replace-static-duration-ownership.md), 2026-08-19.** Not built at
+  acceptance. Blocks implementation step 20. Accepted unchanged
   — the reviewer-gate work of 2026-08-17 ([ADR 0013](0013-reviewer-gate-payload-view.md),
   [ADR 0014](0014-gate-review-history-is-not-snapshotted.md)) touches nothing this record decides
 - **Date:** 2026-08-16

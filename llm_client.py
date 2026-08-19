@@ -15,8 +15,8 @@ WHY THIS FILE EXISTS
         validation retry, and it carries the validation error into the retry prompt,
         because a retry that repeats the same prompt is a coin flip (guidelines §3).
       * Timeouts and transport retries, per model tier (guidelines §17).
-      * 429 backoff. Retry-After when the endpoint sends it, otherwise the documented
-        schedule (guidelines §13, §17).
+      * 429 backoff. Numeric Retry-After is honoured through the documented 30-second
+        policy ceiling; otherwise the client uses the normal schedule (guidelines §13, §17).
       * The per-job call budget. Every request sent counts, including retries, because
         every request spends a token of the same 40 RPM tier.
       * Tracing, when it is switched on. `wrap_openai` puts one LangSmith span around each
@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from time import sleep
@@ -119,6 +120,14 @@ _TRANSPORT_BACKOFF_S: dict[ModelTier, tuple[float, ...]] = {
     "fast": (1.0, 4.0),
 }
 _RATE_LIMIT_BACKOFF_S: tuple[float, ...] = (2.0, 8.0, 30.0)
+MAX_RETRY_AFTER_S = max(_RATE_LIMIT_BACKOFF_S)
+"""Largest provider-directed 429 delay we will serve.
+
+Thirty seconds is already the retry policy's largest fallback and the fast tier's complete
+request timeout.  Honouring a larger header would let the provider replace this client's finite
+retry policy with an arbitrarily long sleep; clipping it preserves Retry-After semantics without
+letting one response escape the job's bounded-wait policy.
+"""
 
 _LIMITER_BACKOFF_S: tuple[float, ...] = (2.0, 8.0)
 """guidelines §17's rate-limiter row: two retries, at 2s and 8s. The 5s bound on each
@@ -432,16 +441,20 @@ def _system_prompt(system: str, schema: type[BaseModel]) -> str:
 
 
 def _retry_after(error: RateLimitError) -> float | None:
-    """Seconds from the Retry-After header, or None to use the documented schedule.
+    """Bounded seconds from Retry-After, or None to use the documented schedule.
 
     The header may also carry an HTTP date, which is not worth parsing for a value that
-    already has a sane fallback.
+    already has a sane fallback. Negative and non-finite numbers are invalid delays, and a
+    numeric provider value cannot exceed the largest delay our own policy would choose.
     """
     response = getattr(error, "response", None)
     header = response.headers.get("retry-after") if response is not None else None
     if header is None:
         return None
     try:
-        return float(header)
+        delay = float(header)
     except ValueError:
         return None
+    if not math.isfinite(delay) or delay < 0:
+        return None
+    return min(delay, MAX_RETRY_AFTER_S)
