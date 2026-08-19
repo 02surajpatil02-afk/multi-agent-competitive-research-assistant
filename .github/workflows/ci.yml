@@ -84,8 +84,11 @@ jobs:
           enable-cache: true
       - name: Install locked development dependencies
         run: uv sync --frozen --extra dev
-      - name: Start Compose infrastructure
-        run: docker compose --env-file .env.example up -d --wait
+      # Only the service this layer actually needs. `--wait` waits on the healthcheck of
+      # every service it starts, so starting the whole default stack made `pytest -m postgres`
+      # depend on LocalStack's queue-and-bucket check - a dependency the suite does not have.
+      - name: Start PostgreSQL 16
+        run: docker compose --env-file .env.example up -d --wait postgres
       - name: Run PostgreSQL 16 suite
         env:
           TEST_DATABASE_URL: postgresql://research:research@localhost:5432/research_test
@@ -108,8 +111,8 @@ jobs:
           enable-cache: true
       - name: Install locked development dependencies
         run: uv sync --frozen --extra dev
-      - name: Start Compose infrastructure
-        run: docker compose --env-file .env.example up -d --wait
+      - name: Start Redis 7
+        run: docker compose --env-file .env.example up -d --wait redis
       - name: Run Redis 7 suite
         env:
           TEST_REDIS_URL: redis://localhost:6379/15
@@ -132,8 +135,10 @@ jobs:
           enable-cache: true
       - name: Install locked development dependencies
         run: uv sync --frozen --extra dev
-      - name: Start Compose infrastructure
-        run: docker compose --env-file .env.example up -d --wait
+      # LocalStack only: the queue and S3 suites reach it for real, and use a temporary
+      # SQLite database (tests/dbharness.py) rather than the `postgres` service.
+      - name: Start LocalStack
+        run: docker compose --env-file .env.example up -d --wait localstack
       - name: Run LocalStack SQS and S3 suite
         env:
           SQS_ENDPOINT_URL: http://localhost:4566
