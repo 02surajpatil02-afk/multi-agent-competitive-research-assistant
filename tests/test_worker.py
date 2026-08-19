@@ -47,6 +47,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -1372,9 +1373,12 @@ def test_one_transient_heartbeat_failure_recovers_without_losing_ownership(
     )
 
     lease.start()
-    assert recovered.wait(timeout=1.0)
-    assert not lease.ownership_lost
-    lease.stop(reason="test complete")
+    try:
+        assert recovered.wait(timeout=1.0)
+        assert not lease.ownership_lost
+    finally:
+        lease.stop(reason="test complete")
+    assert lease._thread is not None and not lease._thread.is_alive()
 
 
 def test_two_consecutive_heartbeat_failures_make_ownership_unsafe(
@@ -1403,12 +1407,13 @@ def test_two_consecutive_heartbeat_failures_make_ownership_unsafe(
     )
 
     lease.start()
-    assert failed_twice.wait(timeout=1.0)
-    deadline = time.monotonic() + 1.0
-    while not lease.ownership_lost and time.monotonic() < deadline:
-        time.sleep(0.001)
-    assert lease.ownership_lost
-    lease.stop(reason="ownership lost")
+    try:
+        assert failed_twice.wait(timeout=1.0)
+        assert lease._ownership_lost.wait(timeout=1.0)
+        assert lease.ownership_lost
+    finally:
+        lease.stop(reason="ownership lost")
+    assert lease._thread is not None and not lease._thread.is_alive()
 
 
 def test_a_failed_renewal_retry_is_derived_earlier_than_the_next_healthy_cadence() -> None:
@@ -1443,8 +1448,15 @@ def test_no_renewal_retry_is_claimed_after_the_safe_start_deadline() -> None:
 
 def test_scheduler_lateness_past_the_safe_deadline_loses_ownership_without_a_call(
     queue: FakeQueue,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    now = time.monotonic()
+    # A fresh Linux runner can have less than 1,200 seconds of monotonic uptime.  Keep the
+    # synthetic receipt timestamp positive so it is not confused with JobMessage's zero sentinel.
+    monotonic = time.monotonic
+    clock_offset = max(0.0, 1201.0 - monotonic())
+    clock = SimpleNamespace(monotonic=lambda: monotonic() + clock_offset)
+    monkeypatch.setattr(worker, "time", clock)
+    now = clock.monotonic()
     message = JobMessage(
         **{
             **_lease_message().__dict__,
@@ -1455,15 +1467,14 @@ def test_scheduler_lateness_past_the_safe_deadline_loses_ownership_without_a_cal
 
     lease.start()
     try:
-        # Ownership loss is published by the heartbeat's Event. Waiting for that transition
-        # rather than polling a one-second wall-clock window keeps this scheduler test reliable
-        # when a CI runner delays the background thread.
-        assert lease._ownership_lost.wait(timeout=5.0)
+        # The overdue initial schedule must publish ownership loss as the thread starts.
+        assert lease._ownership_lost.wait(timeout=1.0)
         assert lease.ownership_lost
         assert queue.visibility_extensions == []
         assert lease.state.scheduling_lateness_s >= 600.0
     finally:
         lease.stop(reason="unsafe before call")
+    assert lease._thread is not None and not lease._thread.is_alive()
 
 
 def test_successful_renewal_uses_attempt_start_for_expiry_and_restores_healthy_schedule(
@@ -1483,16 +1494,22 @@ def test_successful_renewal_uses_attempt_start_for_expiry_and_restores_healthy_s
         visibility_timeout_s=cast(int, 0.09),
         renewal_call_envelope_s=0.001,
     )
+    initial = lease.state
+    assert initial.last_attempt_started_at is None
+    assert initial.next_attempt_at == pytest.approx(initial.lease_started_at + 0.01)
 
     lease.start()
-    assert renewed.wait(timeout=1.0)
-    state = lease.state
-    assert state.last_attempt_started_at is not None
-    assert state.last_successful_renewal_started_at == state.last_attempt_started_at
-    assert state.estimated_expiry == pytest.approx(state.last_attempt_started_at + 0.09)
-    assert state.next_attempt_at == pytest.approx(state.last_attempt_started_at + 0.01)
-    assert state.consecutive_failures == 0
-    lease.stop(reason="state observed")
+    try:
+        assert renewed.wait(timeout=1.0)
+        state = lease.state
+        assert state.last_attempt_started_at is not None
+        assert state.last_successful_renewal_started_at == state.last_attempt_started_at
+        assert state.estimated_expiry == pytest.approx(state.last_attempt_started_at + 0.09)
+        assert state.next_attempt_at == pytest.approx(state.last_attempt_started_at + 0.01)
+        assert state.consecutive_failures == 0
+    finally:
+        lease.stop(reason="state observed")
+    assert lease._thread is not None and not lease._thread.is_alive()
 
 
 def test_an_invalid_receipt_handle_loses_ownership_immediately(
@@ -1510,12 +1527,13 @@ def test_an_invalid_receipt_handle_loses_ownership_immediately(
     lease = VisibilityLease(cast(Any, queue), _lease_message(), visibility_timeout_s=1800)
 
     lease.start()
-    assert attempted.wait(timeout=1.0)
-    deadline = time.monotonic() + 1.0
-    while not lease.ownership_lost and time.monotonic() < deadline:
-        time.sleep(0.001)
-    assert lease.ownership_lost
-    lease.stop(reason="ownership lost")
+    try:
+        assert attempted.wait(timeout=1.0)
+        assert lease._ownership_lost.wait(timeout=1.0)
+        assert lease.ownership_lost
+    finally:
+        lease.stop(reason="ownership lost")
+    assert lease._thread is not None and not lease._thread.is_alive()
 
 
 def test_ownership_loss_during_a_node_stops_after_its_checkpoint_without_acknowledging(
