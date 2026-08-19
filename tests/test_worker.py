@@ -1454,14 +1454,16 @@ def test_scheduler_lateness_past_the_safe_deadline_loses_ownership_without_a_cal
     lease = VisibilityLease(cast(Any, queue), message, visibility_timeout_s=1800)
 
     lease.start()
-    deadline = time.monotonic() + 1.0
-    while not lease.ownership_lost and time.monotonic() < deadline:
-        time.sleep(0.001)
-
-    assert lease.ownership_lost
-    assert queue.visibility_extensions == []
-    assert lease.state.scheduling_lateness_s >= 600.0
-    lease.stop(reason="unsafe before call")
+    try:
+        # Ownership loss is published by the heartbeat's Event. Waiting for that transition
+        # rather than polling a one-second wall-clock window keeps this scheduler test reliable
+        # when a CI runner delays the background thread.
+        assert lease._ownership_lost.wait(timeout=5.0)
+        assert lease.ownership_lost
+        assert queue.visibility_extensions == []
+        assert lease.state.scheduling_lateness_s >= 600.0
+    finally:
+        lease.stop(reason="unsafe before call")
 
 
 def test_successful_renewal_uses_attempt_start_for_expiry_and_restores_healthy_schedule(
