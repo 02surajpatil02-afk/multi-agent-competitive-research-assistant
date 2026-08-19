@@ -69,3 +69,8 @@ CLAUDE.md
 # Compose.
 docker-compose.yml
 docker
+
+# The AWS infrastructure definition (Phase 5 block A). The image is what Terraform deploys;
+# it never reads a .tf file, and terraform.tfstate is exactly the kind of file a build context
+# must not carry to a remote or shared builder.
+infra

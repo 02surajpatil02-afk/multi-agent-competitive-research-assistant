@@ -1,0 +1,62 @@
+# The committed template. `terraform.tfvars` itself is gitignored, for the same reason `.env`
+# is: it is where the filled-in credentials go.
+#
+# **Prefer the environment over this file.** Every variable below can be supplied as
+# `TF_VAR_<name>`, which keeps the credential out of the working tree entirely:
+#
+#     export TF_VAR_db_password='...'          # PowerShell: $env:TF_VAR_db_password = '...'
+#     export TF_VAR_llm_api_key='...'
+#     export TF_VAR_tavily_api_key='...'
+#     export TF_VAR_auth_keys='{"<sha256>":{"user_id":"...","role":"reviewer"}}'
+#
+# Copy to terraform.tfvars only if you would rather keep them in a file, and delete it after the
+# teardown.
+
+# --- Required: no default exists for any of these -------------------------------------------
+
+# The image tag all three task definitions run. A commit SHA, never `latest`
+# (guidelines section 19): rollback is redeploying the previous task definition, and `latest`
+# cannot name one.
+image_tag = "REPLACE-WITH-COMMIT-SHA"
+
+# The RDS master password. Generate one; do not reuse anything.
+db_password = "REPLACE-ME"
+
+# The worker's model endpoint. The API never receives these (ADR 0012).
+llm_base_url = "https://REPLACE-ME/v1"
+llm_model    = "REPLACE-ME"
+llm_api_key  = "REPLACE-ME"
+
+# The worker's search credential.
+tavily_api_key = "REPLACE-ME"
+
+# The API's hashed key table (guidelines section 16): a sha256 of each API key mapped to its
+# user_id and role. **Generate throwaway keys for this deployment.** The two development keys
+# published in .env.example must never be used here, and the ALB speaks plain HTTP, so any key
+# sent to this deployment travels in clear text.
+#
+#     python -c "import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())"
+auth_keys = "{\"REPLACE-WITH-SHA256\":{\"user_id\":\"11111111-1111-4111-8111-111111111111\",\"role\":\"reviewer\"}}"
+
+# --- Optional: shown with their defaults -----------------------------------------------------
+
+# region      = "ap-south-1"
+# name_prefix = "competitive-research"
+
+# Narrow this to your own address whenever the demo link is not being shared.
+# allowed_ingress_cidrs = ["203.0.113.4/32"]
+
+# llm_fast_model = ""      # empty falls back to llm_model, exactly as config.py does
+
+# api_desired_count    = 1
+# worker_desired_count = 1
+
+# db_instance_class = "db.t4g.micro"
+# redis_node_type   = "cache.t4g.micro"
+
+# log_retention_days = 1
+
+# Both default to true because this environment is temporary. Set them false for anything whose
+# data outlives the demo - and read what they cost in docs/deployment.md first.
+# rds_skip_final_snapshot = true
+# s3_force_destroy        = true

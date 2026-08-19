@@ -27,3 +27,17 @@ docs/interview-prep.md
 docs/engineering-guidelines.md
 
 CLAUDE.md
+
+# Terraform (infra/, Phase 5 block A). The state file holds the database password, every
+# generated name, and the whole resource graph; .terraform/ is a provider download; and
+# terraform.tfvars is where the filled-in credentials go, the way .env is above.
+# infra/terraform.tfvars.example is the committed template.
+#
+# `.terraform.lock.hcl` is deliberately NOT ignored: it pins each provider's version and hash,
+# which is the same argument uv.lock carries above. `terraform init` writes it; commit it.
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log

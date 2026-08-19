@@ -2854,6 +2854,40 @@ authorization check (§7).
 - Autoscaling is **off**. Worker count is fixed at 2 and bounded by the LLM rate limit, not queue
   depth (§11).
 
+### The temporary portfolio deployment — Phase 5 block A, built 2026-08-20
+
+**Everything above this heading describes the long-running production shape, and it is still what
+production should look like.** What was actually built on 2026-08-20 is a smaller thing with the
+same components, for a different requirement: deploy, verify end to end, collect evidence,
+destroy — about an hour of life, against limited credits. It lives in `infra/` as Terraform and
+**has never been applied**; `docs/deployment.md` is its deploy, verify, cost and teardown runbook.
+
+| | Production shape (above) | Built in block A |
+|---|---|---|
+| Entry | API Gateway with a Cognito JWT authorizer | **ALB on plain HTTP**, API-key auth unchanged. HTTPS needs ACM, which needs a domain |
+| Task subnets | Private, egress through NAT | **Public, with public IPs and no NAT gateway** ([ADR 0019](adr/0019-no-nat-gateway-in-the-temporary-aws-deployment.md)) |
+| API tasks | 2, behind a target group | 1 |
+| Worker tasks | 2, fixed | 1, fixed. Still never autoscaled on queue depth |
+| RDS | Multi-AZ, backups | **Single-AZ, `db.t4g.micro`, no backups, no final snapshot** |
+| ElastiCache | Replication group, TLS, auth token | **One `cache.t4g.micro` node, `redis://`** — which is why `redisstore.build_redis` needs no change |
+| Secrets | Secrets Manager | **Plaintext task-definition environment.** Block B's first job |
+| Observability | CloudWatch logs, metrics, alarms | Three log groups at 1-day retention. **No alarm exists** |
+
+**Three things are identical in both columns, and that is the point.** One image with three
+commands; the migration as a one-off task that must exit 0 before anything relies on the schema;
+and the worker's `stopTimeout: 120`. §19 below is satisfied by the built task definitions rather
+than only requested by them — *"no ECS task definition exists yet"* in the next section was true
+until 2026-08-20 and is now the one sentence there that has been overtaken.
+
+**One consequence of the health contract is visible on AWS and was not visible locally.**
+`/health` reports `checks.checkpoints`, and LangGraph's tables are created by the **worker's**
+`setup()` — Alembic never touches them and the API never calls it (ADR 0012). So a freshly applied
+deployment answers 503 until the first worker starts, and the ALB correctly routes nothing to it.
+That is not weakened to make ECS green: the API service carries a health-check grace period, which
+stops ECS killing the task during the window without making the target healthy.
+`docs/deployment.md` §3 is the startup order this produces.
+
+
 ---
 
 ## 19. Deployment Boundaries
@@ -3423,4 +3457,5 @@ the episodes recur against a paid endpoint.
 |---|---|
 | What is this project, and what must never break? | `../CLAUDE.md` |
 | How is each part built, and why? | `engineering-guidelines.md` |
+| How is this deployed to AWS, and how is it torn down? | `deployment.md` - the temporary portfolio deployment, built 2026-08-20 |
 | Why was a decision made this way? | §20 above, and `docs/adr/` once ADRs exist |

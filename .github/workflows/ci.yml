@@ -70,6 +70,42 @@ jobs:
       - name: Run offline suite
         run: uv run pytest -q
 
+  # The AWS infrastructure definition, checked without an AWS account (Phase 5 block A).
+  #
+  # **Nothing here touches AWS and nothing here needs a credential.** `init -backend=false`
+  # downloads the providers and configures no state; `validate` then checks syntax, references,
+  # types and required arguments entirely offline. There is deliberately **no `plan` and no
+  # `apply`**: a plan reads real account state, which would make this job need credentials and
+  # would make CI able to change infrastructure. Deployment is a person's decision, taken by
+  # following docs/deployment.md.
+  #
+  # The Python contract tests in `tests/test_infrastructure_terraform.py` run in `unit` above
+  # and answer a different question - not "is this valid HCL" but "does it still describe the
+  # architecture we agreed", such as no NAT gateway, no public database, and a worker with no
+  # ingress rule. Neither replaces the other.
+  infra:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      # From HashiCorp's own signed apt repository rather than a pinned tarball, so the
+      # signature is checked and no download URL has to be guessed at.
+      - name: Install Terraform
+        run: |
+          wget -qO- https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update
+          sudo apt-get install -y terraform
+          terraform version
+      - name: Check formatting
+        run: terraform -chdir=infra fmt -check -recursive -diff
+      - name: Initialise the providers without a backend
+        run: terraform -chdir=infra init -backend=false -input=false
+      - name: Validate
+        run: terraform -chdir=infra validate
+
   # The deterministic evaluation gate. Its own job rather than a step inside `unit`, because
   # the two answer different questions and a build log should say which one broke: `unit`
   # answers "does the code work", this answers "does the evaluation framework still hold its
