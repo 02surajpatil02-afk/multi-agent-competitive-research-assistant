@@ -86,7 +86,7 @@ from config import Config
 from database import queries
 from graph.state import TERMINAL_STATUSES, ResearchState, refuse_edit, reviewer_payload, run_config
 from jobqueue import JobQueue, QueueError
-from routes.auth import Identity, identity_from
+from routes.auth import Authenticator, Identity
 from schemas import GateDecision, JobStatus, QualityFlag
 
 logger = logging.getLogger(__name__)
@@ -196,7 +196,13 @@ class RouteDeps:
     engine: Engine
     checkpoints: BaseCheckpointSaver[Any]
     queue: JobQueue
-    keys: dict[str, Identity]
+    authenticator: Authenticator
+    """Whichever of the two credentials this deployment accepts (ADR 0020 decision 2).
+
+    The route layer never learns which. It asks for the caller behind a header and receives an
+    `Identity` or `None`, exactly as it did when the only answer came from a hashed key table.
+    """
+
     redis: RedisProbe | None = None
     artifacts: ReportPresigner | None = None
     """What `GET /jobs/{id}/report` signs a URL with (step 22a).
@@ -238,13 +244,14 @@ def _deps(request: Request) -> RouteDeps:
 def _caller(request: Request) -> Identity:
     """The authenticated caller, or `401`.
 
-    Absent header, wrong scheme and unknown key are one answer on purpose: distinguishing
-    them tells an attacker which half of the credential to work on.
+    Absent header, wrong scheme, unknown key, expired token, wrong issuer and a token carrying
+    no role group are one answer on purpose: distinguishing them tells an attacker which half of
+    the credential to work on.
     """
-    identity = identity_from(request.headers.get("authorization"), _deps(request).keys)
+    identity = _deps(request).authenticator.identity(request.headers.get("authorization"))
     if identity is None:
         raise ApiError(
-            status.HTTP_401_UNAUTHORIZED, "unauthenticated", "A valid API key is required"
+            status.HTTP_401_UNAUTHORIZED, "unauthenticated", "A valid credential is required"
         )
     return identity
 

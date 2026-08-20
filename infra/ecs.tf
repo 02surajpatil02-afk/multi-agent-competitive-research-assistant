@@ -19,19 +19,38 @@
 #     why the API service carries a health-check grace period rather than a weakened check.
 #     docs/deployment.md gives the startup order this produces.
 #
-#     **Every credential below is a plaintext task-definition environment variable.** That is
-#     Block A's stated interface and Block B's first job: `secrets` with `valueFrom` pointing at
-#     Secrets Manager, and `secretsmanager:GetSecretValue` on the execution role in iam.tf.
-#     Anyone who can call `ecs:DescribeTaskDefinition` can read these values today.
+#     **No credential appears in any `environment` block below** (Block B, ADR 0020 decision 1).
+#     Every secret arrives through `secrets`, which names a Secrets Manager ARN rather than a
+#     value: the ECS agent fetches it at task start using the execution role, and the container
+#     sees an ordinary environment variable. `ecs:DescribeTaskDefinition` now returns ARNs, and
+#     a task definition revision - which is kept forever, long after the deployment is destroyed
+#     - no longer carries a password.
 #
 # WHO USES IT
 #     `terraform apply`, and the operator commands in docs/deployment.md.
 
 locals {
-  # `endpoint` is already `host:port`, so the URL needs no port of its own. The password is
-  # URL-encoded because a libpq connection string is a URL and a `@` or `/` in a generated
-  # password would otherwise end the credential early.
-  database_url = "postgresql://${var.db_username}:${urlencode(var.db_password)}@${aws_db_instance.postgres.endpoint}/${var.db_name}"
+  # **The database arrives in parts, not as a URL.** RDS generates and holds the master password
+  # (`manage_master_user_password`), so no value Terraform can see would complete a connection
+  # string - which is exactly why the password is not in the state file. The two halves of the
+  # credential come from the RDS-managed secret's JSON below, and the container composes the URL
+  # (`config.resolve_database_url`, ADR 0020 decision 1).
+  #
+  # `address` rather than `endpoint`, because `endpoint` is already `host:port` and these are
+  # separate variables.
+  database_environment = [
+    { name = "DB_HOST", value = aws_db_instance.postgres.address },
+    { name = "DB_PORT", value = tostring(aws_db_instance.postgres.port) },
+    { name = "DB_NAME", value = var.db_name },
+  ]
+
+  # `secretsmanager:...:json-key::` is how ECS reads one field out of a JSON secret. The RDS
+  # managed secret holds `{"username": ..., "password": ...}` and nothing else, which is why the
+  # host, port and database name are plain environment above.
+  database_secrets = [
+    { name = "DB_USER", valueFrom = "${local.db_secret_arn}:username::" },
+    { name = "DB_PASSWORD", valueFrom = "${local.db_secret_arn}:password::" },
+  ]
 
   redis_url = "redis://${aws_elasticache_cluster.redis.cache_nodes[0].address}:${aws_elasticache_cluster.redis.port}/0"
 
@@ -46,14 +65,32 @@ locals {
   # correct and `artifacts.presign` signs a URL that already resolves. Setting either here
   # would sign a private or wrong host into a SigV4 signature that cannot be rewritten
   # afterwards.
-  common_environment = [
-    { name = "DATABASE_URL", value = local.database_url },
+  common_environment = concat(local.database_environment, [
     { name = "REDIS_URL", value = local.redis_url },
     { name = "SQS_QUEUE_URL", value = aws_sqs_queue.jobs.url },
     { name = "S3_BUCKET", value = aws_s3_bucket.reports.id },
     { name = "AWS_REGION", value = var.region },
     { name = "APP_ENV", value = "prod" },
     { name = "LOG_LEVEL", value = var.log_level },
+  ])
+
+  # **Not secrets, and deliberately plain.** Verifying a Cognito token needs a published signing
+  # key, a published issuer and a client id; none of the three is a credential, and putting them
+  # in Secrets Manager would buy nothing and cost a fetch at every task start.
+  api_auth_environment = local.cognito_enabled ? [
+    { name = "AUTH_MODE", value = "cognito" },
+    { name = "COGNITO_USER_POOL_ID", value = aws_cognito_user_pool.main[0].id },
+    { name = "COGNITO_CLIENT_ID", value = aws_cognito_user_pool_client.api[0].id },
+    { name = "COGNITO_REGION", value = var.region },
+    ] : [
+    { name = "AUTH_MODE", value = "api_key" },
+  ]
+
+  # The key table, when there still is one. Under Cognito the API holds **no shared secret at
+  # all** - which is why this list is empty and its execution role is granted nothing but the
+  # database credential.
+  api_auth_secrets = local.cognito_enabled ? [] : [
+    { name = "AUTH_KEYS", valueFrom = aws_secretsmanager_secret.auth_keys[0].arn },
   ]
 }
 
@@ -145,7 +182,7 @@ resource "aws_ecs_task_definition" "api" {
   network_mode             = "awsvpc"
   cpu                      = var.api_cpu
   memory                   = var.api_memory
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution["api"].arn
   task_role_arn            = aws_iam_role.api.arn
 
   runtime_platform {
@@ -169,12 +206,13 @@ resource "aws_ecs_task_definition" "api" {
       protocol      = "tcp"
     }]
 
-    # **AUTH_KEYS is here and no LLM or Tavily variable is** - ADR 0012 as configuration rather
-    # than as intent. The API process starts, serves all six routes and passes its health check
-    # with no provider credential in its environment.
-    environment = concat(local.common_environment, [
-      { name = "AUTH_KEYS", value = var.auth_keys },
-    ])
+    # **No LLM or Tavily variable, in either list** - ADR 0012 as configuration rather than as
+    # intent. The API process starts, serves all six routes and passes its health check with no
+    # provider credential in its environment, and its execution role cannot fetch one either.
+    environment = concat(local.common_environment, local.api_auth_environment)
+
+    # The database credential, and the key table only in the mode that has one.
+    secrets = concat(local.database_secrets, local.api_auth_secrets)
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -195,7 +233,7 @@ resource "aws_ecs_task_definition" "worker" {
   network_mode             = "awsvpc"
   cpu                      = var.worker_cpu
   memory                   = var.worker_memory
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution["worker"].arn
   task_role_arn            = aws_iam_role.worker.arn
 
   runtime_platform {
@@ -221,12 +259,17 @@ resource "aws_ecs_task_definition" "worker" {
     # the message is still never deleted, and redelivery is still the recovery path.
     stopTimeout = 120
 
+    # An endpoint and two model ids are configuration, not credentials, so they stay here where
+    # they can be read and changed. The two keys are below.
     environment = concat(local.common_environment, [
       { name = "LLM_BASE_URL", value = var.llm_base_url },
       { name = "LLM_MODEL", value = var.llm_model },
       { name = "LLM_FAST_MODEL", value = var.llm_fast_model },
-      { name = "LLM_API_KEY", value = var.llm_api_key },
-      { name = "TAVILY_API_KEY", value = var.tavily_api_key },
+    ])
+
+    secrets = concat(local.database_secrets, [
+      { name = "LLM_API_KEY", valueFrom = aws_secretsmanager_secret.llm_api_key.arn },
+      { name = "TAVILY_API_KEY", valueFrom = aws_secretsmanager_secret.tavily_api_key.arn },
     ])
 
     logConfiguration = {
@@ -242,16 +285,16 @@ resource "aws_ecs_task_definition" "worker" {
   tags = { Name = "${local.name}-worker" }
 }
 
-# The one-off. It has **no service, no task role and no environment beyond a database URL** - a
-# migration needs no LLM key, no queue and no bucket, and this is the one point where least
-# privilege costs nothing at all.
+# The one-off. It has **no service, no task role, and nothing but a database** - a migration
+# needs no LLM key, no queue and no bucket, and this is the one point where least privilege
+# costs nothing at all.
 resource "aws_ecs_task_definition" "migrate" {
   family                   = "${local.name}-migrate"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = 256
   memory                   = 512
-  execution_role_arn       = aws_iam_role.execution.arn
+  execution_role_arn       = aws_iam_role.execution["migrate"].arn
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -265,9 +308,10 @@ resource "aws_ecs_task_definition" "migrate" {
 
     command = ["alembic", "upgrade", "head"]
 
-    environment = [
-      { name = "DATABASE_URL", value = local.database_url },
-    ]
+    # Connectivity and the database credential, and nothing else. Its execution role can fetch
+    # this one secret and no other.
+    environment = local.database_environment
+    secrets     = local.database_secrets
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -318,8 +362,10 @@ resource "aws_ecs_service" "api" {
   # authenticated path into the process that holds the key table.
   enable_execute_command = false
 
-  # The listener must exist before a service may register into its target group.
-  depends_on = [aws_lb_listener.http]
+  # The listener must exist before a service may register into its target group. Both are
+  # named: with a certificate configured the HTTPS one is what forwards, and the HTTP one
+  # redirects to it.
+  depends_on = [aws_lb_listener.http, aws_lb_listener.https]
 
   tags = { Name = "${local.name}-api" }
 }

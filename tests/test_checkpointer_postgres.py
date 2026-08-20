@@ -74,7 +74,7 @@ from graph.build import ResearchGraph, build_graph, postgres_checkpointer
 from graph.state import ResearchState, new_state, run_config
 from jobqueue import JobQueue
 from llm_client import LLMClient
-from routes.auth import Identity, hash_key
+from routes.auth import ApiKeyAuthenticator, Identity, hash_key
 from schemas import Finding, Report, ResearchPlan, Verdict
 
 pytestmark = pytest.mark.postgres
@@ -332,7 +332,9 @@ def _api_against(url: str, *, engine: Engine | None = None) -> FastAPI:
         checkpoints=checkpoints,
         queue=cast(JobQueue, FakeQueue()),
         # The table holds hashes, never keys (guidelines §16).
-        keys={hash_key("reviewer-key"): Identity(user_id=_REVIEWER_ID, role="reviewer")},
+        authenticator=ApiKeyAuthenticator(
+            {hash_key("reviewer-key"): Identity(user_id=_REVIEWER_ID, role="reviewer")}
+        ),
     )
 
 

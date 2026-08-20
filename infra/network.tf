@@ -188,6 +188,19 @@ resource "aws_vpc_security_group_ingress_rule" "alb_from_internet" {
   to_port           = 80
 }
 
+# The same range on 443, and only when there is a certificate to terminate with. An open 443
+# with no listener behind it would be a rule that describes nothing.
+resource "aws_vpc_security_group_ingress_rule" "alb_from_internet_tls" {
+  count = local.https_enabled ? length(var.allowed_ingress_cidrs) : 0
+
+  security_group_id = aws_security_group.alb.id
+  description       = "HTTPS from the configured client range"
+  cidr_ipv4         = var.allowed_ingress_cidrs[count.index]
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+
 resource "aws_vpc_security_group_egress_rule" "alb_to_api" {
   security_group_id            = aws_security_group.alb.id
   description                  = "Health checks and forwarded requests to the API container port"

@@ -63,4 +63,15 @@ locals {
   # explicitly Single-AZ and each service runs one task. Two AZs is the minimum the services
   # accept, not a redundancy decision.
   azs = slice(data.aws_availability_zones.available.names, 0, 2)
+
+  # The two Block B switches, resolved once so no file has to re-derive them (ADR 0020).
+  #
+  # `cognito_enabled` decides three things together and they must agree: whether the user pool
+  # exists, whether the API is told to verify tokens, and whether an auth-keys secret is created
+  # and granted. Under Cognito the API holds no shared secret at all.
+  cognito_enabled = var.auth_mode == "cognito"
+
+  # HTTPS exists exactly when an operator supplies a certificate. Nothing here creates one - see
+  # alb.tf for why a certificate needs a domain this repository does not own.
+  https_enabled = var.certificate_arn != ""
 }

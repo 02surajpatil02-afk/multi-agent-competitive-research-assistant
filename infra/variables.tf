@@ -2,11 +2,15 @@
 #     Everything an operator must decide, in one place, with the temporary-deployment default
 #     already chosen. Two rules run through it:
 #
-#     **A secret has no default.** `db_password`, `llm_api_key`, `tavily_api_key` and
-#     `auth_keys` are declared and never valued here, so `terraform apply` refuses to run
-#     without them and no credential can arrive by being forgotten. They are passed as
-#     `TF_VAR_*` environment variables (docs/deployment.md), which is also why
-#     `terraform.tfvars` is gitignored.
+#     **A secret has no default.** `llm_api_key` and `tavily_api_key` are declared and never
+#     valued here, so `terraform apply` refuses to run without them and no credential can arrive
+#     by being forgotten. They are passed as `TF_VAR_*` environment variables
+#     (docs/deployment.md), which is also why `terraform.tfvars` is gitignored.
+#
+#     **`db_password` is gone entirely**, and that is Block B's largest single improvement to
+#     state exposure: RDS generates the master password and holds it in a secret it owns, so
+#     there is no value for an operator to invent, type, or leave in `terraform.tfstate`
+#     (docs/adr/0020-*.md decision 1).
 #
 #     **An application tunable is not repeated here.** MAX_REVISIONS, MAX_JOB_RUNTIME,
 #     LLM_RPM_LIMIT and the rest have defaults in `config.py` and keep them; a second copy in
@@ -153,16 +157,6 @@ variable "db_username" {
   default     = "research"
 }
 
-variable "db_password" {
-  description = <<-EOT
-    The master password. **No default.** Passed as TF_VAR_db_password, and it lands in
-    `terraform.tfstate` and in the task definitions' plaintext environment - which is exactly
-    what Block B replaces with Secrets Manager.
-  EOT
-  type        = string
-  sensitive   = true
-}
-
 variable "rds_skip_final_snapshot" {
   description = <<-EOT
     `true` for the temporary deployment: a final snapshot is storage that keeps charging after
@@ -245,11 +239,62 @@ variable "tavily_api_key" {
 variable "auth_keys" {
   description = <<-EOT
     The API's hashed key table, as JSON mapping a sha256 of each key to its user_id and role
-    (guidelines section 16). **No default**, so the two published development keys in
-    .env.example cannot reach a deployment by accident.
+    (guidelines section 16). **Used only when auth_mode is `api_key`**, and empty otherwise:
+    under Cognito the API holds no shared secret and no auth-keys secret is created.
+
+    The default is empty rather than absent so that the Cognito deployment - the one this block
+    is for - needs no value at all. In `api_key` mode a value is required, and the validation
+    below is what refuses an apply that forgot it. The two published development keys in
+    .env.example must never be used here.
   EOT
   type        = string
   sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.auth_mode == "cognito" || trimspace(var.auth_keys) != ""
+    error_message = "auth_keys is required when auth_mode is api_key."
+  }
+}
+
+# --- Block B: how a caller proves who they are ------------------------------------------------
+
+variable "auth_mode" {
+  description = <<-EOT
+    Which credential the API accepts, and **only one is live at a time**
+    (docs/adr/0020-*.md decision 2). `cognito` verifies a Cognito access token against the
+    pool's published signing keys and is the default for this deployment; `api_key` keeps the
+    Phase 2 hashed key table, which is what every local command and the whole offline suite
+    still use.
+
+    An API that accepted either would be exactly as strong as the weaker of the two, and the
+    weaker one is a shared secret with no expiry.
+  EOT
+  type        = string
+  default     = "cognito"
+
+  validation {
+    condition     = contains(["cognito", "api_key"], var.auth_mode)
+    error_message = "auth_mode must be cognito or api_key."
+  }
+}
+
+variable "certificate_arn" {
+  description = <<-EOT
+    An **existing, already-validated** ACM certificate in this region. Set it and the load
+    balancer gains an HTTPS listener on 443 while port 80 redirects to it; leave it empty and
+    the deployment stays plain HTTP, which is the default because this repository owns no
+    domain (docs/adr/0020-*.md decision 5).
+
+    Nothing here creates a certificate or a hosted zone. A public ACM certificate cannot be
+    issued without a domain name to validate against, and inventing one would mean a Route 53
+    hosted zone that charges per month and outlives an hour-long deployment.
+
+    **With this empty, the bearer token travels in clear text.** Use throwaway credentials, and
+    read the trade in docs/deployment.md before showing the link to anyone.
+  EOT
+  type        = string
+  default     = ""
 }
 
 variable "log_level" {

@@ -62,7 +62,7 @@ from artifacts import ArtifactError, ArtifactStore, build_artifact_store, object
 from config import load_config
 from database import queries
 from graph.state import state_serde
-from routes.auth import Identity, hash_key
+from routes.auth import ApiKeyAuthenticator, Identity, hash_key
 
 pytestmark = pytest.mark.integration
 
@@ -498,7 +498,7 @@ def _api(db: Engine, store: ArtifactStore) -> TestClient:
         engine=db,
         checkpoints=InMemorySaver(serde=state_serde()),
         queue=cast(Any, FakeQueue()),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
         artifacts=store,
     )
     return TestClient(application)

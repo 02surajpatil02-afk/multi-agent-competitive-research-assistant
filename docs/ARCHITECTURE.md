@@ -2254,10 +2254,23 @@ means an unhealthy task is never replaced (§10).
 | Phase | Mechanism |
 |---|---|
 | 2 | **Static API keys.** Stored **hashed** in Secrets Manager under `AUTH_KEYS_SECRET_ID`, presented as `Authorization: Bearer <key>`, mapped to a role plus a `user_id` |
-| 5 | **API Gateway + Cognito JWT.** The role becomes a token claim; `user_id` comes from `sub` |
+| 5 block B | **Cognito access tokens**, verified by the API itself. Same `Authorization: Bearer …` header; `user_id` comes from `sub` and the role from a pool group ([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md)) |
 
-The Phase 5 change is confined to **one dependency in the route layer**, because everything
-downstream already reads a `user_id` and a role rather than a key.
+**Built, 2026-08-20, and it was the small change Phase 2 predicted.** `AUTH_MODE` picks one of the
+two — `api_key` locally and in the whole offline suite, `cognito` in the AWS deployment — and
+**never both**, because an API accepting either would be exactly as strong as the weaker one. What
+the route layer holds is an `Authenticator` with one method; `Identity`, `audit_events.actor`,
+`jobs.user_id`, the ownership check and the two roles are untouched.
+
+Six checks on a token, and each closes a specific forgery: `RS256` named rather than read from the
+token (`alg: none`, HMAC confusion), the signature against the pool's published JWKS, `iss` (a pool
+the attacker created), `exp`/`iat`, `token_use == "access"` (an id token used as an access token),
+and `client_id` (a token minted for another app in the same pool). A valid token whose user is in
+neither group authenticates nobody.
+
+**API Gateway is still not built**, and ALB's `authenticate-cognito` was evaluated and rejected: it
+is a browser redirect flow with a session cookie, and these callers are scripts (ADR 0020 decision
+4). There is one authorization decision, made in one place.
 
 *Why not JWT from the start?* One user, no signup. Self-hosted issuing, rotation, and revocation is
 machinery serving nobody. *Why not defer auth to Phase 5?* The approval endpoint ships in Phase 2;
@@ -2275,16 +2288,51 @@ test for exactly that.
 Environment variables locally, Secrets Manager in AWS. **Never in code, never in logs, never in a
 trace.** `gitleaks` runs in CI as a merge blocker (gl §16, gl §19).
 
+**Built in Phase 5 block B, and the delivery mechanism is the part worth knowing.** A secret reaches
+a container through the ECS task definition's `secrets` block, which names an ARN rather than a
+value: the **ECS agent** fetches it with the *execution* role before the process starts, and the
+application reads an ordinary environment variable exactly as it does locally. So **no application
+code calls Secrets Manager and neither task role can**, which is why a compromised worker process
+cannot fetch the auth table — it cannot fetch anything.
+
+Two consequences follow, and both are deliberate:
+
+- `ecs:DescribeTaskDefinition` returns ARNs, not credentials. That matters beyond the deployment's
+  life, because a task definition *revision* is retained after everything else is destroyed.
+- **RDS generates its own master password** into a secret it owns, so no database password passes
+  through Terraform and none is in `terraform.tfstate`. What that secret holds is
+  `{username, password}` with no host, so the container composes `DATABASE_URL` from five parts
+  (`config.resolve_database_url`, ADR 0020 decision 1).
+
+What remains: Terraform writes the LLM key, the search key and — in `api_key` mode — the key table,
+so those values are in local state. `docs/deployment.md` §6 treats the state file as a credential
+store and deletes it at teardown.
+
 ### Least privilege
 
-One task role per service (gl §16):
+**Two kinds of role, and the distinction is load-bearing.** An *execution* role starts a task —
+image pull, log stream, secret fetch. A *task* role is what the running application's SDK picks up.
 
-| Service | May |
+| Role | May |
 |---|---|
-| API task role | Read/write its Postgres schema, send to the job queue, presign objects under its S3 prefix, read the auth secret |
-| Worker task role | Receive/delete from its queue, read/write its Postgres schema, write its S3 prefix, read the LLM and Tavily secrets |
+| API task role | Read/write its Postgres schema, send to the job queue, presign objects under its S3 prefix |
+| Worker task role | Receive/delete/extend on its queue, read/write its Postgres schema, write its S3 prefix |
+| Migration task role | **There is none.** `alembic upgrade head` talks to PostgreSQL and to nothing AWS |
+| `api` execution role | Pull, log, and fetch the database credential — plus the key table in `api_key` mode |
+| `worker` execution role | Pull, log, and fetch the database credential, the LLM key and the search key |
+| `migrate` execution role | Pull, log, and fetch the database credential |
 
-Neither role gets anything else. The worker cannot presign; the API cannot consume the queue.
+Neither task role gets anything else. The worker cannot presign; the API cannot consume the queue;
+**neither can read a secret at all**. Three execution roles rather than one, because a shared role
+would have to be granted every secret all three tasks use — handing the API's task-start identity
+the LLM key, which is the [ADR 0012](adr/0012-the-api-stops-holding-a-compiled-graph.md) boundary
+undone in IAM while the task definition still looked clean.
+
+Every policy this repository writes names its actions one at a time and scopes them to a resource
+this configuration creates. The one wildcard in play is inside AWS's own
+`AmazonECSTaskExecutionRolePolicy`, for `ecr:GetAuthorizationToken` — an account-level call with no
+resource to scope to. Trust policies carry `aws:SourceAccount` and `aws:SourceArn` conditions, so
+these roles cannot be assumed on behalf of another account's ECS.
 
 ### SSRF — the highest-risk surface
 
@@ -2862,15 +2910,17 @@ same components, for a different requirement: deploy, verify end to end, collect
 destroy — about an hour of life, against limited credits. It lives in `infra/` as Terraform and
 **has never been applied**; `docs/deployment.md` is its deploy, verify, cost and teardown runbook.
 
-| | Production shape (above) | Built in block A |
+| | Production shape (above) | Built in blocks A and B |
 |---|---|---|
-| Entry | API Gateway with a Cognito JWT authorizer | **ALB on plain HTTP**, API-key auth unchanged. HTTPS needs ACM, which needs a domain |
+| Entry | API Gateway with a Cognito JWT authorizer | **ALB**, plain HTTP by default; an HTTPS listener with an 80 → 443 redirect appears when an operator supplies a certificate ARN. Nothing here creates a domain |
+| Authentication | Cognito, at the gateway | **Cognito, verified by the API itself** (block B, [ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md)). One user pool, two groups, access tokens only. `AUTH_MODE=api_key` still selects the Phase 2 table |
 | Task subnets | Private, egress through NAT | **Public, with public IPs and no NAT gateway** ([ADR 0019](adr/0019-no-nat-gateway-in-the-temporary-aws-deployment.md)) |
 | API tasks | 2, behind a target group | 1 |
 | Worker tasks | 2, fixed | 1, fixed. Still never autoscaled on queue depth |
-| RDS | Multi-AZ, backups | **Single-AZ, `db.t4g.micro`, no backups, no final snapshot** |
+| RDS | Multi-AZ, backups | **Single-AZ, `db.t4g.micro`, no backups, no final snapshot** — with an **RDS-managed master password**, so none is in Terraform state |
 | ElastiCache | Replication group, TLS, auth token | **One `cache.t4g.micro` node, `redis://`** — which is why `redisstore.build_redis` needs no change |
-| Secrets | Secrets Manager | **Plaintext task-definition environment.** Block B's first job |
+| Secrets | Secrets Manager, rotated | **Secrets Manager, injected through `secrets`/`valueFrom`** (block B). Written by Terraform rather than out of band, and not rotated |
+| IAM | Least privilege plus a permissions boundary | **Three per-task execution roles, two task roles, no task-role secret access**, and `aws:SourceAccount`/`aws:SourceArn` on every trust policy (block B). No permissions boundary |
 | Observability | CloudWatch logs, metrics, alarms | Three log groups at 1-day retention. **No alarm exists** |
 
 **Three things are identical in both columns, and that is the point.** One image with three

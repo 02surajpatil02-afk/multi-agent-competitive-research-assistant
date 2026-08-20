@@ -160,6 +160,85 @@ def test_a_database_url_is_kept_when_it_is_set() -> None:
     assert config.database_url == "postgresql://localhost:5432/x"
 
 
+def test_the_database_url_can_be_composed_from_the_parts_rds_hands_out() -> None:
+    """ADR 0020 decision 1. RDS can generate and hold its own master password, which is the only
+    arrangement in which no password ever passes through Terraform - and what it publishes then
+    is `{username, password}` with no host, so nothing upstream can build a URL."""
+    config = load_config(
+        _env(
+            DB_HOST="db.internal",
+            DB_PORT="5432",
+            DB_NAME="research",
+            DB_USER="research",
+            DB_PASSWORD="plain",
+        )
+    )
+
+    assert config.database_url == "postgresql://research:plain@db.internal:5432/research"
+
+
+def test_a_composed_password_is_percent_encoded() -> None:
+    """A libpq connection string is a URL, so a generated password containing `@` or `/` would
+    end the credential early and produce an error that reads like a wrong host."""
+    config = load_config(
+        _env(
+            DB_HOST="db.internal",
+            DB_NAME="research",
+            DB_USER="research",
+            DB_PASSWORD="p@ss/w:rd#1",
+        )
+    )
+
+    assert config.database_url == (
+        "postgresql://research:p%40ss%2Fw%3Ard%231@db.internal:5432/research"
+    )
+
+
+def test_an_explicit_database_url_always_wins_over_the_parts() -> None:
+    """Which is what keeps every local command, the Compose stack and the whole offline suite
+    untouched: they set `DATABASE_URL` and the parts are never read."""
+    config = load_config(
+        _env(
+            DATABASE_URL="postgresql://localhost:5432/x",
+            DB_HOST="db.internal",
+            DB_NAME="other",
+            DB_USER="other",
+            DB_PASSWORD="other",
+        )
+    )
+
+    assert config.database_url == "postgresql://localhost:5432/x"
+
+
+@pytest.mark.parametrize("missing", ["DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"])
+def test_a_half_configured_database_is_not_configured_at_all(missing: str) -> None:
+    """`None` rather than a URL with a hole in it: the caller already handles "no database",
+    and a string containing the word `None` would fail somewhere much further away."""
+    parts = {
+        "DB_HOST": "db.internal",
+        "DB_NAME": "research",
+        "DB_USER": "research",
+        "DB_PASSWORD": "plain",
+    }
+    del parts[missing]
+
+    assert load_config(_env(**parts)).database_url is None
+
+
+def test_the_default_auth_mode_is_the_key_table() -> None:
+    """So every local command and the whole offline suite behave exactly as before Block B."""
+    assert load_config(_env()).auth_mode == "api_key"
+
+
+def test_the_cognito_region_falls_back_to_the_deployments_region() -> None:
+    config = load_config(_env(AWS_REGION="eu-west-1"))
+
+    assert config.cognito_region == "eu-west-1"
+    assert load_config(_env(AWS_REGION="eu-west-1", COGNITO_REGION="us-east-1")).cognito_region == (
+        "us-east-1"
+    )
+
+
 def test_fast_model_falls_back_to_the_main_model() -> None:
     # The two-tier split trims cost at the edges; a missing fast model must not stop a job.
     assert load_config(_env()).llm_fast_model == "main-model"

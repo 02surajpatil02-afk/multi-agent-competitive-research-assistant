@@ -26,10 +26,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 
 AppEnv = Literal["local", "dev", "prod"]
+
+AuthMode = Literal["api_key", "cognito"]
+"""Which credential the API accepts, and deliberately not both at once (ADR 0020 decision 2).
+
+`api_key` is the Phase 2 hashed-key table and stays the default, so every local command and the
+whole offline suite behave exactly as before. `cognito` is the AWS deployment's mode: a Cognito
+access token, verified against the pool's JWKS. One mode is live per process - an API that
+accepted either would be exactly as strong as the weaker of the two.
+"""
 
 _DOTENV_PATH = Path(".env")
 """Relative to the working directory, not searched for. Every command in CLAUDE.md runs
@@ -192,6 +202,24 @@ class Config:
     max_page_chars: int
 
     # Auth. Required from Phase 2; None until then.
+    auth_mode: AuthMode
+    """Which of the two credentials `routes/auth.py` will accept. See `AuthMode` above."""
+
+    cognito_user_pool_id: str | None
+    cognito_client_id: str | None
+    cognito_region: str
+    """The three values that identify one Cognito user pool and one app client.
+
+    **None of them is a secret**, which is the point worth noticing: verifying a token needs a
+    public key, an issuer and a client id, and all three are published. So they are plain
+    environment variables in the task definition while the LLM key is not, and
+    `test_infrastructure_terraform.py` holds that distinction.
+
+    `cognito_region` is separate from `aws_region` only because it can be: a pool can live in a
+    region the rest of the deployment does not. It falls back to `aws_region`, which is what
+    this deployment uses.
+    """
+
     auth_keys_secret_id: str | None
 
     auth_keys: str | None = field(repr=False)
@@ -228,6 +256,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     source = os.environ if env is None else env
 
     llm_model = _optional(source, "LLM_MODEL")
+    aws_region = _optional(source, "AWS_REGION") or "ap-south-1"
     langsmith_tracing = _bool(source, "LANGSMITH_TRACING", default=False)
     langsmith_api_key = _optional(source, "LANGSMITH_API_KEY")
     if langsmith_tracing and langsmith_api_key is None:
@@ -244,11 +273,11 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         # guidelines §17's main-tier row. Overridden only where the endpoint is slow.
         llm_main_timeout_s=_float(source, "LLM_MAIN_TIMEOUT_S", default=60.0),
         tavily_api_key=_optional(source, "TAVILY_API_KEY"),
-        database_url=_optional(source, "DATABASE_URL"),
+        database_url=resolve_database_url(source),
         redis_url=_optional(source, "REDIS_URL") or "redis://localhost:6379/0",
         sqs_queue_url=_optional(source, "SQS_QUEUE_URL"),
         s3_bucket=_optional(source, "S3_BUCKET"),
-        aws_region=_optional(source, "AWS_REGION") or "ap-south-1",
+        aws_region=aws_region,
         aws_endpoint_url=_optional(source, "AWS_ENDPOINT_URL"),
         s3_public_endpoint_url=_optional(source, "S3_PUBLIC_ENDPOINT_URL"),
         langsmith_tracing=langsmith_tracing,
@@ -270,12 +299,56 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         max_job_runtime=_int(source, "MAX_JOB_RUNTIME", default=1200),
         max_fetch_bytes=_int(source, "MAX_FETCH_BYTES", default=2_097_152),
         max_page_chars=_int(source, "MAX_PAGE_CHARS", default=24_000),
+        auth_mode=_auth_mode(source),
+        cognito_user_pool_id=_optional(source, "COGNITO_USER_POOL_ID"),
+        cognito_client_id=_optional(source, "COGNITO_CLIENT_ID"),
+        cognito_region=_optional(source, "COGNITO_REGION") or aws_region,
         auth_keys_secret_id=_optional(source, "AUTH_KEYS_SECRET_ID"),
         auth_keys=_optional(source, "AUTH_KEYS"),
         retention_days=_int(source, "RETENTION_DAYS", default=365),
         app_env=_app_env(source),
         log_level=_optional(source, "LOG_LEVEL") or "INFO",
     )
+
+
+def resolve_database_url(env: Mapping[str, str]) -> str | None:
+    """`DATABASE_URL`, or the same URL composed from the five parts RDS hands out separately.
+
+    **This exists because of one security property, not for convenience** (ADR 0020 decision 1).
+    RDS can generate and hold its own master password in Secrets Manager
+    (`manage_master_user_password`), which is the only arrangement in which the password never
+    passes through Terraform and therefore never lands in `terraform.tfstate`. What that secret
+    holds is `{"username": ..., "password": ...}` and nothing else - no host, no port, no
+    database name - so nothing on the AWS side can hand a container a finished connection
+    string. The composition has to happen somewhere, and the container is the only place that
+    holds all five values at once.
+
+    `DATABASE_URL` always wins, so every local command, the whole offline suite and the Compose
+    stack are untouched: they set it and this function returns it. The parts are read only when
+    it is absent, and only when **all four required ones** are present - a half-configured
+    deployment is `None`, which is the same "not configured" the caller already handles, rather
+    than a URL with the word `None` in it.
+
+    The password is percent-encoded because a libpq connection string is a URL: a generated
+    password containing `@`, `/` or `#` would otherwise end the credential early and produce a
+    connection error that reads like a wrong host.
+
+    Shared with `database/migrations/env.py`, which needs the same answer without building a
+    whole `Config` - a migration must not need an LLM key to run.
+    """
+    direct = _optional(env, "DATABASE_URL")
+    if direct is not None:
+        return direct
+
+    host = _optional(env, "DB_HOST")
+    name = _optional(env, "DB_NAME")
+    user = _optional(env, "DB_USER")
+    password = _optional(env, "DB_PASSWORD")
+    if not (host and name and user and password):
+        return None
+
+    port = _optional(env, "DB_PORT") or "5432"
+    return f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{name}"
 
 
 def required(value: str | None, name: str) -> str:
@@ -347,6 +420,18 @@ def _researcher_concurrency(env: Mapping[str, str]) -> int:
             f"{MAX_RESEARCHER_CONCURRENCY}, got {value}"
         )
     return value
+
+
+def _auth_mode(env: Mapping[str, str]) -> AuthMode:
+    """Which credential the API accepts. Refused loudly rather than defaulted quietly.
+
+    A typo here would silently fall back to the other mode, and "the deployment authenticated
+    everyone the wrong way round" is not a failure worth discovering from a request log.
+    """
+    value = env.get("AUTH_MODE", "").strip() or "api_key"
+    if value not in ("api_key", "cognito"):
+        raise ValueError(f"AUTH_MODE must be api_key or cognito, got {value!r}")
+    return cast(AuthMode, value)
 
 
 def _app_env(env: Mapping[str, str]) -> AppEnv:

@@ -72,6 +72,13 @@ dependencies = [
     # the local integration tests worth running. `jobqueue.py` is the only module that imports
     # it; S3 joins the same client in a later stage.
     "boto3==1.43.72",
+    # Cognito access-token verification (Phase 5 block B, ADR 0020). It earns its place by
+    # being the one thing here that must not be hand-written: an RS256 JWT is an RSA
+    # signature over a canonical string, and Python's standard library has no RSA at all, so
+    # the alternatives are this or a home-made verifier on the authentication path. The
+    # `crypto` extra is what pulls `cryptography`, which does the signature check itself.
+    # `routes/auth.py` is the only module that imports it.
+    "pyjwt[crypto]==2.13.0",
     # Short-term state, for the job queue's other half (implementation step 21). It earns its
     # place by being the only way the rate limiter can be *shared*: two workers each politely
     # limiting themselves to 40 requests per minute produce 80 (guidelines §11), and the
@@ -81,7 +88,10 @@ dependencies = [
 ]
 
 # Deliberately absent until something imports them:
-#   Secrets Manager (boto3 already covers the client) - Phase 5.
+#   A Secrets Manager client. Phase 5 block B injects secrets through the ECS task
+#   definition's `secrets` block, so the ECS agent reads them and the application still
+#   reads plain environment variables - no application code calls Secrets Manager, and
+#   boto3 would already cover it if one ever did.
 #
 # langchain-core arrives transitively under langgraph and is imported directly in exactly
 # one place, for the RunnableConfig type that graph/state.run_config() returns. It is not

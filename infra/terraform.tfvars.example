@@ -4,13 +4,15 @@
 # **Prefer the environment over this file.** Every variable below can be supplied as
 # `TF_VAR_<name>`, which keeps the credential out of the working tree entirely:
 #
-#     export TF_VAR_db_password='...'          # PowerShell: $env:TF_VAR_db_password = '...'
-#     export TF_VAR_llm_api_key='...'
+#     export TF_VAR_llm_api_key='...'          # PowerShell: $env:TF_VAR_llm_api_key = '...'
 #     export TF_VAR_tavily_api_key='...'
-#     export TF_VAR_auth_keys='{"<sha256>":{"user_id":"...","role":"reviewer"}}'
 #
 # Copy to terraform.tfvars only if you would rather keep them in a file, and delete it after the
 # teardown.
+#
+# **There is no db_password**, and that is Block B rather than an omission: RDS generates its own
+# master password into a Secrets Manager secret it owns, so no password passes through Terraform
+# and none lands in `terraform.tfstate` (docs/adr/0020-*.md decision 1).
 
 # --- Required: no default exists for any of these -------------------------------------------
 
@@ -18,9 +20,6 @@
 # (guidelines section 19): rollback is redeploying the previous task definition, and `latest`
 # cannot name one.
 image_tag = "REPLACE-WITH-COMMIT-SHA"
-
-# The RDS master password. Generate one; do not reuse anything.
-db_password = "REPLACE-ME"
 
 # The worker's model endpoint. The API never receives these (ADR 0012).
 llm_base_url = "https://REPLACE-ME/v1"
@@ -30,18 +29,30 @@ llm_api_key  = "REPLACE-ME"
 # The worker's search credential.
 tavily_api_key = "REPLACE-ME"
 
-# The API's hashed key table (guidelines section 16): a sha256 of each API key mapped to its
-# user_id and role. **Generate throwaway keys for this deployment.** The two development keys
-# published in .env.example must never be used here, and the ALB speaks plain HTTP, so any key
-# sent to this deployment travels in clear text.
-#
-#     python -c "import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())"
-auth_keys = "{\"REPLACE-WITH-SHA256\":{\"user_id\":\"11111111-1111-4111-8111-111111111111\",\"role\":\"reviewer\"}}"
-
 # --- Optional: shown with their defaults -----------------------------------------------------
 
 # region      = "ap-south-1"
 # name_prefix = "competitive-research"
+
+# How a caller proves who they are. `cognito` is the default and creates the user pool, its app
+# client and the two role groups; the API verifies an access token against the pool's published
+# signing keys (docs/adr/0020-*.md decision 2). Set `api_key` to keep the Phase 2 hashed key
+# table instead - and then `auth_keys` below becomes required.
+# auth_mode = "cognito"
+
+# Only read when auth_mode is "api_key". The sha256 of each API key mapped to its user_id and
+# role (guidelines section 16). **Generate throwaway keys for this deployment** - the two
+# development keys published in .env.example must never be used here.
+#
+#     python -c "import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())"
+#
+# auth_keys = "{\"REPLACE-WITH-SHA256\":{\"user_id\":\"11111111-1111-4111-8111-111111111111\",\"role\":\"reviewer\"}}"
+
+# An EXISTING, already-validated ACM certificate in this region. Set it and the load balancer
+# gains an HTTPS listener while port 80 redirects to it. Left empty, the deployment speaks plain
+# HTTP and **every bearer token travels in clear text** - nothing here creates a certificate,
+# because a public one cannot be issued without a domain this repository does not own.
+# certificate_arn = "arn:aws:acm:ap-south-1:REPLACE:certificate/REPLACE"
 
 # Narrow this to your own address whenever the demo link is not being shared.
 # allowed_ingress_cidrs = ["203.0.113.4/32"]

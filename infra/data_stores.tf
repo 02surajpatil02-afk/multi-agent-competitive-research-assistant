@@ -32,7 +32,20 @@ resource "aws_db_instance" "postgres" {
 
   db_name  = var.db_name
   username = var.db_username
-  password = var.db_password
+
+  # **The one Block B change in this file, and it is the one that matters most for state.**
+  # RDS generates the master password itself, stores it in a Secrets Manager secret it owns,
+  # and never shows it to Terraform. `var.db_password` is gone: there is no value to pass, no
+  # value to keep in a shell variable, and - the point - **no password anywhere in
+  # `terraform.tfstate`**, which is a plain JSON file on the operator's laptop.
+  #
+  # The cost is that nothing upstream can compose a connection string, because the secret holds
+  # `{"username", "password"}` and no host. ecs.tf therefore injects the two halves and the
+  # container assembles the URL (`config.resolve_database_url`, ADR 0020 decision 1).
+  #
+  # No `master_user_secret_kms_key_id`: the default is the AWS-managed `aws/secretsmanager`
+  # key, which is free. A customer-managed key would be a per-month charge and two more grants.
+  manage_master_user_password = true
 
   db_subnet_group_name   = aws_db_subnet_group.postgres.name
   vpc_security_group_ids = [aws_security_group.postgres.id]

@@ -1,4 +1,4 @@
-# Deployment — the temporary AWS environment (Phase 5 block A)
+# Deployment — the temporary AWS environment (Phase 5 blocks A and B)
 
 **What this is.** The Terraform in `infra/` deploys the two processes this repository already
 runs — `uvicorn app:app` and `python -m worker` — onto AWS, together with the four stores they
@@ -7,9 +7,24 @@ hour.**
 
 **What this is not.** It is not a high-availability production environment and this document
 never claims it is. The database is Single-AZ with no backups, there is one task of each
-process, the load balancer speaks plain HTTP, and every credential is a plaintext environment
-variable in a task definition. Each of those is a deliberate, listed trade with the production
-alternative written beside it in [§9](#9-portfolio-versus-production).
+process, and unless you supply a certificate the load balancer speaks plain HTTP. Each of those
+is a deliberate, listed trade with the production alternative written beside it in
+[§9](#9-portfolio-versus-production).
+
+**What block B changed** ([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md)),
+because three of block A's listed omissions were one problem:
+
+- **No credential is in a task definition any more.** Secrets arrive through the task
+  definition's `secrets` block, which names a Secrets Manager ARN rather than a value; the ECS
+  agent fetches it at task start and the application still reads a plain environment variable.
+- **RDS generates its own master password.** There is no `db_password` variable, nothing to
+  export, and **no database password in `terraform.tfstate`**.
+- **Authentication is Cognito by default.** The API verifies an access token itself — same
+  `Authorization: Bearer …` header, same two roles, same `Identity` — and holds no shared secret.
+  `auth_mode = "api_key"` still selects the Phase 2 key table.
+- **HTTPS is available but not created.** Set `certificate_arn` to a certificate you already own
+  and port 80 redirects to 443. Leave it empty, which is the default, and see
+  [§4.6](#46-the-token-and-what-it-travels-over) for what that costs.
 
 **Nothing in this repository deploys anything.** CI formats and validates the Terraform and
 never plans or applies. Every command below is run by a person who has decided to run it.
@@ -105,7 +120,7 @@ internet". Specifically:
 
 | Group | Ingress | Egress |
 |---|---|---|
-| `alb` | 80 from `allowed_ingress_cidrs` | 8000 to the `api` group |
+| `alb` | 80 from `allowed_ingress_cidrs`, **and 443 from the same range only when a certificate is configured** | 8000 to the `api` group |
 | `api` | **8000 from the `alb` group, and nothing else** | 443 anywhere, 53 inside the VPC, 5432 to `postgres`, 6379 to `redis` |
 | `worker` | **none — no ingress rule exists** | 80 and 443 anywhere, 53 inside the VPC, 5432 to `postgres`, 6379 to `redis` |
 | `postgres` | 5432 from `api` and `worker` **by group reference, never a CIDR** | none |
@@ -133,6 +148,12 @@ a worker has started**, because LangGraph's checkpoint tables are created by `Po
 which only the worker calls — Alembic never touches them, and the API never calls `setup()`
 (ADR 0012). A deployment whose checkpoint tables do not exist is one in which **no job can run**,
 so 503 is the correct answer and the ALB is right not to route to it.
+
+**Block B added nothing to `/health` and must not have.** The three checks are `db`, `redis` and
+`checkpoints`; whether Cognito answers is not one of them. A check that failed because an identity
+provider was slow would deregister an API that is working, and the API does not contact Cognito
+until a caller presents a token — so an unreachable provider is a `401`, which is the correct
+answer, rather than a `503` for everyone.
 
 **Nothing here weakens that check to make ECS green.** The API service instead carries
 `health_check_grace_period_seconds = 300`, which stops ECS *killing and replacing* the task
@@ -180,21 +201,53 @@ refuses to run without them, because none of them has a default.
 
 ```bash
 export AWS_REGION=ap-south-1
-export TF_VAR_db_password='...'
 export TF_VAR_llm_base_url='https://.../v1'
 export TF_VAR_llm_model='...'
 export TF_VAR_llm_api_key='...'
 export TF_VAR_tavily_api_key='...'
+```
+
+**There is no `TF_VAR_db_password`, and that is block B.** RDS generates the master password into
+a Secrets Manager secret it owns, so there is nothing to invent and nothing that could land in
+state ([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md) decision 1).
+
+**There is no `TF_VAR_auth_keys` either, in the default mode.** `auth_mode` defaults to `cognito`,
+which creates the user pool and leaves the API holding no shared secret. If you deliberately want
+the Phase 2 key table instead, set both:
+
+```bash
+export TF_VAR_auth_mode=api_key
 export TF_VAR_auth_keys='{"<sha256 of a throwaway key>":{"user_id":"...","role":"reviewer"}}'
 ```
 
-**Generate throwaway API keys for this deployment.** The ALB speaks plain HTTP, so a key sent to
-it travels in clear text, and the two development keys published in `.env.example` must never be
-used here.
+and generate throwaway keys for it — the two development keys published in `.env.example` must
+never be used here:
 
 ```bash
 python -c "import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())"
 ```
+
+**Optional: HTTPS.** Only if you already own a validated ACM certificate in this region. Nothing
+here creates one — see [§4.6](#46-the-token-and-what-it-travels-over).
+
+```bash
+export TF_VAR_certificate_arn='arn:aws:acm:ap-south-1:...:certificate/...'
+```
+
+### 4.1a Where each secret ends up
+
+| Value | Where it lives | Who may fetch it | In Terraform state? |
+|---|---|---|---|
+| Database password | Secrets Manager, **generated and owned by RDS** | the `api`, `worker` and `migrate` execution roles | **No** — Terraform never sees it |
+| `LLM_API_KEY` | Secrets Manager, written by Terraform | the `worker` execution role only | Yes — see the warning in [§6](#6-teardown) |
+| `TAVILY_API_KEY` | Secrets Manager, written by Terraform | the `worker` execution role only | Yes |
+| `AUTH_KEYS` (`api_key` mode only) | Secrets Manager, written by Terraform | the `api` execution role only | Yes |
+| Cognito pool id, client id, issuer | Plain task-definition environment | — | Yes, and none of the three is a secret |
+| LLM endpoint and model ids | Plain task-definition environment | — | Yes, and none is a secret |
+
+**Nothing inside either container can read a secret.** The application reads environment
+variables, exactly as it does locally; the fetch is done by the ECS agent using the *execution*
+role before the process starts. Neither task role carries a `secretsmanager` permission at all.
 
 ### 4.2 Create the image repository first
 
@@ -277,6 +330,77 @@ aws ecs describe-tasks --cluster "$(terraform -chdir=infra output -raw ecs_clust
 `0` means the schema is current. Anything else: read `/ecs/competitive-research/migrate` and stop
 — guidelines §19's rule is that the migration exits 0 *before* anything relies on the schema.
 
+### 4.6 The token, and what it travels over
+
+**Skip this section entirely if you set `auth_mode = "api_key"`** — then the credential is the
+key whose hash you put in `TF_VAR_auth_keys`, and the rest of this document works unchanged.
+
+Under the default `cognito` mode there is a user pool with two groups, `reviewer` and
+`submitter`, and no users. **Every command below is run by you, deliberately, and nothing in this
+repository runs them.** They create one throwaway account for the demo.
+
+```bash
+export POOL_ID=$(terraform -chdir=infra output -raw cognito_user_pool_id)
+```
+
+```bash
+export CLIENT_ID=$(terraform -chdir=infra output -raw cognito_client_id)
+```
+
+Pick a throwaway username and generate a password rather than typing one — it has to satisfy the
+pool's policy (12 characters, upper, lower, digit, symbol), and a password you invented for a demo
+is a password you will reuse:
+
+```bash
+export DEMO_USER=demo-reviewer
+```
+
+```bash
+export DEMO_PASSWORD="$(python -c "import secrets,string; a=string.ascii_letters+string.digits+'!@#%^&*'; print(''.join(secrets.choice(a) for _ in range(20))+'aA1!')")"
+```
+
+Create the user, set the password as permanent so there is no first-login challenge, and put them
+in the `reviewer` group — which is what makes them a reviewer to the API:
+
+```bash
+aws cognito-idp admin-create-user --user-pool-id "$POOL_ID" --username "$DEMO_USER" --message-action SUPPRESS
+```
+
+```bash
+aws cognito-idp admin-set-user-password --user-pool-id "$POOL_ID" --username "$DEMO_USER" --password "$DEMO_PASSWORD" --permanent
+```
+
+```bash
+aws cognito-idp admin-add-user-to-group --user-pool-id "$POOL_ID" --username "$DEMO_USER" --group-name reviewer
+```
+
+Then exchange the password for a token. **This call goes to Cognito's own HTTPS endpoint, not to
+this deployment**, and it needs no AWS credentials:
+
+```bash
+export TOKEN=$(aws cognito-idp initiate-auth --client-id "$CLIENT_ID" --auth-flow USER_PASSWORD_AUTH --auth-parameters USERNAME="$DEMO_USER",PASSWORD="$DEMO_PASSWORD" --query 'AuthenticationResult.AccessToken' --output text)
+```
+
+**It is the access token and not the id token.** The API accepts exactly one
+([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md) decision 3): the access token
+is what says *this bearer may call this API*, and it is the one carrying `cognito:groups` and
+`client_id`. An id token here answers `401`.
+
+**A caller with no group is refused.** A user in the pool who is in neither `reviewer` nor
+`submitter` authenticates to Cognito perfectly well and gets `401` from this API, which is
+deliberate — the group is where the role comes from.
+
+**What a token costs you if it leaks, and why that is bounded.** Without `certificate_arn` the ALB
+speaks plain HTTP, so the token is observable in transit — exactly as an API key would be. Three
+things bound it: the token expires in **one hour**, which is the intended life of the whole
+deployment; `allowed_ingress_cidrs` can be narrowed to your own address; and the account is a
+throwaway you delete at teardown. **The password never crosses the ALB at all** — only the token
+does.
+
+To upgrade: obtain a certificate for a domain you own, set `TF_VAR_certificate_arn`, re-apply, and
+point the domain at the ALB. Port 80 then redirects to 443 and nothing else in this document
+changes.
+
 ---
 
 ## 5. Verify
@@ -286,6 +410,14 @@ Ten checks, in the order the system actually works.
 ```bash
 export API=$(terraform -chdir=infra output -raw api_url)
 ```
+
+**Every authenticated call below sends `Authorization: Bearer $TOKEN`**, and that is the same
+header in both auth modes — a Cognito access token from [§4.6](#46-the-token-and-what-it-travels-over),
+or a Phase 2 API key. That is the whole reason Cognito was a small change: the request contract did
+not move. Under `api_key` mode, `export TOKEN=<the plaintext key>` and read on.
+
+*(Earlier revisions of this runbook showed `x-api-key`. The API has never read that header; the
+commands below are the ones that work.)*
 
 **1. Migration.** The exit code above is `0`.
 
@@ -302,7 +434,9 @@ curl -s "$API/health"
 aws elbv2 describe-target-health --target-group-arn "$(aws elbv2 describe-target-groups --names competitive-research-api --query 'TargetGroups[0].TargetGroupArn' --output text)" --query 'TargetHealthDescriptions[].TargetHealth.State'
 ```
 
-**4. Authentication.** No key is `401`; a submitter key on a reviewer route is `403`.
+**4. Authentication.** No credential is `401`. So is a made-up one, a token from another
+pool, an expired token, and a valid token whose user is in neither group — the API answers
+the same way to all of them on purpose. A `submitter` on a reviewer route is `403`.
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' "$API/jobs/00000000-0000-4000-8000-000000000000"
@@ -311,7 +445,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "$API/jobs/00000000-0000-4000-8000-0000
 **5. Submit a job.** Expect `201` and `{"job_id": "...", "status": "queued"}`.
 
 ```bash
-curl -s -X POST "$API/jobs" -H "x-api-key: $SUBMITTER_KEY" -H 'content-type: application/json' \
+curl -s -X POST "$API/jobs" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"question":"Compare TCS and Infosys on cloud strategy"}'
 ```
 
@@ -338,11 +472,11 @@ that evidence.
 approve it.
 
 ```bash
-curl -s "$API/jobs/$JOB_ID/gate" -H "x-api-key: $REVIEWER_KEY"
+curl -s "$API/jobs/$JOB_ID/gate" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```bash
-curl -s -X POST "$API/jobs/$JOB_ID/approve" -H "x-api-key: $REVIEWER_KEY" \
+curl -s -X POST "$API/jobs/$JOB_ID/approve" -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -d '{"decision":"approve"}'
 ```
 
@@ -357,7 +491,7 @@ aws s3 ls "s3://$(terraform -chdir=infra output -raw reports_bucket)/reports/"
 ```
 
 ```bash
-curl -s "$API/jobs/$JOB_ID/report" -H "x-api-key: $REVIEWER_KEY"
+curl -s "$API/jobs/$JOB_ID/report" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```bash
@@ -392,8 +526,31 @@ terraform -chdir=infra destroy -var image_tag="$IMAGE_TAG"
 | Messaging | Both SQS queues | Free at rest; deleted anyway |
 | Storage | S3 bucket **and its objects** | `force_destroy` decides |
 | Logs | Three CloudWatch log groups | Terraform-managed on purpose — groups ECS creates itself survive destroy |
-| IAM | Execution role, two task roles, two inline policies | |
+| IAM | **Three execution roles**, two task roles, and their inline policies | Block B split the execution role per task definition |
+| Secrets | The LLM key, the search key, and the auth-keys secret in `api_key` mode | `recovery_window_in_days = 0`, so they are **deleted immediately, not scheduled** |
+| Cognito | The user pool, its app client, and both groups — **and every user in it** | Deleting the pool deletes the demo account with it |
 | Network | VPC, 4 subnets, 2 route tables, internet gateway, 5 security groups | |
+
+### Deletion semantics worth knowing before you rely on them
+
+**Secrets are deleted, not scheduled.** Secrets Manager's default is a 7-to-30-day recovery
+window, during which the secret still appears in the console *and* its name cannot be reused —
+which is how the second run of a demo fails. `recovery_window_in_days = 0` makes destroy final. It
+is the right choice for a temporary environment and the wrong one for anything whose secret you
+might need back.
+
+**The RDS-managed database secret is not Terraform's.** RDS created it and RDS deletes it with the
+instance. You will not see it in `terraform state list`, and it needs no separate teardown step —
+but it does mean the password is unrecoverable the moment the instance goes, which is correct here
+and is why `skip_final_snapshot` and this belong in the same conversation.
+
+**The Cognito user pool takes its users with it.** There is no separate cleanup for the demo
+account created in [§4.6](#46-the-token-and-what-it-travels-over) — but if you created users in a
+pool you intend to keep, delete them first:
+`aws cognito-idp admin-delete-user --user-pool-id "$POOL_ID" --username "$DEMO_USER"`.
+
+**A certificate you supplied is not deleted**, and must not be: `certificate_arn` is an input,
+Terraform did not create it, and destroy leaves it alone. ACM public certificates are free at rest.
 
 ### The orphan checks
 
@@ -437,17 +594,45 @@ aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName'
 aws ec2 describe-vpcs --filters Name=tag:Project,Values=competitive-research --query 'Vpcs[].VpcId'
 ```
 
+```bash
+aws secretsmanager list-secrets --include-planned-deletion --query 'SecretList[?starts_with(Name, `competitive-research`)].[Name,DeletedDate]'
+```
+
+```bash
+aws cognito-idp list-user-pools --max-results 60 --query 'UserPools[?starts_with(Name, `competitive-research`)].Id'
+```
+
 **Expected results:** no manual snapshot with this deployment's identifier, **no NAT gateway and
 no Elastic IP at all** (this design creates neither, so anything found belongs to something
 else), no ECS-described ENI left behind, no `/ecs/competitive-research/*` log group, no
 repository, no load balancer, and no VPC carrying the `Project` tag.
 
+**Expected results for the two block B checks:** no secret whose name starts with
+`competitive-research` (an entry with a `DeletedDate` means the recovery window is not 0 — check
+why), and no user pool with that prefix.
+
 **Orphaned ENIs are the one that bites.** A Fargate task's ENI is deleted with the task, but a
 VPC delete that fails usually fails because one ENI is still detaching. Wait a minute and re-run
 destroy rather than deleting the VPC by hand.
 
-Finally, `unset` the `TF_VAR_*` variables, and delete `infra/terraform.tfvars` if one was
-created — it holds the credentials.
+### The last step, and it is not optional
+
+```bash
+rm -f infra/terraform.tfstate infra/terraform.tfstate.backup infra/terraform.tfvars
+```
+
+**`terraform.tfstate` is a credential store.** It is plain JSON, it is not encrypted, and after a
+successful apply it holds the LLM key, the search key and — in `api_key` mode — the API key table,
+because Terraform wrote those values into Secrets Manager and records everything it writes. It is
+gitignored, which stops it being committed and does nothing about it sitting on the disk.
+
+**It does not hold the database password**, and that is the one improvement block B made to this
+paragraph rather than to the deployment: RDS generated it and Terraform never saw it
+([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md) decision 1).
+
+Delete it once the environment is gone and the orphan checks are clean — the state of a destroyed
+deployment describes nothing and protects nothing. Then `unset` the `TF_VAR_*` variables, and
+`unset DEMO_PASSWORD` and `TOKEN` if you set them.
 
 ---
 
@@ -459,6 +644,9 @@ risk.
 
 | Resource | Charging model | ~1-hour deployment | If forgotten for a week |
 |---|---|---|---|
+| **Secrets Manager** | Per secret-month, prorated, plus per 10k API calls | Fractions of a cent for 3 secrets read a handful of times | Cents |
+| **Cognito user pool** | Per monthly active user, with a large free tier | **$0** at one demo user | $0 |
+| **ACM certificate** | Free for public certificates | $0, and none is created here | $0 |
 | **RDS `db.t4g.micro`, Single-AZ** | Per hour + 20 GiB gp3 | Cents | The largest single line |
 | **ElastiCache `cache.t4g.micro`** | Per hour | Cents | Comparable to RDS |
 | **ALB** | Per hour + LCU | Cents | Charges with **zero traffic and zero tasks** |
@@ -484,18 +672,33 @@ spend, not AWS.
 
 ---
 
-## 8. What Block A intentionally left out
+## 8. What blocks A and B left out
 
-| Left out | Where it belongs |
+**Block A's four deferrals are closed** ([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md)):
+
+| Was left out | What block B built |
 |---|---|
-| Secrets Manager. Every credential is a plaintext task-definition environment variable, readable by anyone who can call `ecs:DescribeTaskDefinition` | **Block B**, with `secrets`/`valueFrom` and `secretsmanager:GetSecretValue` on the execution role |
-| Cognito JWT. Authentication is still the Phase 2 API-key table | **Block B** |
-| IAM hardening — trust-policy conditions (`aws:SourceArn`), a permissions boundary, a customer-managed KMS key. What exists is minimum-functional least privilege: named actions, scoped to this deployment's queue and `reports/*` | **Block B** |
-| HTTPS, ACM, Route 53, a custom domain | **Block B** |
+| Secrets Manager | Three secrets plus the RDS-managed database credential, injected through the task definition's `secrets` block. No credential is in an `environment` entry, and no task role can read one |
+| Cognito JWT | A user pool, an app client and two groups; the API verifies the access token itself — algorithm, signature, issuer, expiry, `token_use`, `client_id` — and maps a pool group to a role |
+| IAM hardening | Three per-task execution roles instead of one shared, `secretsmanager:GetSecretValue` scoped to each task's own secret ARNs, and `aws:SourceAccount` / `aws:SourceArn` conditions on every trust policy |
+| HTTPS | An optional HTTPS listener with a TLS 1.2 floor and an 80 → 443 redirect, from a certificate the operator supplies |
+
+**What block B deliberately did not build**, each because it needs something outside this
+configuration or costs more than an hour-long environment can justify:
+
+| Left out | Why, and where it belongs |
+|---|---|
+| An ACM certificate, a domain, a Route 53 hosted zone | A public certificate needs a validated domain this repository does not own, and a hosted zone charges per month. **Supply an ARN instead** — §4.6 |
+| A customer-managed KMS key | RDS storage, the bucket and every secret are already encrypted with AWS-managed keys, at no cost and with no grants. A CMK is a per-month charge and two more grants |
+| Automated secret rotation | Rotation is a schedule, and a schedule needs an environment that outlives an hour. The values here are throwaway and the deployment is destroyed; `ignore_changes = [secret_string]` already permits manual rotation |
+| MFA on the user pool | Right for an account that can approve an export, and also a phone number or an authenticator enrolment for a demo account that lives an hour |
+| A permissions boundary, CloudTrail data events | Both need account-level setup this configuration cannot make on its own |
+| ALB `authenticate-cognito` | Evaluated and rejected: a browser redirect flow with a session cookie, for an API whose callers are scripts. ADR 0020 decision 4 |
+| A remote Terraform backend | One operator, one laptop, one apply. See §9 for when that stops being true |
 | CloudWatch alarms and dashboards — DLQ depth, task count, RDS connections | **Block C** |
 | Stale-job and DLQ operational recovery (ADR 0010 decision 9's sweep) | **Block C** |
 | Retention beyond minimal safe defaults — an S3 lifecycle expiry, the `RETENTION_DAYS` sweep | **Block C** |
-| API Gateway in front of the ALB, autoscaling, a remote Terraform backend | Later, and only with a requirement behind each |
+| API Gateway in front of the ALB, autoscaling | Later, and only with a requirement behind each |
 
 ---
 
@@ -508,9 +711,10 @@ spend, not AWS.
 | Cache | One node, no replica, no TLS, no auth token, `redis://` | Replication group with automatic failover, in-transit encryption and an auth token — `rediss://`, which `Redis.from_url` already understands, so still no code change |
 | API tasks | 1 | 2+ across AZs, so a task restart is invisible |
 | Worker tasks | 1 | 2, fixed (ARCHITECTURE.md §18). **Never autoscaled on queue depth** — the bound is the LLM rate limit |
-| Entry | ALB on HTTP | HTTPS with an ACM certificate and a domain, HTTP redirecting to HTTPS; API Gateway in front if throttling and JWT authorization are wanted |
-| Secrets | Plaintext task-definition environment | Secrets Manager, injected as `secrets`, rotated |
-| Terraform state | Local file, gitignored | S3 backend with DynamoDB locking, so two operators cannot apply at once |
+| Entry | ALB on HTTP unless a certificate is supplied | HTTPS with an ACM certificate and a domain you own, HTTP redirecting; API Gateway in front if throttling and JWT authorization are wanted |
+| Secrets | Secrets Manager, injected as `secrets`, **written by Terraform** and so present in state | Secrets Manager, populated out of band with `put-secret-value` and rotated on a schedule; a customer-managed KMS key with grants to the three execution roles |
+| Authentication | Cognito access tokens, one hour, no MFA, one throwaway user | Cognito with MFA, a real user directory or federation, and shorter-lived tokens behind an authorizing gateway |
+| Terraform state | Local file, gitignored, **deleted at teardown** | S3 backend with DynamoDB locking and bucket encryption, so two operators cannot apply at once and no credential sits on a laptop |
 | Image tags | Commit SHA, mutable repository | Commit SHA, **immutable** repository — a tag that can move is a rollback target that can lie |
 | Monitoring | Three log groups at 1-day retention | CloudWatch alarms on DLQ depth, task count, RDS connections and 5xx rate; longer retention; the §14 dashboard |
 | Deploy | `terraform apply` from a laptop | CI builds and pushes on merge; migration task, then service update, then watch the alarms (guidelines §19) |

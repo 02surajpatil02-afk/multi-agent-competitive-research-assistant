@@ -1,13 +1,13 @@
 """
 WHY THIS FILE EXISTS
     The API entrypoint: `uvicorn app:app --reload` (CLAUDE.md commands). It builds what the
-    routes need - the config, the database engine, a checkpoint *reader*, the queue, the key
-    table, the Redis health probe and the artifact presigner - and hands them over as one
-    object. Nothing here decides anything; the decisions are in routes/api.py and
+    routes need - the config, the database engine, a checkpoint *reader*, the queue, the
+    authenticator, the Redis health probe and the artifact presigner - and hands them over as
+    one object. Nothing here decides anything; the decisions are in routes/api.py and
     routes/auth.py.
 
     **Everything is built once, at startup, and a failure here is fatal on purpose.** A
-    missing `AUTH_KEYS`, an unreachable database URL, or a malformed key table should stop
+    missing credential setting, an unreachable database URL, or a malformed key table should stop
     the process rather than surface as a confusing 500 on the first request that needs it -
     which is the same rule config.py already follows for environment variables.
 
@@ -44,7 +44,7 @@ from graph.state import state_serde
 from jobqueue import JobQueue, build_queue
 from redisstore import RedisHealth, build_redis
 from routes.api import ApiError, RedisProbe, ReportPresigner, RouteDeps, router
-from routes.auth import Identity, load_api_keys
+from routes.auth import Authenticator, build_authenticator
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +55,21 @@ def create_application(
     engine: Engine,
     checkpoints: BaseCheckpointSaver[Any],
     queue: JobQueue,
-    keys: dict[str, Identity] | None = None,
+    authenticator: Authenticator | None = None,
     redis: RedisProbe | None = None,
     artifacts: ReportPresigner | None = None,
     on_shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Wire the routes to their collaborators.
 
-    `keys` is normally parsed from `config.auth_keys`; a caller passes its own only in a
-    test, where the point is which role is calling rather than how the table was loaded.
+    `authenticator` is normally chosen from `config.auth_mode` - the hashed key table, or a
+    Cognito access-token verifier (ADR 0020). A caller passes its own only in a test, where the
+    point is which role is calling rather than how the credential was checked.
+
+    **Choosing it opens no connection and fetches nothing.** The Cognito verifier reads its
+    pool's signing keys on the first token it is shown, so a deployment with no callers yet
+    makes no outbound request - and a startup that cannot reach Cognito is a startup that
+    cannot reach Cognito, not a process that refuses to boot.
 
     `redis` is the `/health` probe (step 21) and is optional for the same reason: a test that
     is not about health should not have to supply one, and an absent probe reports healthy
@@ -95,7 +101,7 @@ def create_application(
         engine=engine,
         checkpoints=checkpoints,
         queue=queue,
-        keys=load_api_keys(config.auth_keys) if keys is None else keys,
+        authenticator=build_authenticator(config) if authenticator is None else authenticator,
         redis=redis,
         artifacts=artifacts,
     )
@@ -177,10 +183,15 @@ def _checkpoint_reader(database_url: str) -> tuple[PostgresSaver, ConnectionPool
 def _build() -> FastAPI:  # pragma: no cover - exercised by running the server
     """The production wiring. **No graph, no LLM client, no Tavily key** (ADR 0012).
 
-    What it needs is `DATABASE_URL`, `AUTH_KEYS`, `SQS_QUEUE_URL` and - since step 22a -
-    `S3_BUCKET`, because `GET /jobs/{id}/report` signs a URL for an object in it. A missing LLM
-    credential can no longer stop this process from starting, which is what makes guidelines
-    §13's least-privilege table a property of the code rather than of an intended deployment.
+    What it needs is a database, a queue, a bucket - because `GET /jobs/{id}/report` signs a URL
+    for an object in it - and one credential setting: `AUTH_KEYS` in the default mode, or the
+    two Cognito identifiers when `AUTH_MODE=cognito` (ADR 0020). A missing LLM credential can no
+    longer stop this process from starting, which is what makes guidelines §13's
+    least-privilege table a property of the code rather than of an intended deployment.
+
+    `DATABASE_URL` may arrive composed from `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` and
+    `DB_PASSWORD`, which is how the AWS deployment delivers an RDS-managed password that
+    Terraform never saw (ADR 0020 decision 1). `load_config` has already done that by here.
     """
     config = load_config()
     database_url = required(config.database_url, "DATABASE_URL")

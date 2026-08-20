@@ -80,7 +80,14 @@ from graph.state import (
 )
 from llm_client import LLMClient
 from routes.api import MAX_REVIEWER_TEXT_CHARS, _idempotency_key
-from routes.auth import AuthConfigError, Identity, hash_key, identity_from, load_api_keys
+from routes.auth import (
+    ApiKeyAuthenticator,
+    AuthConfigError,
+    Identity,
+    hash_key,
+    identity_from,
+    load_api_keys,
+)
 from worker import WorkerDeps
 from worker import handle as worker_handle
 
@@ -315,7 +322,7 @@ def _application(
         engine=db,
         checkpoints=saver,
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
         # A **presigner** and nothing more: the Protocol the route layer declares has no
         # `put_report` on it, because the API's task role may not write an object.
         artifacts=None if bucket is None else ArtifactStore(_BUCKET, client=bucket),
@@ -465,7 +472,7 @@ def test_health_reports_redis_and_degrades_when_it_is_gone(
         engine=db,
         checkpoints=saver,
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
         redis=_UnreachableRedis(),
     )
 
@@ -489,7 +496,7 @@ def test_a_redis_probe_that_raises_is_a_failed_check_not_a_failed_request(
         engine=db,
         checkpoints=saver,
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
         redis=_RaisingRedis(),
     )
 
@@ -520,7 +527,7 @@ def test_health_says_so_when_the_checkpoint_tables_do_not_exist_yet(
         engine=db,
         checkpoints=_UncreatedCheckpoints(),
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
     )
 
     with TestClient(application) as client:
@@ -549,7 +556,7 @@ def test_the_api_never_creates_the_checkpoint_tables_itself(
         engine=db,
         checkpoints=saver,
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
     )
 
     with TestClient(application) as client:
@@ -581,7 +588,7 @@ def test_deciding_on_a_queued_job_is_a_conflict_and_not_an_internal_error(
         engine=db,
         checkpoints=_UncreatedCheckpoints(),
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
     )
 
     with TestClient(application) as client:
@@ -610,7 +617,7 @@ def test_reading_the_gate_of_a_queued_job_was_already_a_conflict(
         engine=db,
         checkpoints=_UncreatedCheckpoints(),
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
     )
 
     with TestClient(application) as client:
@@ -643,7 +650,7 @@ def test_the_application_releases_what_it_opened_when_it_shuts_down(
         engine=db,
         checkpoints=saver,
         queue=cast(Any, queue),
-        keys=_KEYS,
+        authenticator=ApiKeyAuthenticator(_KEYS),
         on_shutdown=lambda: released.append("pool"),
     )
 
@@ -1590,7 +1597,10 @@ def test_the_route_layer_is_handed_nothing_that_could_execute_a_graph(
         "engine",
         "checkpoints",
         "queue",
-        "keys",
+        # One object with one method, chosen at startup from AUTH_MODE (ADR 0020). It replaced
+        # the raw key table when Cognito arrived, and the route layer still cannot tell which
+        # credential is configured.
+        "authenticator",
         # A health probe with one method, and no cache, no URL set and no rate-limit bucket:
         # the API reaches Redis to report on the workers, never to do their work (step 21).
         "redis",

@@ -40,6 +40,7 @@ import os
 from alembic import context
 from sqlalchemy import create_engine
 
+from config import resolve_database_url
 from database.queries import sqlalchemy_url
 from database.schema import alembic_include_name, metadata
 
@@ -47,11 +48,17 @@ target_metadata = metadata
 
 
 def _database_url() -> str:
-    """The database to migrate: whatever the caller passed, else `DATABASE_URL`.
+    """The database to migrate: whatever the caller passed, else the environment's.
 
     The main option is what a test sets when it points Alembic at a temporary database.
+
+    `config.resolve_database_url` rather than `os.environ["DATABASE_URL"]` because the AWS
+    migration task receives the RDS-managed credential as its parts - the password lives in a
+    secret AWS generated and Terraform never saw, so nothing upstream can compose the URL
+    (ADR 0020 decision 1). It is one function, not the whole `Config`: a migration still does
+    not need an LLM key to run, which is the property this file's docstring above cares about.
     """
-    url = context.config.get_main_option("sqlalchemy.url", None) or os.environ.get("DATABASE_URL")
+    url = context.config.get_main_option("sqlalchemy.url", None) or resolve_database_url(os.environ)
     if not url:
         raise RuntimeError("DATABASE_URL is not set, so there is no database to migrate")
     # The same normalisation the application engine does: `postgresql://` means psycopg2 to

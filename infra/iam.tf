@@ -1,26 +1,62 @@
 # WHY THIS FILE EXISTS
-#     Three roles, and the smallest set of permissions that lets the two processes do the work
-#     they already do. **This is Block A's minimum-functional IAM, not Block B's hardening**,
-#     and the difference is worth stating rather than implying:
+#     Six roles, and the smallest set of permissions that lets each process do the work it
+#     already does. Block A built one execution role and two task roles; Block B split the
+#     execution role three ways and added the conditions that stop it being assumed by anything
+#     but this account's ECS.
 #
-#     | Built here | Left to Block B |
+#     **The distinction that shapes the whole file.** An *execution* role belongs to the ECS
+#     agent and is used to *start* a task - pull the image, create the log stream, and now fetch
+#     the secrets the task definition names. A *task* role belongs to the running application
+#     and is what boto3 picks up inside the container. They are different identities with
+#     different jobs, and a secret granted to one is not readable by the other.
+#
+#     **That is why the secrets go on the execution roles and not the task roles.** The
+#     application never calls Secrets Manager - it reads environment variables, exactly as it
+#     does locally - so nothing in the container needs, or has, permission to read a secret.
+#     A compromised worker process cannot fetch the auth table; it cannot fetch anything.
+#
+#     **Three execution roles rather than one**, because one shared role would have to be
+#     granted every secret all three tasks use, which would give the API's task-start identity
+#     the LLM key. That is precisely the boundary ADR 0012 exists to hold, and a shared role
+#     would quietly undo it in IAM while the task definition still looked clean.
+#
+#     | Role | May fetch |
 #     |---|---|
-#     | One task role per service, so the API cannot consume the queue and the worker cannot presign | Conditions on the trust policy (`aws:SourceArn`), which stop a confused-deputy call from another account |
-#     | Actions named one by one, never `sqs:*` or `s3:*` | A customer-managed KMS key and the grants that go with it |
-#     | Resources scoped to this deployment's queue ARN and to `reports/*` inside this bucket | `secretsmanager:GetSecretValue` on the execution role, which is what replaces the plaintext environment in ecs.tf |
-#     | An execution role that is AWS's managed ECS policy and nothing added | A permissions boundary, and access logging on who assumed what |
+#     | `api` execution | the RDS-managed database credential; the auth-keys secret **only in api_key mode** |
+#     | `worker` execution | the database credential, the LLM key, the search key |
+#     | `migrate` execution | the database credential, and nothing else |
+#     | `api` task | send a message to this queue; sign for objects under `reports/` |
+#     | `worker` task | receive, delete and extend a message on this queue; write objects under `reports/` |
+#     | `migrate` task | **there is none** - a migration talks to PostgreSQL and to nothing AWS |
 #
-#     **The split is the one ARCHITECTURE.md section 19 already describes.** The worker may
-#     receive, delete and extend a message and write an object; the API may send a message and
-#     read one back for a presigned URL. Neither can do the other's job, which is what makes
-#     "the API never runs the graph" a property of the deployment rather than of the code alone.
+#     **No wildcard resource appears anywhere below**, and no `s3:*`, `sqs:*` or
+#     `secretsmanager:*`. Every statement names its actions one at a time and scopes them to a
+#     resource this configuration creates. The one thing worth knowing about
+#     `AmazonECSTaskExecutionRolePolicy`, which is attached to all three execution roles: it is
+#     AWS's own managed policy and it does use `Resource: "*"` for `ecr:GetAuthorizationToken`
+#     and the CloudWatch Logs actions. That is not avoidable - `GetAuthorizationToken` has no
+#     resource to scope to, it is an account-level call - and hand-copying the policy would
+#     produce a private version of the same thing that drifts as AWS updates it.
 #
-#     **The migration task gets no task role at all.** `alembic upgrade head` talks to
-#     PostgreSQL and to nothing else - no queue, no bucket, no secret - so the correct set of
-#     AWS permissions for it is the empty one.
+#     **Left to production rather than built** (docs/deployment.md section 9): a permissions
+#     boundary, a customer-managed KMS key with grants to these roles, and CloudTrail data
+#     events on who assumed what. Each needs setup outside this configuration.
 #
 # WHO USES IT
 #     ecs.tf, which names these roles on its three task definitions.
+
+data "aws_caller_identity" "current" {}
+
+# --- Who may assume these roles ------------------------------------------------------------
+#
+# **Block B's trust hardening.** Block A trusted `ecs-tasks.amazonaws.com` with no conditions,
+# which is the shape every tutorial uses and which technically lets the ECS service in *any*
+# account ask to assume this role on behalf of a task there. The two conditions below are the
+# confused-deputy fix AWS documents: the request must be made on behalf of this account, and the
+# thing making it must be an ECS resource in this region.
+#
+# `aws:SourceArn` is `ArnLike` with a trailing wildcard because the concrete value is the task
+# ARN, which does not exist until ECS creates the task - there is nothing narrower to write.
 
 data "aws_iam_policy_document" "ecs_tasks_assume" {
   statement {
@@ -31,28 +67,81 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
       type        = "Service"
       identifiers = ["ecs-tasks.amazonaws.com"]
     }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:*"]
+    }
   }
 }
 
-# --- The execution role ---------------------------------------------------------------------
-#
-# This is the role the ECS agent uses to *start* a task - pull the image from ECR and create the
-# log stream - rather than the role the application code runs as. One is enough for all three
-# task definitions, because all three start the same way.
+# --- The three execution roles ---------------------------------------------------------------
 
-resource "aws_iam_role" "execution" {
-  name               = "${local.name}-ecs-execution"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+locals {
+  # The database credential RDS generated and holds. All three tasks need it: the API and the
+  # worker connect, and the migration is the one that creates the schema.
+  db_secret_arn = aws_db_instance.postgres.master_user_secret[0].secret_arn
 
-  tags = { Name = "${local.name}-ecs-execution" }
+  # Read as a table: role name to the exact secret ARNs its task definition names. iam.tf and
+  # ecs.tf must agree, and this local is the one place that decides.
+  execution_secret_arns = {
+    api = local.cognito_enabled ? [
+      local.db_secret_arn,
+      ] : [
+      local.db_secret_arn,
+      aws_secretsmanager_secret.auth_keys[0].arn,
+    ]
+    worker = [
+      local.db_secret_arn,
+      aws_secretsmanager_secret.llm_api_key.arn,
+      aws_secretsmanager_secret.tavily_api_key.arn,
+    ]
+    migrate = [
+      local.db_secret_arn,
+    ]
+  }
 }
 
-# AWS's own managed policy, deliberately. It is exactly ECR pull plus CloudWatch Logs write, it
-# is maintained by AWS, and hand-copying it would produce a private version of the same thing
-# that drifts.
+resource "aws_iam_role" "execution" {
+  for_each = local.execution_secret_arns
+
+  name               = "${local.name}-${each.key}-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+
+  tags = { Name = "${local.name}-${each.key}-execution" }
+}
+
 resource "aws_iam_role_policy_attachment" "execution" {
-  role       = aws_iam_role.execution.name
+  for_each = aws_iam_role.execution
+
+  role       = each.value.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# One statement, one action, and a list of exactly the secrets this task definition names. The
+# `DescribeSecret` companion permission is deliberately absent: ECS needs only the value.
+resource "aws_iam_role_policy" "execution_secrets" {
+  for_each = local.execution_secret_arns
+
+  name = "${local.name}-${each.key}-execution-secrets"
+  role = aws_iam_role.execution[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "FetchOnlyThisTasksSecrets"
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = each.value
+    }]
+  })
 }
 
 # --- The API task role ------------------------------------------------------------------------

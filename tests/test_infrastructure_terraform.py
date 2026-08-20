@@ -79,9 +79,15 @@ FORBIDDEN_RESOURCE_TYPES = (
     # The NAT-gateway policy, and the Elastic IP one would need.
     "aws_nat_gateway",
     "aws_eip",
-    # Block B.
-    "aws_cognito_user_pool",
-    "aws_secretsmanager_secret",
+    # Block B deliberately creates neither a domain nor a certificate: a public ACM certificate
+    # needs a validated domain, and a hosted zone charges per month and outlives the deployment
+    # (ADR 0020 decision 5). An operator supplies an existing certificate ARN instead.
+    "aws_acm_certificate",
+    "aws_route53_zone",
+    "aws_route53_record",
+    # A customer-managed key is a per-month charge and two more grants, for encryption the
+    # AWS-managed keys already provide here (ADR 0020 decision 6).
+    "aws_kms_key",
     # Block C.
     "aws_cloudwatch_metric_alarm",
     "aws_appautoscaling_target",
@@ -544,10 +550,47 @@ def test_the_health_check_is_the_applications_own_and_accepts_only_a_healthy_ans
     assert _attribute(target_group.body, "target_type") == '"ip"'
 
 
-def test_the_listener_forwards_to_the_api_target_group() -> None:
-    listener = _one("aws_lb_listener")
+def test_the_http_listener_serves_when_there_is_no_certificate_and_redirects_when_there_is() -> (
+    None
+):
+    """ADR 0020 decision 5. Both branches exist in one listener, and only one is ever live: an
+    HTTP listener that kept forwarding beside an HTTPS one would leave the plain path open."""
+    listener = _resources("aws_lb_listener")["http"]
+
     assert _attribute(listener.body, "port") == "80"
     assert _attribute(listener.body, "target_group_arn") == "aws_lb_target_group.api.arn"
+    assert "for_each = local.https_enabled ? [1] : []" in listener.body
+    assert "for_each = local.https_enabled ? [] : [1]" in listener.body
+    assert '"redirect"' in listener.body
+
+
+def test_the_https_listener_exists_only_when_a_certificate_is_supplied() -> None:
+    """Nothing here creates a certificate, and the default is no certificate at all - so the
+    deployment is HTTP unless an operator brings one (ADR 0020 decision 5)."""
+    listener = _resources("aws_lb_listener")["https"]
+
+    assert _attribute(listener.body, "count") == "local.https_enabled ? 1 : 0"
+    assert _attribute(listener.body, "port") == "443"
+    assert _attribute(listener.body, "protocol") == '"HTTPS"'
+    assert _attribute(listener.body, "certificate_arn") == "var.certificate_arn"
+    assert _attribute(listener.body, "target_group_arn") == "aws_lb_target_group.api.arn"
+
+    policy = _attribute(listener.body, "ssl_policy") or ""
+    assert "TLS13-1-2" in policy, "the TLS floor must be 1.2, not the 2016 default"
+
+    assert _attribute(_variables()["certificate_arn"].body, "default") == '""'
+
+
+def test_https_is_the_only_thing_that_opens_a_second_port_on_the_load_balancer() -> None:
+    """The 443 ingress rule exists exactly when the listener behind it does. An open port with
+    no listener is a rule that describes nothing."""
+    rule = _rules("ingress")["alb_from_internet_tls"]
+
+    assert (
+        _attribute(rule.body, "count")
+        == "local.https_enabled ? length(var.allowed_ingress_cidrs) : 0"
+    )
+    assert _attribute(rule.body, "from_port") == "443"
 
 
 def test_the_api_service_is_given_time_to_wait_for_the_first_worker() -> None:
@@ -608,8 +651,9 @@ def test_the_migration_task_is_given_nothing_but_a_database() -> None:
 
     assert _attribute(definition.body, "task_role_arn") is None
     assert "local.common_environment" not in definition.body
-    assert "DATABASE_URL" in definition.body
-    for variable in ("SQS_QUEUE_URL", "S3_BUCKET", *PROVIDER_VARIABLES):
+    assert _attribute(definition.body, "environment") == "local.database_environment"
+    assert _attribute(definition.body, "secrets") == "local.database_secrets"
+    for variable in ("SQS_QUEUE_URL", "S3_BUCKET", "AUTH_KEYS", *PROVIDER_VARIABLES):
         assert variable not in definition.body
 
 
@@ -632,6 +676,237 @@ def test_neither_service_is_scaled_beyond_what_the_llm_tier_allows() -> None:
     depth, and autoscaling is deliberately absent."""
     for name in ("api_desired_count", "worker_desired_count"):
         assert _attribute(_variables()[name].body, "default") == "1"
+
+
+# --- Block B: secrets never reach a task definition in plaintext ----------------------------------
+
+
+SECRET_VARIABLE_NAMES = ("LLM_API_KEY", "TAVILY_API_KEY", "AUTH_KEYS", "DB_PASSWORD", "DB_USER")
+"""The five values that must arrive through `secrets`/`valueFrom` and never through
+`environment`. Anything in `environment` is returned in full by `ecs:DescribeTaskDefinition`,
+and a task definition revision outlives the deployment it belonged to."""
+
+
+def _container_locals() -> str:
+    """The `locals` block in ecs.tf, where the environment and secret lists are assembled."""
+    return next(block.body for block in _blocks(_tf_text()["ecs.tf"]) if block.type == "locals")
+
+
+def test_no_credential_is_assembled_into_a_plaintext_environment_list() -> None:
+    """The check that would fail if a secret were moved back inline. Every `{ name = "X", value
+    = ... }` pair in ecs.tf is read, and none of them may name a credential."""
+    plaintext = re.findall(r'\{\s*name\s*=\s*"([A-Z0-9_]+)"\s*,\s*value\s*=', _tf_code()["ecs.tf"])
+
+    for variable in SECRET_VARIABLE_NAMES:
+        assert variable not in plaintext, f"{variable} is a plaintext environment entry"
+
+
+def test_every_credential_arrives_through_a_secrets_manager_reference() -> None:
+    secret_refs = dict(
+        re.findall(
+            r'\{\s*name\s*=\s*"([A-Z0-9_]+)"\s*,\s*valueFrom\s*=\s*(.+?)\s*\}',
+            _tf_code()["ecs.tf"],
+        )
+    )
+
+    for variable in SECRET_VARIABLE_NAMES:
+        assert variable in secret_refs, f"{variable} has no valueFrom reference"
+        assert "secret" in secret_refs[variable], f"{variable} does not name a secret"
+
+
+def test_the_database_credential_comes_from_the_secret_rds_owns() -> None:
+    """Not a secret Terraform wrote - the one RDS generated, which is the whole point: the value
+    exists only inside AWS and no plan, apply or state file has ever held it."""
+    locals_body = _container_locals()
+
+    assert "aws_db_instance.postgres.master_user_secret[0].secret_arn" in _tf_code()["iam.tf"]
+    assert "${local.db_secret_arn}:username::" in locals_body
+    assert "${local.db_secret_arn}:password::" in locals_body
+
+
+def test_the_api_receives_no_provider_secret_and_the_worker_receives_no_key_table() -> None:
+    """The ADR 0012 boundary as IAM and as configuration at once. The API cannot read the LLM
+    key, and the worker - which makes no authorization decision - cannot read the key table."""
+    api = _resources("aws_ecs_task_definition")["api"].body
+    worker = _resources("aws_ecs_task_definition")["worker"].body
+
+    for variable in (*PROVIDER_VARIABLES, "llm_api_key", "tavily_api_key"):
+        assert variable not in api, f"the API task definition names {variable}"
+
+    for name in ("AUTH_KEYS", "auth_keys", "COGNITO"):
+        assert name not in worker, f"the worker task definition names {name}"
+
+
+def test_secrets_are_deleted_rather_than_scheduled_when_the_deployment_is_destroyed() -> None:
+    """A scheduled secret still appears after teardown, and blocks re-creating the same name -
+    which is how the second run of a demo fails."""
+    assert "secret_recovery_window_days = 0" in _tf_code()["secrets.tf"]
+
+    for secret in _resources("aws_secretsmanager_secret").values():
+        window = _attribute(secret.body, "recovery_window_in_days")
+        assert window == "local.secret_recovery_window_days", window
+
+
+def test_the_key_table_secret_exists_only_in_the_mode_that_uses_it() -> None:
+    secret = _resources("aws_secretsmanager_secret")["auth_keys"]
+    assert _attribute(secret.body, "count") == "local.cognito_enabled ? 0 : 1"
+
+
+# --- Block B: IAM is separated, narrowed, and trusted only by this account's ECS ------------------
+
+
+def test_each_task_definition_has_its_own_execution_role() -> None:
+    """One shared execution role would have to be granted every secret all three tasks use,
+    which would hand the API's task-start identity the LLM key - undoing ADR 0012 in IAM while
+    the task definition still looked clean."""
+    role = _resources("aws_iam_role")["execution"]
+    assert _attribute(role.body, "for_each") == "local.execution_secret_arns"
+
+    for name in ("api", "worker", "migrate"):
+        definition = _resources("aws_ecs_task_definition")[name]
+        assert (
+            _attribute(definition.body, "execution_role_arn")
+            == f'aws_iam_role.execution["{name}"].arn'
+        )
+
+
+def test_each_execution_role_may_fetch_only_its_own_secrets() -> None:
+    """`secretsmanager:GetSecretValue` on a named list, never a wildcard, and never
+    `DescribeSecret` - ECS needs the value and nothing about the secret."""
+    policy = _resources("aws_iam_role_policy")["execution_secrets"]
+
+    assert _attribute(policy.body, "Action") == '["secretsmanager:GetSecretValue"]'
+    assert _attribute(policy.body, "Resource") == "each.value"
+    assert "secretsmanager:*" not in policy.body
+    assert "DescribeSecret" not in policy.body
+
+
+def test_the_api_execution_role_gets_no_provider_secret() -> None:
+    """The table in iam.tf, read as code: the API's list is the database credential, plus the
+    key table only in the mode that has one."""
+    locals_body = next(
+        block.body for block in _blocks(_tf_text()["iam.tf"]) if block.type == "locals"
+    )
+    api_entry = locals_body.split("api =")[1].split("worker =")[0]
+
+    assert "llm_api_key" not in api_entry
+    assert "tavily_api_key" not in api_entry
+    assert "db_secret_arn" in api_entry
+
+
+def test_the_application_itself_is_given_no_secrets_manager_permission() -> None:
+    """The application reads environment variables, exactly as it does locally. Nothing in
+    either container calls Secrets Manager, so neither task role can - a compromised worker
+    process cannot fetch the auth table because it cannot fetch anything."""
+    for name in ("api", "worker"):
+        document = next(
+            block
+            for block in _all_blocks()
+            if block.type == "data" and block.labels == ("aws_iam_policy_document", name)
+        )
+        assert "secretsmanager" not in document.body
+
+
+def test_no_task_or_execution_policy_uses_a_wildcard_action_or_resource() -> None:
+    """`AmazonECSTaskExecutionRolePolicy` is AWS's own and does use `Resource: "*"` for
+    `ecr:GetAuthorizationToken`, which is an account-level call with no resource to scope to.
+    Everything this repository writes is named."""
+    written = "\n".join(
+        block.body
+        for block in _all_blocks()
+        if (block.type == "data" and block.labels[:1] == ("aws_iam_policy_document",))
+        or (block.type == "resource" and block.labels[:1] == ("aws_iam_role_policy",))
+    )
+
+    for wildcard in ('"s3:*"', '"sqs:*"', '"secretsmanager:*"', '"*"'):
+        assert wildcard not in written, f"a policy grants {wildcard}"
+
+
+def test_the_task_roles_are_trusted_only_by_this_accounts_ecs() -> None:
+    """Block A trusted `ecs-tasks.amazonaws.com` unconditionally, which lets ECS in any account
+    ask to assume these roles on behalf of a task there. These two conditions are AWS's
+    documented confused-deputy fix."""
+    document = next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", "ecs_tasks_assume")
+    )
+
+    assert "aws:SourceAccount" in document.body
+    assert "aws:SourceArn" in document.body
+    assert "data.aws_caller_identity.current.account_id" in document.body
+
+    for role in _resources("aws_iam_role").values():
+        assert (
+            _attribute(role.body, "assume_role_policy")
+            == "data.aws_iam_policy_document.ecs_tasks_assume.json"
+        )
+
+
+# --- Block B: Cognito is minimal, and the API is what validates the token -------------------------
+
+
+def test_there_is_one_user_pool_one_client_and_two_groups() -> None:
+    assert set(_resources("aws_cognito_user_pool")) == {"main"}
+    assert set(_resources("aws_cognito_user_pool_client")) == {"api"}
+    assert set(_resources("aws_cognito_user_group")) == {"reviewer", "submitter"}, (
+        "the pool's groups are the two roles routes/auth.py has had since Phase 2"
+    )
+
+
+def test_cognito_exists_only_when_the_deployment_asks_for_it() -> None:
+    for resource_type in (
+        "aws_cognito_user_pool",
+        "aws_cognito_user_pool_client",
+        "aws_cognito_user_group",
+    ):
+        for name, block in _resources(resource_type).items():
+            assert _attribute(block.body, "count") == "local.cognito_enabled ? 1 : 0", name
+
+
+def test_the_app_client_is_public_and_holds_no_client_secret() -> None:
+    """A client secret a curl script has to carry would be exactly the shared secret Cognito is
+    replacing. What secures this flow is the user's password and the token's signature."""
+    client = _resources("aws_cognito_user_pool_client")["api"]
+
+    assert _attribute(client.body, "generate_secret") == "false"
+    assert _attribute(client.body, "prevent_user_existence_errors") == '"ENABLED"'
+    assert _attribute(client.body, "access_token_validity") == "1"
+    assert _attribute(client.body, "access_token") == '"hours"'
+
+
+def test_the_pool_adds_no_hosted_ui_federation_or_lambda_trigger() -> None:
+    """Each would be a resource to tear down and a claim to explain, and nothing here needs
+    one: the API takes a bearer token and serves no browser."""
+    cognito = _tf_code()["cognito.tf"]
+
+    for absent in (
+        "callback_urls",
+        "logout_urls",
+        "allowed_oauth_flows",
+        "lambda_config",
+        "aws_cognito_identity_provider",
+        "aws_cognito_user_pool_domain",
+    ):
+        assert absent not in cognito, f"cognito.tf configures {absent}"
+
+
+def test_the_load_balancer_does_not_authenticate() -> None:
+    """ADR 0020 decision 4: ALB's `authenticate-cognito` action is a browser redirect flow with
+    a session cookie, which is wrong for an API whose callers are scripts. The API validates the
+    bearer token itself, which is what kept the request contract identical."""
+    for listener in _resources("aws_lb_listener").values():
+        assert "authenticate-cognito" not in listener.body
+        assert "authenticate_cognito" not in listener.body
+
+
+def test_the_api_is_told_which_pool_to_trust_in_plain_environment() -> None:
+    """A signing key, an issuer and a client id are published by design, so putting them in
+    Secrets Manager would buy nothing and cost a fetch at every task start."""
+    locals_body = _container_locals()
+
+    for name in ("AUTH_MODE", "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID", "COGNITO_REGION"):
+        assert f'name = "{name}", value' in locals_body, f"{name} is not plain environment"
 
 
 # --- Configuration that must not cross over from the local stack ----------------------------------
@@ -690,19 +965,67 @@ def test_the_provider_takes_no_credential_and_the_region_is_a_variable() -> None
 
 def test_every_secret_variable_is_declared_without_a_default() -> None:
     """`terraform apply` refuses to run without them, so no credential can arrive by being
-    forgotten - and none of them can be committed, because none of them is written down."""
-    for name in ("db_password", "llm_api_key", "tavily_api_key", "auth_keys"):
+    forgotten - and none of them can be committed, because none of them is written down.
+
+    `auth_keys` is the one exception and is checked separately below: under Cognito there is no
+    key table at all, so requiring a value would demand a credential the deployment never reads.
+    """
+    for name in ("llm_api_key", "tavily_api_key"):
         variable = _variables()[name]
         assert _attribute(variable.body, "sensitive") == "true", f"{name} is not marked sensitive"
         assert _attribute(variable.body, "default") is None, f"{name} has a default"
 
 
+def test_the_key_table_is_still_required_in_the_mode_that_reads_it() -> None:
+    """Its default is empty because Cognito needs none, and a validation is what stops an
+    `api_key` deployment starting with no table - which would authenticate nobody."""
+    variable = _variables()["auth_keys"]
+
+    assert _attribute(variable.body, "sensitive") == "true"
+    assert _attribute(variable.body, "default") == '""'
+    assert 'var.auth_mode == "cognito" || trimspace(var.auth_keys) != ""' in variable.body
+
+
+def test_there_is_no_database_password_variable_at_all() -> None:
+    """ADR 0020 decision 1, and the largest single reduction in what `terraform.tfstate` holds:
+    RDS generates the master password into a secret it owns, so no password value ever passes
+    through Terraform to be recorded."""
+    assert "db_password" not in _variables()
+
+    database = _one("aws_db_instance")
+    assert _attribute(database.body, "manage_master_user_password") == "true"
+    assert _attribute(database.body, "password") is None
+
+    joined = "\n".join(_tf_code().values())
+    assert "var.db_password" not in joined
+
+
+SECRET_BEARING_EXPRESSIONS = (
+    "var.llm_api_key",
+    "var.tavily_api_key",
+    "var.auth_keys",
+    "secret_string",
+    "aws_secretsmanager_secret_version",
+    "master_user_secret[0].secret_string",
+)
+"""Expressions that resolve to a credential rather than to a name for one. An ARN is neither -
+it is what `put-secret-value` and the teardown checklist take, and reading one grants nothing."""
+
+
 def test_no_output_would_print_a_secret() -> None:
     outputs = {block.labels[0]: block for block in _all_blocks() if block.type == "output"}
     for name, block in outputs.items():
-        value = _attribute(block.body, "value") or ""
-        for secret in ("password", "api_key", "auth_keys", "database_url"):
+        value = _attribute(block.body, "value") or block.body
+        for secret in ("password", *SECRET_BEARING_EXPRESSIONS):
             assert secret not in value, f"output {name} would print {secret}"
+
+
+def test_no_output_is_marked_sensitive_because_none_needs_to_be() -> None:
+    """A `sensitive` output is one that holds a secret and is being hidden. The rule here is
+    stronger: an output must not hold one, so none of them needs hiding."""
+    for block in _all_blocks():
+        if block.type == "output":
+            assert _attribute(block.body, "sensitive") is None, block.labels[0]
 
 
 def test_every_output_the_runbook_needs_exists() -> None:
