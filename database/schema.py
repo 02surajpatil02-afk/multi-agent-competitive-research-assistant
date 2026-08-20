@@ -91,6 +91,7 @@ AuditAction = Literal[
     "export_attempted",
     "export_result",
     "job_finished",
+    "job_reconciled",
     "retention_delete",
 ]
 """The actions ARCHITECTURE.md §9 enumerates, plus `reflection_failed` and `job_finished`.
@@ -100,6 +101,14 @@ AuditAction = Literal[
 does not carry it. Both are in the specification, so the vocabulary follows the requirement
 rather than the list, and the discrepancy is worth correcting in §9 rather than silently
 working around.
+
+`job_reconciled` is [ADR 0021](../docs/adr/0021-stale-job-reconciliation-and-dlq-recovery.md)
+decision 5. The operator sweep repairs a `jobs` row from durable state, and two of its four
+mutations - a gate projection restored, and a `queued` job re-enqueued - finish no job and so
+write no `job_finished` row. Without this action those mutations would leave no trace at all,
+and a durable row changed by a person with no record of who or why is exactly what
+`ck_audit_events_actor` exists to prevent. It costs one Alembic revision - `rev_0004` - for the
+same reason `job_finished` cost `rev_0003`.
 
 `job_finished` is ADR 0009 decision 5, which adopts the shape
 [ADR 0008](../docs/adr/0008-a-failed-jobs-reason-lives-in-the-checkpoint-for-phase-2.md)

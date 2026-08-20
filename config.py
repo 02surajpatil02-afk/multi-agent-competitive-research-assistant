@@ -236,6 +236,22 @@ class Config:
     """
 
     # Operations.
+    stale_job_min_age_seconds: int
+    """How old a non-terminal job must be before the block C sweep will even look at it.
+
+    **It selects candidates; it never authorises a change**
+    ([ADR 0021](docs/adr/0021-stale-job-reconciliation-and-dlq-recovery.md) decision 2). A row
+    that clears this bar is inspected under the same per-job PostgreSQL fence a worker takes,
+    against freshly reread durable state; a busy fence means the job is still owned and nothing
+    happens to it. No job is ever failed because it is old.
+
+    The default is derived rather than picked. A message can be in flight for three deliveries
+    of the queue's 1800-second visibility window before it is dead-lettered - 5400 seconds - and
+    a single invocation is bounded at `MAX_JOB_RUNTIME` inside that. 7200 is 5400 plus half an
+    hour, so a job that is still working its way through legitimate redelivery is not a
+    candidate at all, and the fence is what stands behind that rather than in front of it.
+    """
+
     retention_days: int
     app_env: AppEnv
     log_level: str
@@ -305,6 +321,8 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         cognito_region=_optional(source, "COGNITO_REGION") or aws_region,
         auth_keys_secret_id=_optional(source, "AUTH_KEYS_SECRET_ID"),
         auth_keys=_optional(source, "AUTH_KEYS"),
+        # ADR 0021 decision 2: 3 x 1800s of redelivery, plus half an hour.
+        stale_job_min_age_seconds=_int(source, "STALE_JOB_MIN_AGE_SECONDS", default=7200),
         retention_days=_int(source, "RETENTION_DAYS", default=365),
         app_env=_app_env(source),
         log_level=_optional(source, "LOG_LEVEL") or "INFO",

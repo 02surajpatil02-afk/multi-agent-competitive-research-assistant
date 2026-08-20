@@ -1,4 +1,4 @@
-# Deployment — the temporary AWS environment (Phase 5 blocks A and B)
+# Deployment — the temporary AWS environment (Phase 5 blocks A, B and C)
 
 **What this is.** The Terraform in `infra/` deploys the two processes this repository already
 runs — `uvicorn app:app` and `python -m worker` — onto AWS, together with the four stores they
@@ -25,6 +25,19 @@ because three of block A's listed omissions were one problem:
 - **HTTPS is available but not created.** Set `certificate_arn` to a certificate you already own
   and port 80 redirects to 443. Leave it empty, which is the default, and see
   [§4.6](#46-the-token-and-what-it-travels-over) for what that costs.
+
+**What block C added** ([ADR 0021](adr/0021-stale-job-reconciliation-and-dlq-recovery.md)),
+which is the operational half:
+
+- **Six CloudWatch alarms**, every one of them reading a metric AWS already publishes, plus an
+  optional SNS topic with **no subscription** — subscribing is one operator command.
+- **Explicit short log retention** on all four log groups, because a group ECS creates on its own
+  never expires and that is storage which charges after every task has stopped.
+- **Three operator recovery tools** — `reconcile_jobs.py`, `inspect_dlq.py`, `replay_dlq.py` — and
+  one `ops` task definition to run them in, because RDS has no public address and a laptop cannot
+  reach the database they read.
+- **`docs/runbook.md`**, thirteen conditions with a symptom, a place to look, a safe first action
+  and what not to do.
 
 **Nothing in this repository deploys anything.** CI formats and validates the Terraform and
 never plans or applies. Every command below is run by a person who has decided to run it.
@@ -405,7 +418,8 @@ changes.
 
 ## 5. Verify
 
-Ten checks, in the order the system actually works.
+Fifteen checks, in the order the system actually works. **Ten to prove it works, and five to
+prove you could tell if it stopped.**
 
 ```bash
 export API=$(terraform -chdir=infra output -raw api_url)
@@ -502,6 +516,85 @@ curl -s "<the url from that response>" | head -c 400
 endpoint, so unlike the local stack there is no `S3_PUBLIC_ENDPOINT_URL` and no rewriting — it
 resolves and downloads as signed.
 
+### Block C: the operational half
+
+**None of these five needs a job to fail.** Each demonstrates a capability against the healthy
+deployment you have just verified, which is the only honest way to demonstrate it — **do not
+corrupt a row or delete a checkpoint to produce a symptom.**
+
+**11. The alarms exist and are in a sensible state.** Expect six, all `OK` or
+`INSUFFICIENT_DATA` on a deployment that has just run one job. `INSUFFICIENT_DATA` is not a
+fault: SQS publishes queue metrics every five minutes and an idle queue publishes nothing.
+
+```bash
+aws cloudwatch describe-alarms --alarm-name-prefix competitive-research --query 'MetricAlarms[].[AlarmName,StateValue]' --output table
+```
+
+If you want notifications, subscribe now — nothing here created a subscription:
+
+```bash
+aws sns subscribe --topic-arn "$(terraform -chdir=infra output -raw alarms_topic_arn)" --protocol email --notification-endpoint you@example.com
+```
+
+**12. The reconciler dry-runs clean.** On a healthy deployment this should report zero
+candidates, or report a live job as `owned`. **`owned` is the correct answer**, not an obstacle:
+it means a worker holds that job's execution fence. The tooling runs as a one-off task, because
+RDS has no public address:
+
+```bash
+aws ecs run-task --cluster "$CLUSTER" --task-definition "$(terraform -chdir=infra output -raw ops_task_definition)" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json task_subnet_ids | tr -d '[]\"' )],securityGroups=[$(terraform -chdir=infra output -raw worker_security_group_id)],assignPublicIp=ENABLED}"
+```
+
+```bash
+aws logs tail /ecs/competitive-research/ops --since 5m
+```
+
+**Nothing was written.** The default command is the dry run and `--apply` is absent, which is
+what makes running that task by accident harmless.
+
+**13. The DLQ inspection tool answers.** On a healthy deployment the answer is "0 dead-letter
+message(s)", and that is the check: the tool reached the queue, read nothing, and released
+nothing. Override the command on the same task definition:
+
+```bash
+aws ecs run-task --cluster "$CLUSTER" --task-definition "$(terraform -chdir=infra output -raw ops_task_definition)" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json task_subnet_ids | tr -d '[]\"' )],securityGroups=[$(terraform -chdir=infra output -raw worker_security_group_id)],assignPublicIp=ENABLED}" --overrides '{"containerOverrides":[{"name":"ops","command":["python","scripts/inspect_dlq.py"]}]}'
+```
+
+**14. A worker restart is survivable, and this is the one to watch.** Submit a job, wait for the
+worker log to show a node executing, then stop the task. The message was never deleted, so it
+redelivers; the worker resumes from the checkpoint and does not replay the completed node.
+
+```bash
+aws ecs update-service --cluster "$CLUSTER" --service "$(terraform -chdir=infra output -raw worker_service_name)" --force-new-deployment
+```
+
+```bash
+aws logs tail /ecs/competitive-research/worker --follow
+```
+
+What to look for: `delivery 2`, then the job continuing rather than starting again. That is
+at-least-once delivery, the checkpoint and the execution fence all working at once, and it is the
+single most convincing thing this deployment can show.
+
+**15. The DLQ alarm can be observed, safely.** *Optional, and it is the only step that puts a
+message anywhere by hand.* Send one **isolated test message** — a job id that does not exist —
+directly to the dead-letter queue, watch the alarm turn, then remove it. It touches no real job
+and no database row:
+
+```bash
+aws sqs send-message --queue-url "$(terraform -chdir=infra output -raw jobs_dlq_url)" --message-group-id alarm-test --message-deduplication-id "alarm-test-$(date +%s)" --message-body '{"job_id":"00000000-0000-4000-8000-000000000000","user_id":"00000000-0000-4000-8000-000000000000","idempotency_key":"alarm-test"}'
+```
+
+Within roughly five minutes the alarm state is `ALARM`. `inspect_dlq.py` will show the message
+with `row=missing`, which is exactly right — there is no such job. Then delete it:
+
+```bash
+aws sqs receive-message --queue-url "$(terraform -chdir=infra output -raw jobs_dlq_url)" --query 'Messages[0].ReceiptHandle' --output text | xargs -I {} aws sqs delete-message --queue-url "$(terraform -chdir=infra output -raw jobs_dlq_url)" --receipt-handle {}
+```
+
+**Do not point this at a real job id.** `replay_dlq.py` would then be operating on a job whose
+message was never genuinely dead-lettered, which proves nothing and risks a duplicate delivery.
+
 ---
 
 ## 6. Teardown
@@ -525,8 +618,9 @@ terraform -chdir=infra destroy -var image_tag="$IMAGE_TAG"
 | Cache | ElastiCache cluster, subnet group | |
 | Messaging | Both SQS queues | Free at rest; deleted anyway |
 | Storage | S3 bucket **and its objects** | `force_destroy` decides |
-| Logs | Three CloudWatch log groups | Terraform-managed on purpose — groups ECS creates itself survive destroy |
-| IAM | **Three execution roles**, two task roles, and their inline policies | Block B split the execution role per task definition |
+| Logs | **Four** CloudWatch log groups | Terraform-managed on purpose — groups ECS creates itself survive destroy |
+| Monitoring | **Six CloudWatch alarms and the SNS topic** | Terraform owns all seven; a subscription you added by hand goes with the topic |
+| IAM | **Four execution roles**, **three** task roles, and their inline policies | Block B split the execution role per task definition; block C added the `ops` pair |
 | Secrets | The LLM key, the search key, and the auth-keys secret in `api_key` mode | `recovery_window_in_days = 0`, so they are **deleted immediately, not scheduled** |
 | Cognito | The user pool, its app client, and both groups — **and every user in it** | Deleting the pool deletes the demo account with it |
 | Network | VPC, 4 subnets, 2 route tables, internet gateway, 5 security groups | |
@@ -551,6 +645,14 @@ pool you intend to keep, delete them first:
 
 **A certificate you supplied is not deleted**, and must not be: `certificate_arn` is an input,
 Terraform did not create it, and destroy leaves it alone. ACM public certificates are free at rest.
+
+**Messages left in the dead-letter queue go with the queue**, and the queue goes with destroy —
+so **read them before you tear down**. `message_retention_seconds` is 14 days, which outlives the
+demo and not the deployment. If a dead-lettered message is evidence you want to keep, run
+`inspect_dlq.py` and save its output; nothing else preserves it.
+
+**Alarm history is not preserved either.** Deleting an alarm deletes its state-change history, so
+a screenshot of `describe-alarms` is the only record that it ever fired.
 
 ### The orphan checks
 
@@ -583,6 +685,14 @@ aws logs describe-log-groups --log-group-name-prefix /ecs/competitive-research -
 ```
 
 ```bash
+aws cloudwatch describe-alarms --alarm-name-prefix competitive-research --query 'MetricAlarms[].AlarmName'
+```
+
+```bash
+aws sns list-topics --query 'Topics[?contains(TopicArn, `competitive-research`)].TopicArn'
+```
+
+```bash
 aws ecr describe-repositories --query 'repositories[].repositoryName'
 ```
 
@@ -610,6 +720,11 @@ repository, no load balancer, and no VPC carrying the `Project` tag.
 **Expected results for the two block B checks:** no secret whose name starts with
 `competitive-research` (an entry with a `DeletedDate` means the recovery window is not 0 — check
 why), and no user pool with that prefix.
+
+**Expected results for the two block C checks:** no alarm and no topic with that prefix. Both are
+Terraform-owned, so anything found means destroy did not finish — re-run it rather than deleting
+by hand. **An alarm costs a small amount per month whether or not it ever fires**, and an SNS
+topic with a live email subscription outlives the deployment it was watching.
 
 **Orphaned ENIs are the one that bites.** A Fargate task's ENI is deleted with the task, but a
 VPC delete that fails usually fails because one ENI is still detaching. Wait a minute and re-run
@@ -654,14 +769,23 @@ risk.
 | NAT gateway | Per hour + per GB | **$0 — none exists** | — |
 | Elastic IP | Per hour when idle | **$0 — none exists** | — |
 | CloudWatch Logs | Ingest + storage | Negligible at 1-day retention | Small but non-zero forever |
+| **CloudWatch alarms** | Per alarm-month, prorated | Fractions of a cent for 6 alarms | **A few dollars a year, charging whether or not one ever fires** |
+| **SNS topic** | Per million publishes, with a large free tier | **$0** — a topic with no subscription publishes nothing | $0, unless you subscribed something noisy |
+| **The `ops` task** | Fargate per second, only while a recovery runs | **$0** unless you ran one; seconds if you did | $0 — nothing starts it |
 | ECR storage | Per GB-month | Negligible for 1–2 images | Small but non-zero forever |
 | SQS, S3, IGW, security groups, subnets | Per request / per GB | Effectively free at this volume | Effectively free |
 | **RDS final snapshot** | Per GB-month | $0 while skipped | **Charges after everything else is gone** |
 
-**The four that keep charging after the tasks stop:** the ALB, RDS, ElastiCache, and anything
-retained — a snapshot, a log group, an ECR image. The first three are why the destroy step is
+**The five that keep charging after the tasks stop:** the ALB, RDS, ElastiCache, anything
+retained — a snapshot, a log group, an ECR image — and, new in block C, **the alarms**, which bill
+per alarm-month regardless of state. The first three are why the destroy step is
 part of the procedure rather than an afterthought; the last is why the log groups are
 Terraform-managed and `force_delete` is on.
+
+**Block C's own incremental cost for an hour is effectively nothing**: six alarms prorated over
+an hour, an SNS topic that publishes nothing, native metrics that are already collected, and a
+task that runs for seconds if it runs at all. What it adds to a *forgotten* deployment is the six
+alarm-months, which is the one line worth checking after teardown.
 
 **Rough expectation for a one-hour deployment: well under a dollar**, dominated by RDS,
 ElastiCache and the ALB in roughly equal parts. **Rough expectation if left running for a month:
@@ -672,7 +796,7 @@ spend, not AWS.
 
 ---
 
-## 8. What blocks A and B left out
+## 8. What blocks A, B and C left out
 
 **Block A's four deferrals are closed** ([ADR 0020](adr/0020-cognito-jwt-validation-and-secret-injection.md)):
 
@@ -695,10 +819,26 @@ configuration or costs more than an hour-long environment can justify:
 | A permissions boundary, CloudTrail data events | Both need account-level setup this configuration cannot make on its own |
 | ALB `authenticate-cognito` | Evaluated and rejected: a browser redirect flow with a session cookie, for an API whose callers are scripts. ADR 0020 decision 4 |
 | A remote Terraform backend | One operator, one laptop, one apply. See §9 for when that stops being true |
-| CloudWatch alarms and dashboards — DLQ depth, task count, RDS connections | **Block C** |
-| Stale-job and DLQ operational recovery (ADR 0010 decision 9's sweep) | **Block C** |
-| Retention beyond minimal safe defaults — an S3 lifecycle expiry, the `RETENTION_DAYS` sweep | **Block C** |
 | API Gateway in front of the ALB, autoscaling | Later, and only with a requirement behind each |
+
+**Block C's three deferrals are closed** ([ADR 0021](adr/0021-stale-job-reconciliation-and-dlq-recovery.md)):
+
+| Was left out | What block C built |
+|---|---|
+| CloudWatch alarms | Six, all on native metrics, plus an optional SNS topic with no subscription. **No dashboard** — a second place to keep true, for six alarms already visible in the console |
+| Stale-job and DLQ recovery (ADR 0010 decision 9's sweep) | `reconcile_jobs.py`, `inspect_dlq.py` and `replay_dlq.py`, run as one-off `ops` tasks. Age selects a candidate and never authorises a change; every mutation needs the per-job execution fence, a fresh reread and outcome-specific evidence |
+| Retention | Explicit 1-day log retention on all four groups, 14-day DLQ retention, no S3 expiry, and **no automatic database cleanup** |
+
+**What block C deliberately did not build**, each for a stated reason:
+
+| Left out | Why, and where it belongs |
+|---|---|
+| ECS `RunningTaskCount` alarms | The metric lives in the `ECS/ContainerInsights` namespace, which is a per-metric charge. The ALB unhealthy-target and queue-age alarms answer the same two questions from metrics already published free |
+| A CloudWatch dashboard | Six alarms are already visible in the console, and a dashboard is a second place to keep true |
+| A Lambda or EventBridge-scheduled reconciler | An always-on service, its own role and its own failure mode, for an environment that lives an hour |
+| Automatic DLQ redrive (`StartMessageMoveTask`) | It cannot inspect a job's durable state before moving a message, and it moves all of them. A blind redrive is the outage that produced them, repeated |
+| Gate expiry — closing a review nobody answered | Still deferred, and deliberately not reachable by the sweep: `awaiting_approval` is not a candidate status at all. It is a policy decision about someone else's review, not an engineering gap |
+| An S3 expiry rule and a `RETENTION_DAYS` database sweep | Both would delete, on a schedule, the evidence the deployment exists to produce |
 
 ---
 
@@ -716,7 +856,10 @@ configuration or costs more than an hour-long environment can justify:
 | Authentication | Cognito access tokens, one hour, no MFA, one throwaway user | Cognito with MFA, a real user directory or federation, and shorter-lived tokens behind an authorizing gateway |
 | Terraform state | Local file, gitignored, **deleted at teardown** | S3 backend with DynamoDB locking and bucket encryption, so two operators cannot apply at once and no credential sits on a laptop |
 | Image tags | Commit SHA, mutable repository | Commit SHA, **immutable** repository — a tag that can move is a rollback target that can lie |
-| Monitoring | Three log groups at 1-day retention | CloudWatch alarms on DLQ depth, task count, RDS connections and 5xx rate; longer retention; the §14 dashboard |
+| Monitoring | Six alarms on native metrics, four log groups at 1-day retention, no dashboard | The same six plus **Container Insights** for real ECS task-count alarms, a 5xx *rate* rather than a count, ~30-day retention, and the §14 dashboard |
+| Alerting | One SNS topic, no subscription — the alarms are read in the console | A subscription to a rota, and a distinction between what pages and what waits until morning |
+| Operational recovery | Three scripts an operator runs as one-off tasks, all dry-run by default | The same three, run the same way. **This is not a shape production should change** — a reconciler that mutates durable state on a schedule, with nobody reading its evidence, is a worse idea at scale than at demo scale |
+| Retention | 1-day logs, 14-day DLQ, no S3 expiry, no database sweep | 30-day logs; an S3 lifecycle rule matched to `RETENTION_DAYS`; the retention sweep itself, which is the one thing here that genuinely needs building |
 | Deploy | `terraform apply` from a laptop | CI builds and pushes on merge; migration task, then service update, then watch the alarms (guidelines §19) |
 
 **What does not change between the two columns**, and this is the part worth saying out loud in

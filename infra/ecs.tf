@@ -150,7 +150,7 @@ resource "aws_ecs_cluster" "main" {
   tags = { Name = local.name }
 }
 
-# Three log groups rather than one, so `aws logs tail` reads one process at a time - which is
+# Four log groups rather than one, so `aws logs tail` reads one process at a time - which is
 # how a two-process system is actually debugged. They are Terraform-managed on purpose: a log
 # group ECS creates on its own survives `terraform destroy` and keeps charging for storage.
 resource "aws_cloudwatch_log_group" "api" {
@@ -172,6 +172,16 @@ resource "aws_cloudwatch_log_group" "migrate" {
   retention_in_days = var.log_retention_days
 
   tags = { Name = "${local.name}-migrate" }
+}
+
+# Block C's operator tooling writes here. It gets its own group for the same reason the other
+# three do: what a recovery run decided, and about which job, is the thing you go looking for
+# afterwards - and it should not be interleaved with twenty minutes of worker output.
+resource "aws_cloudwatch_log_group" "ops" {
+  name              = "/ecs/${local.name}/ops"
+  retention_in_days = var.log_retention_days
+
+  tags = { Name = "${local.name}-ops" }
 }
 
 # --- The three task definitions ------------------------------------------------------------------
@@ -324,6 +334,62 @@ resource "aws_ecs_task_definition" "migrate" {
   }])
 
   tags = { Name = "${local.name}-migrate" }
+}
+
+# The other one-off: Phase 5 block C's operator recovery tooling, run by hand with a command
+# override. **No service, and nothing starts it.**
+#
+#     aws ecs run-task --cluster ... --task-definition ...-ops \
+#       --overrides '{"containerOverrides":[{"name":"ops","command":["python","scripts/reconcile_jobs.py"]}]}'
+#
+# It exists because RDS has no public address and sits in subnets with no route off the VPC, so
+# a laptop cannot reach the database the three scripts read. Its environment is the database and
+# the queue; it has **no bucket, no Redis, no provider credential and no auth setting**, and its
+# task role may touch two queues and nothing else (docs/adr/0021-*.md decision 7).
+#
+# The default command is the dry run, which is the safe thing for a task somebody starts by
+# accident: it writes nothing and prints what it would do.
+resource "aws_ecs_task_definition" "ops" {
+  family                   = "${local.name}-ops"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 256
+  memory                   = 512
+  execution_role_arn       = aws_iam_role.execution["ops"].arn
+  task_role_arn            = aws_iam_role.ops.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "X86_64"
+  }
+
+  container_definitions = jsonencode([{
+    name      = "ops"
+    image     = local.image
+    essential = true
+
+    command = ["python", "scripts/reconcile_jobs.py"]
+
+    environment = concat(local.database_environment, [
+      { name = "SQS_QUEUE_URL", value = aws_sqs_queue.jobs.url },
+      { name = "AWS_REGION", value = var.region },
+      { name = "APP_ENV", value = "prod" },
+      { name = "LOG_LEVEL", value = var.log_level },
+    ])
+
+    secrets = local.database_secrets
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.ops.name
+        awslogs-region        = var.region
+        awslogs-stream-prefix = "ops"
+      }
+    }
+  }])
+
+  tags = { Name = "${local.name}-ops" }
 }
 
 # --- The two services -------------------------------------------------------------------------

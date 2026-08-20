@@ -199,11 +199,91 @@ variable "s3_force_destroy" {
 
 variable "log_retention_days" {
   description = <<-EOT
-    CloudWatch Logs retention. 1 day, because the deployment lives for an hour and log storage
-    is one of the few things that keeps charging after every task has stopped.
+    CloudWatch Logs retention, applied to all three ECS log groups. **1 day, and explicit.**
+
+    A log group ECS creates on its own has retention "Never expire", which is storage that keeps
+    charging long after every task has stopped - which is why the three groups are
+    Terraform-managed and why this number exists at all rather than being left to a default.
+
+    One day is right for a deployment that lives an hour and is destroyed. It is deliberately
+    shorter than the dead-letter queue's 14-day message retention: the evidence that a job
+    failed outlives the log lines explaining it, which is a trade a longer-lived environment
+    should reverse. docs/deployment.md section 9 names 30 days for production.
   EOT
   type        = number
   default     = 1
+}
+
+# --- Block C: the operational alarms ---------------------------------------------------------
+#
+# Four numbers and one switch. Each threshold is derived from something this system already
+# decided rather than chosen for looking reasonable, and each is a variable so an operator can
+# move it without editing monitoring.tf. **None of them is claimed to be production-optimal** -
+# they are right for one worker, one API task and a deployment that lives an hour.
+
+variable "create_alarms_topic" {
+  description = <<-EOT
+    Whether to create the SNS topic the alarms notify. An SNS topic with nothing subscribed to
+    it costs nothing, so the default is `true` and every alarm has a real action to name; who
+    hears about it is an operator's decision, made afterwards with `aws sns subscribe`.
+
+    **No email subscription is created here, on purpose.** That would put an address in a
+    repository and send a confirmation mail on every apply.
+
+    Set it to `false` and the alarms still exist, still change state and are still visible in
+    the console - they simply notify nothing, which is often all a one-hour deployment needs.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "queue_age_alarm_seconds" {
+  description = <<-EOT
+    How old the oldest jobs-queue message may get before the alarm fires. **This is the
+    worker-liveness alarm**: a worker that is not consuming is a queue that is ageing.
+
+    3600 is derived rather than picked. `ApproximateAgeOfOldestMessage` counts in-flight
+    messages, so a job the worker is legitimately running ages it - and one invocation is
+    bounded at `MAX_JOB_RUNTIME` (1200s). Meanwhile a message can spend three deliveries of the
+    1800-second visibility window in flight before it is dead-lettered, which is 5400s. An hour
+    sits between the two: longer than any single legitimate invocation, and early enough to fire
+    while redelivery is still happening rather than after the dead-letter alarm already has.
+
+    A job waiting at the human gate does not age this metric at all - its message was deleted
+    when the gate interrupted - so no threshold here can be tripped by a slow reviewer.
+  EOT
+  type        = number
+  default     = 3600
+}
+
+variable "rds_free_storage_alarm_bytes" {
+  description = <<-EOT
+    How little free storage RDS may report before the alarm fires. The default is 2 GiB of the
+    20 GiB `db_allocated_storage` allocates, so it fires at 10% remaining.
+
+    A full disk is the one RDS condition that is unrecoverable in place: every checkpoint, every
+    audit row and every terminal status is a write. 10% of 20 GiB is roughly a day of headroom
+    at any rate this deployment can produce, which is early enough to react and late enough not
+    to fire on an idle environment.
+
+    Raise it with `db_allocated_storage` - a percentage-shaped threshold would need a metric
+    math expression for a number that changes once.
+  EOT
+  type        = number
+  default     = 2147483648
+}
+
+variable "redis_memory_alarm_percent" {
+  description = <<-EOT
+    The `DatabaseMemoryUsagePercentage` at which the cache alarm fires.
+
+    80 is a conventional headroom figure and is stated as one. What makes it worth watching here
+    is specific: everything in Redis fails open except the shared rate limiter, and an evicted
+    `ratelimit:llm` key does not break anything - it silently widens the window every worker is
+    sharing. Over-permission is the failure mode, which is the kind nobody notices.
+  EOT
+  type        = number
+  default     = 80
 }
 
 # --- What the worker needs to call a model -------------------------------------------------

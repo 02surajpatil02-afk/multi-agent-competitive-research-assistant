@@ -92,6 +92,14 @@ output "migrate_task_definition" {
   value       = aws_ecs_task_definition.migrate.arn
 }
 
+output "ops_task_definition" {
+  description = <<-EOT
+    Phase 5 block C's operator tooling, for `aws ecs run-task` with a command override. Nothing
+    starts it, and its default command is the reconciler's dry run - see docs/runbook.md.
+  EOT
+  value       = aws_ecs_task_definition.ops.arn
+}
+
 output "task_subnet_ids" {
   description = "The subnets `aws ecs run-task` must place the migration task in."
   value       = aws_subnet.public[*].id
@@ -105,6 +113,33 @@ output "worker_security_group_id" {
 output "vpc_id" {
   description = "For the teardown orphan checks in docs/deployment.md."
   value       = aws_vpc.main.id
+}
+
+# --- Block C: the operational alarms -------------------------------------------------------------
+
+output "alarm_names" {
+  description = <<-EOT
+    Every CloudWatch alarm this deployment creates, for `aws cloudwatch describe-alarms
+    --alarm-names` during verification and for the teardown check in docs/deployment.md.
+  EOT
+  value = [
+    aws_cloudwatch_metric_alarm.dlq_not_empty.alarm_name,
+    aws_cloudwatch_metric_alarm.jobs_queue_backlog_age.alarm_name,
+    aws_cloudwatch_metric_alarm.api_unhealthy_targets.alarm_name,
+    aws_cloudwatch_metric_alarm.api_target_5xx.alarm_name,
+    aws_cloudwatch_metric_alarm.rds_free_storage_low.alarm_name,
+    aws_cloudwatch_metric_alarm.redis_memory_pressure.alarm_name,
+  ]
+}
+
+output "alarms_topic_arn" {
+  description = <<-EOT
+    The SNS topic every alarm notifies, or empty when `create_alarms_topic` is false. **An ARN,
+    not a value** - subscribing to it is one command and nothing here creates a subscription:
+
+        aws sns subscribe --topic-arn <this> --protocol email --notification-endpoint you@...
+  EOT
+  value       = var.create_alarms_topic ? aws_sns_topic.alarms[0].arn : ""
 }
 
 # --- Block B: authentication and secrets -------------------------------------------------------
@@ -161,10 +196,11 @@ output "execution_role_names" {
 }
 
 output "log_groups" {
-  description = "The three CloudWatch log groups, which keep charging for storage if left behind."
+  description = "The four CloudWatch log groups, which keep charging for storage if left behind."
   value = [
     aws_cloudwatch_log_group.api.name,
     aws_cloudwatch_log_group.worker.name,
     aws_cloudwatch_log_group.migrate.name,
+    aws_cloudwatch_log_group.ops.name,
   ]
 }

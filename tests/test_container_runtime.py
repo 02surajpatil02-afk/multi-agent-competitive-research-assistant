@@ -122,6 +122,76 @@ def _one_off(
     return finished.returncode, finished.stdout + finished.stderr
 
 
+def test_the_operator_recovery_tools_run_by_path_inside_the_image() -> None:
+    """Phase 5 block C, and the defect this caught.
+
+    Each of the four is documented as `python scripts/<name>.py`, and in a deployment the image
+    is the only place any of them can run - RDS has no public address. Before `PYTHONPATH=/app`
+    was stated in the Dockerfile, every one of these raised `ModuleNotFoundError` on its first
+    import, which would have been discovered by an operator trying to recover a job rather than
+    by a build.
+
+    `--help` for three of them, because parsing arguments is enough to prove the imports
+    resolved and it reaches no database. The reconciler is run for real below.
+    """
+    for tool in ("reexport_job", "reconcile_jobs", "inspect_dlq", "replay_dlq"):
+        status, output = _one_off("worker", "python", f"scripts/{tool}.py", "--help")
+        assert status == 0, f"scripts/{tool}.py could not start: {output}"
+        assert "ModuleNotFoundError" not in output
+        assert "usage:" in output.lower()
+
+
+def test_the_reconciler_dry_runs_against_the_real_stores_and_writes_nothing() -> None:
+    """The whole tool, end to end, against the Compose PostgreSQL and the LocalStack queue:
+    it reads the candidate rows, resolves the dead-letter queue from the jobs queue's own
+    redrive policy, reads it without consuming it, and reports.
+
+    **Dry run is the default**, so a container somebody starts by accident writes nothing -
+    which is also why the `ops` task definition's default command is this one.
+    """
+    status, output = _one_off(
+        "worker",
+        "python",
+        "scripts/reconcile_jobs.py",
+        environment={"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"},
+    )
+
+    assert status == 0, output
+    assert "candidate(s) inspected" in output
+    assert "repaired" in output
+
+
+def test_applying_a_reconciliation_needs_an_actor() -> None:
+    """`ck_audit_events_actor` refuses `unknown` one layer down; this refuses it one layer up,
+    before anything is read. A durable row repaired with no identity behind it is not a
+    repair."""
+    status, output = _one_off(
+        "worker",
+        "python",
+        "scripts/reconcile_jobs.py",
+        "--apply",
+        environment={"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"},
+    )
+
+    assert status == 1, output
+    assert "--actor" in output
+
+
+def test_the_replay_tool_refuses_to_act_on_the_whole_queue() -> None:
+    """There is no `--all`, and the absence is the safety property: a message reached the
+    dead-letter queue because three deliveries could not make it work."""
+    status, output = _one_off(
+        "worker",
+        "python",
+        "scripts/replay_dlq.py",
+        "--all",
+        environment={"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"},
+    )
+
+    assert status != 0
+    assert "unrecognized arguments" in output or "--job-id" in output
+
+
 def _docker(*arguments: str) -> str:
     """One `docker` invocation against a container this file started itself. Compose has no
     verb for "stop this one detached container and tell me how it exited"."""

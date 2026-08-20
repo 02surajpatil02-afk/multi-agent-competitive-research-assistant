@@ -85,7 +85,17 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     # The virtual environment, on PATH, so `uvicorn`, `python` and `alembic` are the ones
     # installed from the lockfile.
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    # **The import root, stated rather than assumed.** `uvicorn app:app` and `python -m worker`
+    # resolve from the working directory, so they never needed this - but `python
+    # scripts/reexport_job.py` does not: running a file by path puts *its own directory* on
+    # `sys.path`, not the working directory, so `from artifacts import ...` failed inside the
+    # image with `ModuleNotFoundError`. On a developer's machine the same command works because
+    # `uv sync` installs this project into the local virtual environment; the image deliberately
+    # installs only the dependencies. Found by running ADR 0009's recovery path in a container
+    # (Phase 5 block C), and the reason it matters is that in a deployment there is no host to
+    # run these tools from - the image is the only place they can run.
+    PYTHONPATH=/app
 
 # A non-root user with a fixed uid. Fixed rather than allocated because a numeric uid is what
 # a host or an orchestrator can be told about, and `--system` because this account exists to
@@ -103,18 +113,25 @@ WORKDIR /app
 # application only reads its own source, so files it cannot rewrite are one fewer thing an
 # injected page could aim at.
 COPY app.py worker.py config.py schemas.py llm_client.py jobqueue.py redisstore.py \
-     artifacts.py alembic.ini ./
+     artifacts.py operations.py alembic.ini ./
 COPY agents/ ./agents/
 COPY database/ ./database/
 COPY graph/ ./graph/
 COPY routes/ ./routes/
 COPY tools/ ./tools/
 
-# One script, deliberately: ADR 0009's operator recovery for an export whose artifact write
-# was exhausted. It is application code - it re-projects a stored `report_json` and can reach
-# nothing that could re-bill a model - and in a deployment there is no host to run it from.
-# `check_model.py` and `measure_jobs.py` are development tools and stay out.
-COPY scripts/__init__.py scripts/reexport_job.py ./scripts/
+# Four scripts, deliberately - the operator recovery tools, and nothing else. Each is
+# application code that re-projects durable state, and none of them can reach a model.
+#
+# **They are in the image because in a deployment there is no host to run them from.** RDS and
+# ElastiCache have no public address and sit in subnets with no route off the VPC, so a laptop
+# cannot reach the database at all: the only way to run one of these is as a one-off task in
+# the same VPC, from this image (infra/ecs.tf's `ops` task definition, docs/runbook.md).
+#
+# `check_model.py` calls a real model endpoint and `measure_jobs.py` runs real jobs and writes
+# `measurements/`. Both are development tools and stay out.
+COPY scripts/__init__.py scripts/reexport_job.py scripts/reconcile_jobs.py \
+     scripts/inspect_dlq.py scripts/replay_dlq.py ./scripts/
 
 USER app
 

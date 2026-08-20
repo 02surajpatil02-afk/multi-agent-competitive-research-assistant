@@ -179,13 +179,42 @@ def test_the_image_carries_what_a_migration_needs() -> None:
 def test_the_image_leaves_the_development_scripts_out() -> None:
     """`scripts/` is copied file by file rather than whole, so the two development tools stay
     out: `check_model.py` is a preflight against a real endpoint and `measure_jobs.py` runs
-    real jobs and writes `measurements/`. What is copied is ADR 0009's operator recovery,
-    which re-projects a stored report and can reach nothing that could re-bill a model."""
+    real jobs and writes `measurements/`.
+
+    What is copied is the operator recovery set - ADR 0009's re-export and Phase 5 block C's
+    three - and **they are in the image because in a deployment there is no host to run them
+    from**: RDS has no public address and sits in subnets with no route off the VPC, so the
+    only place they can reach the database is inside it. None of them can re-bill a model.
+    """
     from_scripts = {source for group in _copy_sources() for source in group}
 
-    assert "scripts/reexport_job.py" in from_scripts
+    for tool in (
+        "scripts/reexport_job.py",
+        "scripts/reconcile_jobs.py",
+        "scripts/inspect_dlq.py",
+        "scripts/replay_dlq.py",
+    ):
+        assert tool in from_scripts, f"{tool} cannot be run in a deployment"
+
     assert "scripts/check_model.py" not in from_scripts
     assert "scripts/measure_jobs.py" not in from_scripts
+
+
+def test_the_image_states_its_import_root() -> None:
+    """**A defect found by running ADR 0009's recovery path in a container, not by reading.**
+
+    `uvicorn app:app` and `python -m worker` resolve imports from the working directory, so they
+    never needed this. `python scripts/reexport_job.py` does: running a file by path puts *its
+    own directory* on `sys.path` rather than the working directory, so `from artifacts import
+    ...` raised `ModuleNotFoundError` inside the image. It works on a developer's machine only
+    because `uv sync` installs this project into the local virtual environment, and the image
+    deliberately installs the dependencies alone.
+
+    The documented command has to work in the one place the tool can actually be run.
+    """
+    dockerfile = (_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "PYTHONPATH=/app" in dockerfile
+    assert "WORKDIR /app" in dockerfile
 
 
 def test_the_dockerfile_names_its_sources_rather_than_copying_the_context() -> None:

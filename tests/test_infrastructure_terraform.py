@@ -88,10 +88,24 @@ FORBIDDEN_RESOURCE_TYPES = (
     # A customer-managed key is a per-month charge and two more grants, for encryption the
     # AWS-managed keys already provide here (ADR 0020 decision 6).
     "aws_kms_key",
-    # Block C.
-    "aws_cloudwatch_metric_alarm",
+    # Autoscaling stays absent through block C too: worker count is bounded by the LLM rate
+    # limit rather than by queue depth (ARCHITECTURE.md section 11), so scaling on the very
+    # metric the backlog alarm watches would be the wrong response to it.
     "aws_appautoscaling_target",
     "aws_appautoscaling_policy",
+    # Block C's own "did not build" list (docs/adr/0021-*.md decision 7). Each would be an
+    # always-on operational service for an environment that lives an hour, doing work three
+    # deterministic scripts already do on demand - and each is a one-line addition that no other
+    # test would notice.
+    "aws_cloudwatch_dashboard",
+    "aws_lambda_function",
+    "aws_cloudwatch_event_rule",
+    "aws_cloudwatch_event_target",
+    "aws_sfn_state_machine",
+    "aws_xray_sampling_rule",
+    # An email address in a repository, and a confirmation mail on every apply. The topic is
+    # created; subscribing to it is one operator command (monitoring.tf).
+    "aws_sns_topic_subscription",
 )
 """Resource types whose absence is a decision. Each would be a one-line addition that changes
 either the cost shape or which block this is."""
@@ -1052,6 +1066,278 @@ def test_the_example_variables_file_carries_no_real_value() -> None:
 
 def test_the_infrastructure_is_left_out_of_the_container_build_context() -> None:
     assert "\ninfra\n" in (_ROOT / ".dockerignore").read_text(encoding="utf-8")
+
+
+# --- Block C: six alarms, each one explainable ----------------------------------------------------
+
+ALARMS = (
+    "dlq_not_empty",
+    "jobs_queue_backlog_age",
+    "api_unhealthy_targets",
+    "api_target_5xx",
+    "rds_free_storage_low",
+    "redis_memory_pressure",
+)
+"""The whole alarm set. Six is a decision in both directions: fewer would leave the dead-letter
+queue or the worker unwatched, and a page of them would be a set nobody reads."""
+
+
+def test_the_alarm_set_is_exactly_the_six_that_were_justified() -> None:
+    """A seventh alarm is not free - it is another thing to explain, another threshold to defend
+    and another source of noise. This fails when one is added or removed without the reasoning
+    in monitoring.tf changing with it."""
+    assert set(_resources("aws_cloudwatch_metric_alarm")) == set(ALARMS)
+
+
+@pytest.mark.parametrize("name", ALARMS)
+def test_every_alarm_says_what_to_do_about_it(name: str) -> None:
+    """An alarm whose description does not tell you where to look is a notification, not an
+    alarm. Every one of them names the runbook."""
+    alarm = _resources("aws_cloudwatch_metric_alarm")[name]
+
+    assert _attribute(alarm.body, "alarm_name") is not None
+    assert "alarm_description" in alarm.body, f"{name} has no description"
+    assert _attribute(alarm.body, "treat_missing_data") is not None, (
+        f"{name} leaves missing-data behaviour to a default"
+    )
+
+
+def test_no_alarm_reads_a_metric_the_application_has_to_publish() -> None:
+    """Every namespace below is one AWS populates on its own. A custom metric would be an
+    operational signal the application has to remember to emit, which goes quiet exactly when
+    the application is broken - and it would need `PutMetricData` on a task role."""
+    native = {"AWS/SQS", "AWS/ApplicationELB", "AWS/RDS", "AWS/ElastiCache"}
+    for name, alarm in _resources("aws_cloudwatch_metric_alarm").items():
+        namespace = (_attribute(alarm.body, "namespace") or "").strip('"')
+        assert namespace in native, f"{name} reads {namespace}, which nothing publishes for free"
+
+    joined = "\n".join(_tf_code().values())
+    assert "PutMetricData" not in joined
+    assert "aws_cloudwatch_log_metric_filter" not in joined
+
+
+def test_the_dead_letter_alarm_fires_on_a_single_message() -> None:
+    """Any message in that queue means three deliveries failed and nobody has looked at why.
+    There is no threshold above zero that would be defensible."""
+    alarm = _resources("aws_cloudwatch_metric_alarm")["dlq_not_empty"]
+
+    assert _attribute(alarm.body, "metric_name") == '"ApproximateNumberOfMessagesVisible"'
+    assert _attribute(alarm.body, "dimensions") == "{ QueueName = aws_sqs_queue.jobs_dlq.name }"
+    assert _attribute(alarm.body, "threshold") == "0"
+    assert _attribute(alarm.body, "comparison_operator") == '"GreaterThanThreshold"'
+    assert _attribute(alarm.body, "treat_missing_data") == '"notBreaching"'
+
+
+def test_the_queue_age_alarm_is_slower_than_a_job_and_faster_than_the_dead_letter_queue() -> None:
+    """The threshold has to sit between two numbers the system already fixed: longer than one
+    invocation's `MAX_JOB_RUNTIME` (1200s), and shorter than three deliveries of the 1800-second
+    visibility window (5400s). Anything below the first pages on a healthy job; anything above
+    the second tells you nothing the dead-letter alarm has not already said."""
+    alarm = _resources("aws_cloudwatch_metric_alarm")["jobs_queue_backlog_age"]
+
+    assert _attribute(alarm.body, "metric_name") == '"ApproximateAgeOfOldestMessage"'
+    assert _attribute(alarm.body, "dimensions") == "{ QueueName = aws_sqs_queue.jobs.name }"
+    assert _attribute(alarm.body, "threshold") == "var.queue_age_alarm_seconds"
+
+    default = int(_attribute(_variables()["queue_age_alarm_seconds"].body, "default") or 0)
+    assert 1200 < default < 5400, f"{default} is outside the window the runtime already fixed"
+
+
+def test_the_load_balancer_alarms_name_the_api_target_group() -> None:
+    for name in ("api_unhealthy_targets", "api_target_5xx"):
+        alarm = _resources("aws_cloudwatch_metric_alarm")[name]
+        assert _attribute(alarm.body, "namespace") == '"AWS/ApplicationELB"'
+        assert _attribute(alarm.body, "TargetGroup") == "aws_lb_target_group.api.arn_suffix"
+        assert _attribute(alarm.body, "LoadBalancer") == "aws_lb.api.arn_suffix"
+
+
+def test_the_unhealthy_target_alarm_outlasts_the_documented_startup_window() -> None:
+    """`/health` is legitimately 503 until the first worker creates LangGraph's tables, and the
+    API service is given a 300-second grace period for it. An alarm window shorter than that
+    would page on every single deploy."""
+    alarm = _resources("aws_cloudwatch_metric_alarm")["api_unhealthy_targets"]
+
+    period = int(_attribute(alarm.body, "period") or 0)
+    periods = int(_attribute(alarm.body, "evaluation_periods") or 0)
+    grace = int(
+        _attribute(_resources("aws_ecs_service")["api"].body, "health_check_grace_period_seconds")
+        or 0
+    )
+    assert period * periods > grace, "the alarm fires inside the documented startup window"
+
+
+def test_the_store_alarms_hold_their_state_when_a_store_stops_reporting() -> None:
+    """A database or a cache that has stopped publishing metrics is not a healthy one.
+    `notBreaching` is right for a queue that is legitimately silent when empty and wrong here."""
+    for name in ("rds_free_storage_low", "redis_memory_pressure"):
+        alarm = _resources("aws_cloudwatch_metric_alarm")[name]
+        assert _attribute(alarm.body, "treat_missing_data") == '"missing"', name
+
+
+def test_the_free_storage_threshold_leaves_room_to_react() -> None:
+    """It fires with roughly 10% of the allocated storage left. A full disk stops every
+    checkpoint, every audit row and every terminal status, and cannot be recovered in place."""
+    alarm = _resources("aws_cloudwatch_metric_alarm")["rds_free_storage_low"]
+    assert _attribute(alarm.body, "comparison_operator") == '"LessThanThreshold"'
+    assert _attribute(alarm.body, "threshold") == "var.rds_free_storage_alarm_bytes"
+
+    threshold = int(_attribute(_variables()["rds_free_storage_alarm_bytes"].body, "default") or 0)
+    allocated = int(_attribute(_variables()["db_allocated_storage"].body, "default") or 0)
+    assert 0 < threshold < allocated * 1024**3, "the alarm would fire on an empty database"
+
+
+# --- Block C: where an alarm goes ---------------------------------------------------------------
+
+
+def test_there_is_one_alarm_topic_and_it_is_optional() -> None:
+    """An SNS topic with nothing subscribed costs nothing, so every alarm gets a real action to
+    name - and `create_alarms_topic = false` leaves the alarms in place with no action, still
+    changing state and still visible in the console."""
+    topic = _one("aws_sns_topic")
+    assert _attribute(topic.body, "count") == "var.create_alarms_topic ? 1 : 0"
+    assert _attribute(_variables()["create_alarms_topic"].body, "default") == "true"
+
+    assert (
+        "alarm_actions = var.create_alarms_topic ? [aws_sns_topic.alarms[0].arn] : []"
+        in _tf_code()["monitoring.tf"]
+    )
+
+
+@pytest.mark.parametrize("name", ALARMS)
+def test_every_alarm_notifies_the_one_topic(name: str) -> None:
+    alarm = _resources("aws_cloudwatch_metric_alarm")[name]
+    assert _attribute(alarm.body, "alarm_actions") == "local.alarm_actions"
+    assert _attribute(alarm.body, "ok_actions") == "local.alarm_actions"
+
+
+def test_no_email_address_is_written_down() -> None:
+    """Subscribing is one operator command. A subscription here would put an address in a
+    repository and send a confirmation mail on every apply."""
+    for name, text in _tf_code().items():
+        assert "notification_endpoint" not in text, f"{name} subscribes something to an alarm"
+        assert re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text) is None, f"{name} holds an address"
+
+
+# --- Block C: retention is explicit, and nothing new can read a secret ---------------------------
+
+
+def test_every_log_group_has_an_explicit_short_retention() -> None:
+    """A log group ECS creates on its own never expires, which is storage that keeps charging
+    after every task has stopped. All four are Terraform-managed and all four say how long."""
+    groups = _resources("aws_cloudwatch_log_group")
+    assert set(groups) == {"api", "worker", "migrate", "ops"}
+
+    for name, group in groups.items():
+        assert _attribute(group.body, "retention_in_days") == "var.log_retention_days", name
+
+    retention = int(_attribute(_variables()["log_retention_days"].body, "default") or 0)
+    assert 0 < retention <= 7, f"{retention} days is not a temporary deployment's retention"
+
+
+def test_the_reports_bucket_still_expires_nothing() -> None:
+    """Block C adds retention *documentation* and no S3 expiry rule. The reports are the
+    evidence this deployment exists to produce, and a schedule that deleted them could delete
+    them before the screenshots were taken."""
+    lifecycle = _one("aws_s3_bucket_lifecycle_configuration")
+    assert "expiration" not in lifecycle.body
+
+
+def test_the_dead_letter_queue_keeps_its_messages_longer_than_the_logs() -> None:
+    """14 days, the maximum. The evidence that a job failed has to outlive the demo, and it
+    deliberately outlives the log lines explaining it at 1-day retention."""
+    dlq = _resources("aws_sqs_queue")["jobs_dlq"]
+    assert _attribute(dlq.body, "message_retention_seconds") == "1209600"
+
+
+def test_block_c_changed_no_running_services_permissions() -> None:
+    """**A recovery tool's reach must not become a running service's reach.** The worker still
+    cannot receive from the dead-letter queue, the API still cannot receive from anything, and
+    neither gained CloudWatch or SNS - an operator needing a permission is never a reason to
+    give it to a process that runs all day."""
+    for name in ("api", "worker"):
+        document = next(
+            block
+            for block in _all_blocks()
+            if block.type == "data" and block.labels == ("aws_iam_policy_document", name)
+        )
+        assert "jobs_dlq" not in document.body, f"the {name} task can reach the dead-letter queue"
+        assert "cloudwatch" not in document.body.lower(), f"the {name} task gained CloudWatch"
+        assert "sns" not in document.body.lower(), f"the {name} task gained SNS"
+
+
+def test_the_one_new_role_is_a_task_nobody_starts_and_it_touches_two_queues() -> None:
+    """**Why a role exists at all when the operator already has AWS credentials.** RDS is
+    `publicly_accessible = false` in subnets with no route off the VPC, so a laptop cannot reach
+    the database every one of the three scripts reads. The only place they can run is inside
+    this VPC, as a one-off task from the same image - and a task needs a role.
+
+    What it may do is the union of what those scripts call: send a replacement message to the
+    jobs queue, and read, release or delete one on the dead-letter queue. Nothing else."""
+    assert set(_resources("aws_iam_role")) == {"execution", "api", "worker", "ops"}
+
+    assert "ops" in _resources("aws_ecs_task_definition")
+    assert "ops" not in _resources("aws_ecs_service"), "the operator tooling is not a service"
+
+    document = next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", "ops")
+    )
+    assert "aws_sqs_queue.jobs.arn" in document.body
+    assert "aws_sqs_queue.jobs_dlq.arn" in document.body
+    for absent in ("s3:", "secretsmanager", "cloudwatch", "sns", "ecs:"):
+        assert absent not in document.body.lower(), f"the ops task role grants {absent}"
+
+    # It never consumes the jobs queue. That is the worker's, and only the worker's.
+    send_only = document.body.split("InspectAndRecoverDeadLetters")[0]
+    assert "sqs:ReceiveMessage" not in send_only
+    assert "sqs:DeleteMessage" not in send_only
+
+
+def test_the_operator_task_carries_no_provider_credential_and_no_bucket() -> None:
+    """It re-projects durable state and moves messages. It can reach nothing that could re-bill
+    a model, and nothing that could hand out a report."""
+    definition = _resources("aws_ecs_task_definition")["ops"]
+
+    for variable in (*PROVIDER_VARIABLES, "S3_BUCKET", "AUTH_KEYS", "COGNITO", "REDIS_URL"):
+        assert variable not in definition.body, f"the ops task definition names {variable}"
+    assert _attribute(definition.body, "secrets") == "local.database_secrets"
+    assert _attribute(definition.body, "command") == '["python", "scripts/reconcile_jobs.py"]', (
+        "the default command must be the dry run, for a task somebody starts by accident"
+    )
+
+
+def test_the_operations_runbook_exists() -> None:
+    """A stop condition for this block: alarms nobody has a written response to are decoration.
+    Every scenario named here is one the alarms above or the runtime can actually produce."""
+    runbook = (_ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
+    for scenario in (
+        "API unhealthy",
+        "Worker not running",
+        "Redis unavailable",
+        "RDS unavailable",
+        "Jobs queue backing up",
+        "DLQ contains messages",
+        "Stale queued or running row",
+        "Job stuck awaiting approval",
+        "S3 export failed",
+        "Provider outage",
+        "Lease ownership lost",
+        "Migration failure",
+        "Authentication failure",
+    ):
+        assert scenario in runbook, f"docs/runbook.md has no entry for {scenario}"
+
+    for tool in ("scripts/reconcile_jobs.py", "scripts/inspect_dlq.py", "scripts/replay_dlq.py"):
+        assert tool in runbook, f"the runbook never names {tool}"
+
+
+def test_the_deployment_runbook_covers_the_block_c_teardown() -> None:
+    """`terraform destroy` removes the alarms and the topic because Terraform owns them. The
+    orphan checks are what catch the ones it did not."""
+    runbook = (_ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+    for check in ("describe-alarms", "list-topics"):
+        assert check in runbook, f"the teardown checklist does not check for {check}"
 
 
 # --- CI stays AWS-account-independent -------------------------------------------------------------

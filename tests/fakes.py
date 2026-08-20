@@ -386,7 +386,7 @@ class FakeQueue:
     10's `503 enqueue_failed` from a test.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dead_letters: FakeQueue | None = None) -> None:
         self.sent: list[SentMessage] = []
         self.deleted: list[str] = []
         self.visibility_extensions: list[tuple[str, int]] = []
@@ -395,6 +395,9 @@ class FakeQueue:
         self._inbox: list[SentMessage] = []
         self._in_flight: list[SentMessage] = []
         self._receives: dict[str, int] = {}
+        # Phase 5 block C. A queue with no dead-letter queue is the honest default: most tests
+        # here are about the worker, which never reads one.
+        self._dead_letters = dead_letters
 
     # --- what the API calls ---
 
@@ -453,6 +456,75 @@ class FakeQueue:
             receipt_handle=message.deduplication_id,
             receive_count=self._receives[message.deduplication_id],
         )
+
+    def receive_batch(
+        self, *, max_messages: int, wait_seconds: int, visibility_timeout_s: int
+    ) -> list[Any]:
+        """The block C read: several at once, carrying the two FIFO attributes.
+
+        Every message it hands out is in flight afterwards, exactly as `receive()` leaves one -
+        which is what makes "inspect and release" and "hold while replaying" different things a
+        test can tell apart.
+        """
+        from jobqueue import JobMessage
+
+        batch: list[JobMessage] = []
+        while self._inbox and len(batch) < max_messages:
+            message = self._inbox.pop(0)
+            self._in_flight.append(message)
+            self._receives[message.deduplication_id] = (
+                self._receives.get(message.deduplication_id, 0) + 1
+            )
+            batch.append(
+                JobMessage(
+                    job_id=message.body["job_id"],
+                    user_id=message.body["user_id"],
+                    idempotency_key=message.body["idempotency_key"],
+                    receipt_handle=message.deduplication_id,
+                    receive_count=self._receives[message.deduplication_id],
+                    group_id=message.group_id,
+                    deduplication_id=message.deduplication_id,
+                )
+            )
+        self.visibility_extensions.extend(
+            (message.receipt_handle, visibility_timeout_s) for message in batch
+        )
+        return batch
+
+    def release(self, message: Any) -> None:
+        """Hand a delivery straight back, which is what a zero visibility timeout does."""
+        self.extend_visibility(message, visibility_timeout_s=0)
+        returning = [
+            held for held in self._in_flight if held.deduplication_id == message.receipt_handle
+        ]
+        self._in_flight = [
+            held for held in self._in_flight if held.deduplication_id != message.receipt_handle
+        ]
+        self._inbox.extend(returning)
+
+    def resend(self, message: Any) -> None:
+        """Put a message from another queue onto this one, unchanged.
+
+        **It bypasses the deduplication memory above, and that is the behaviour rather than a
+        shortcut.** SQS forgets a deduplication id after five minutes and a dead-lettered
+        message is at least three failed deliveries old, so a replay really is accepted. A fake
+        that remembered forever would make every replay a silent no-op and would prove the
+        opposite of what the test is asking.
+        """
+        from jobqueue import QueueError
+
+        if not message.group_id or not message.deduplication_id:
+            raise QueueError(f"the message for job {message.job_id} has no FIFO attributes")
+        resent = SentMessage(
+            body=message.body(),
+            group_id=message.group_id,
+            deduplication_id=message.deduplication_id,
+        )
+        self.sent.append(resent)
+        self._inbox.append(resent)
+
+    def dead_letter_queue(self) -> FakeQueue | None:
+        return self._dead_letters
 
     def delete(self, message: Any) -> None:
         self.deleted.append(message.receipt_handle)

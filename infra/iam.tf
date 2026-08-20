@@ -106,6 +106,11 @@ locals {
     migrate = [
       local.db_secret_arn,
     ]
+    # Block C's operator tooling. The database credential and nothing else - the three scripts
+    # read rows, checkpoints and queues, and none of them can reach a model or a bucket.
+    ops = [
+      local.db_secret_arn,
+    ]
   }
 }
 
@@ -185,6 +190,69 @@ resource "aws_iam_role_policy" "api" {
   role   = aws_iam_role.api.id
   policy = data.aws_iam_policy_document.api.json
 }
+
+# --- The operations task role (Phase 5 block C) ---------------------------------------------------
+#
+# **Why this role exists at all, when the operator already has credentials.** RDS is
+# `publicly_accessible = false` in subnets with no route off the VPC, so a laptop cannot reach
+# the database - which every one of the three recovery scripts needs. The only place they can run
+# is inside this VPC, as a one-off task from the same image, and a task needs a role
+# (docs/adr/0021-*.md decision 7).
+#
+# **It is a task and never a service.** Nothing starts it; an operator runs `aws ecs run-task`
+# with a command override, exactly as they do for the migration.
+#
+# What it may do is the union of what the three scripts actually call, and no more: read and
+# release messages on the dead-letter queue, delete one from it during a deliberate replay, and
+# send one back to the jobs queue. **No S3, no Secrets Manager, no CloudWatch, and no permission
+# on any other queue.** The API and the worker gained nothing from this file.
+
+resource "aws_iam_role" "ops" {
+  name               = "${local.name}-ops-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+
+  tags = { Name = "${local.name}-ops-task" }
+}
+
+data "aws_iam_policy_document" "ops" {
+  # `reconcile_jobs.py` re-enqueues a job whose message was lost, using the same `send_start`
+  # the API uses. **No Receive and no Delete on this queue**: the operator tooling never
+  # consumes the jobs queue - that is the worker's, and only the worker's.
+  statement {
+    sid    = "ReEnqueueLostJobMessages"
+    effect = "Allow"
+    actions = [
+      "sqs:SendMessage",
+      "sqs:GetQueueUrl",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [aws_sqs_queue.jobs.arn]
+  }
+
+  # The dead-letter queue: read it, hand messages straight back (`ChangeMessageVisibility` with
+  # a zero timeout is what `release` is), and delete one only after a deliberate replay has
+  # already sent it. `GetQueueUrl` is how the DLQ is resolved from the jobs queue's redrive
+  # policy rather than from a second environment variable.
+  statement {
+    sid    = "InspectAndRecoverDeadLetters"
+    effect = "Allow"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueUrl",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [aws_sqs_queue.jobs_dlq.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "ops" {
+  name   = "${local.name}-ops-task"
+  role   = aws_iam_role.ops.id
+  policy = data.aws_iam_policy_document.ops.json
+}
+
 
 # --- The worker task role ----------------------------------------------------------------------
 

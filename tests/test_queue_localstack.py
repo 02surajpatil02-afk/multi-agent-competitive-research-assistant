@@ -63,6 +63,7 @@ from openai import OpenAI
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
+import operations
 from config import Config, load_config
 from database import queries
 from graph.build import ResearchGraph, build_graph
@@ -448,6 +449,110 @@ def test_a_message_reaches_the_dead_letter_queue_after_the_third_delivery(
         dead = _peek(sqs, dlq_url)
 
     assert [json.loads(message["Body"])["job_id"] for message in dead] == [job_id]
+
+
+# --- 3a. Phase 5 block C: reading and recovering a dead-letter queue -----------------------
+#
+# Three properties that a fake can only model. LocalStack is not real SQS either, but it is the
+# real API and the real queue attributes, which is where all three of these live.
+
+
+def test_the_dead_letter_queue_is_resolved_from_the_redrive_policy(
+    throwaway: tuple[JobQueue, str, str],
+) -> None:
+    """The block C tooling never takes a second `SQS_DLQ_URL` variable: it reads the queue's own
+    `RedrivePolicy`, turns the target ARN into a name, and asks SQS for the URL.
+
+    A duplicate setting is a setting that can disagree with the queue it describes, and an
+    operator pointed at the wrong dead-letter queue would draw conclusions from someone else's
+    messages (ADR 0021 decision 6).
+    """
+    queue, _url, dlq_url = throwaway
+
+    resolved = queue.dead_letter_queue()
+    assert resolved is not None
+    assert resolved.attributes()["QueueArn"].endswith(dlq_url.rsplit("/", 1)[-1])
+
+
+def test_a_queue_with_no_redrive_policy_has_no_dead_letter_queue(sqs: Any, localstack: str) -> None:
+    """None is a real answer, and the tooling treats it as "nothing can be shown to be
+    orphaned" rather than as an error - which is the safe direction for that absence."""
+    suffix = uuid4().hex[:12]
+    url = sqs.create_queue(QueueName=f"lonely-{suffix}.fifo", Attributes={"FifoQueue": "true"})[
+        "QueueUrl"
+    ]
+    try:
+        assert build_queue(url, region=REGION, endpoint_url=localstack).dead_letter_queue() is None
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def test_inspecting_a_dead_letter_queue_leaves_every_message_on_it(
+    throwaway: tuple[JobQueue, str, str], localstack: str
+) -> None:
+    """**SQS has no peek**, so reading is what hides a message - and this is the property no
+    single-process fake can be wrong about in the right way. The messages must be visible again
+    to a *different* client immediately afterwards, because the thing that has to keep seeing
+    them is the DLQ-depth alarm.
+    """
+    queue, _url, dlq_url = throwaway
+    dead_letters = build_queue(dlq_url, region=REGION, endpoint_url=localstack)
+
+    for index in range(3):
+        job_id = new_job_id()
+        dead_letters.send_start(job_id=job_id, user_id=USER, idempotency_key=f"key-{index}")
+
+    found = operations.read_dead_letter_messages(dead_letters, limit=10)
+    assert len(found) == 3
+    assert all(message.group_id and message.deduplication_id for message in found), (
+        "the FIFO attributes a replay needs were not asked for"
+    )
+
+    # A second reader, immediately: the release really happened rather than the timeout lapsing.
+    again = operations.read_dead_letter_messages(
+        build_queue(dlq_url, region=REGION, endpoint_url=localstack), limit=10
+    )
+    assert {message.job_id for message in again} == {message.job_id for message in found}
+
+
+def test_a_replayed_message_keeps_the_group_and_deduplication_id_it_was_sent_with(
+    throwaway: tuple[JobQueue, str, str], localstack: str
+) -> None:
+    """The whole of ADR 0021 decision 6's "the message that goes back is the message that came
+    out", against a real FIFO queue.
+
+    A resume message's deduplication id is ADR 0007's gate-visit key, and minting a new one
+    would mean a visit could be answered twice. The five-minute window is not in the way here
+    for the reason the decision gives: a dead-lettered message is at least three deliveries old,
+    and this one has never been on the jobs queue at all.
+    """
+    queue, url, dlq_url = throwaway
+    dead_letters = build_queue(dlq_url, region=REGION, endpoint_url=localstack)
+
+    job_id = new_job_id()
+    dead_letters.send_resume(
+        job_id=job_id, user_id=USER, idempotency_key=f"key-{job_id}", calls_used=7
+    )
+    # **Read while holding, exactly as `scripts/replay_dlq.py` does.** An inspection releases
+    # each message with a zero visibility timeout, and a released receipt handle is no longer
+    # in flight - so the delete below would be refused. That is why the two readers differ, and
+    # this is where the difference is real rather than modelled.
+    (dead,) = dead_letters.receive_batch(
+        max_messages=10, wait_seconds=1, visibility_timeout_s=operations.REPLAY_VISIBILITY_S
+    )
+    assert dead.deduplication_id == f"{job_id}:7"
+
+    queue.resend(dead)
+    dead_letters.delete(dead)
+
+    # Read back through `receive_batch`, because `receive()` deliberately does not ask SQS for
+    # the FIFO attributes - the worker routes on durable state and has no use for either.
+    (replayed,) = queue.receive_batch(
+        max_messages=10, wait_seconds=SHORT_VISIBILITY_S, visibility_timeout_s=SHORT_VISIBILITY_S
+    )
+    assert replayed.job_id == job_id
+    assert replayed.group_id == job_id
+    assert replayed.deduplication_id == f"{job_id}:7"
 
 
 # --- 4. A real worker, a real queue ------------------------------------------------------

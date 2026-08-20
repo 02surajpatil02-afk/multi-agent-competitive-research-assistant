@@ -125,7 +125,17 @@ build-backend = "setuptools.build_meta"
 # harnesses rather than shipped application code, and `.dockerignore` keeps `eval` out of
 # the image for the same reason it keeps `tests` out.
 [tool.setuptools]
-py-modules = ["app", "config", "schemas", "llm_client", "jobqueue", "redisstore", "worker"]
+py-modules = [
+    "app",
+    "artifacts",
+    "config",
+    "jobqueue",
+    "llm_client",
+    "operations",
+    "redisstore",
+    "schemas",
+    "worker",
+]
 packages = ["agents", "database", "graph", "routes", "tools"]
 
 [tool.pytest.ini_options]

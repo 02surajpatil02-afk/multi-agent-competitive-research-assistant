@@ -653,6 +653,86 @@ def read_claim_sources(engine: Engine, job_id: str) -> Sequence[Row[Any]]:
         return conn.execute(sa.select(claim_sources).where(claim_sources.c.job_id == job_id)).all()
 
 
+def read_unfinished_jobs(
+    engine: Engine, *, statuses: Sequence[JobStatus], job_id: str | None = None
+) -> Sequence[Row[Any]]:
+    """Every job that has not finished, in one of `statuses`, with the time of its last event.
+
+    **This is candidate selection for the block C reconciler and nothing more**
+    ([ADR 0021](../docs/adr/0021-stale-job-reconciliation-and-dlq-recovery.md) decision 2). It
+    answers "which rows are worth looking at"; whether any of them may be changed is decided
+    afterwards, from the execution fence and from durable state. Age selects; it never
+    authorises.
+
+    `last_event_at` is the newest `audit_events.created_at` for the job, as a correlated
+    subquery, and it is why no `jobs.updated_at` column was added. The audit trail already has
+    to record every node event, so "when did this job last do anything durable" is a fact the
+    database holds - and a second column carrying the same fact would be a second thing to keep
+    true (ADR 0006 made the same call about `count_reviewer_edits`).
+
+    It is NULL only for a job whose `job_created` row is gone, which cannot happen while the
+    trail is append-only; callers fall back to `created_at` anyway, because a caller that
+    crashed on a NULL would be refusing to look at the very row most in need of looking at.
+
+    `completed_at IS NULL` is repeated beside the status filter deliberately. `finish_job` is
+    the only writer of that column, so it - not the status string - is what "this job has
+    ended" means (`set_job_status` says the same thing), and a row whose status was left behind
+    by a dead process must not be selectable as a candidate once it has genuinely finished.
+    """
+    last_event_at = (
+        sa.select(sa.func.max(audit_events.c.created_at))
+        .where(audit_events.c.job_id == jobs.c.job_id)
+        .scalar_subquery()
+        .label("last_event_at")
+    )
+    statement = (
+        sa.select(jobs, last_event_at)
+        .where(jobs.c.completed_at.is_(None), jobs.c.status.in_(list(statuses)))
+        .order_by(jobs.c.created_at)
+    )
+    if job_id is not None:
+        statement = statement.where(jobs.c.job_id == job_id)
+    with engine.connect() as conn:
+        return conn.execute(statement).all()
+
+
+def record_reconciliation(
+    engine: Engine, *, job_id: str, actor: str, outcome: str, detail: Mapping[str, Any]
+) -> None:
+    """One `job_reconciled` row per (job, outcome), written by the operator sweep.
+
+    **`actor` is the person who ran the sweep**, for the reason `scripts/reexport_job.py` gives
+    about `--actor`: a durable row changed by a machine that cannot say who asked is
+    accountability theatre, and `ck_audit_events_actor` refuses `unknown` one layer down.
+
+    **The guard is `record_gate_opened`'s, keyed on `(job_id, outcome)`.** The sweep is meant to
+    be safe to run again, and its mutations are self-limiting - a repaired gate projection is
+    already `awaiting_approval` the second time, and a finished job is not a candidate at all -
+    so a second run normally decides `no_change` and writes nothing. This makes that true even
+    when it does not: an outcome already on record is not recorded twice, so re-running the
+    sweep cannot inflate the trail (ADR 0021 decision 5).
+    """
+    with engine.begin() as conn:
+        recorded = conn.execute(
+            sa.select(audit_events.c.event_id)
+            .where(
+                audit_events.c.job_id == job_id,
+                audit_events.c.action == "job_reconciled",
+                audit_events.c.detail["outcome"].as_string() == outcome,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if recorded is not None:
+            return
+        _audit(
+            conn,
+            job_id=job_id,
+            actor=actor,
+            action="job_reconciled",
+            detail={"outcome": outcome, **detail},
+        )
+
+
 def read_audit_events(engine: Engine, job_id: str) -> Sequence[Row[Any]]:
     """The per-job timeline, in the order the events happened.
 
