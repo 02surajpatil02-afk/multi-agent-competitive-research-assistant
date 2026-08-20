@@ -86,7 +86,7 @@ resource "aws_ecr_lifecycle_policy" "app" {
     rules = [{
       rulePriority = 1
       description  = "Keep the five most recent images; a demo pushes two or three."
-      selection    = {
+      selection = {
         tagStatus   = "any"
         countType   = "imageCountMoreThan"
         countNumber = 5
@@ -178,7 +178,7 @@ resource "aws_ecs_task_definition" "api" {
 
     logConfiguration = {
       logDriver = "awslogs"
-      options   = {
+      options = {
         awslogs-group         = aws_cloudwatch_log_group.api.name
         awslogs-region        = var.region
         awslogs-stream-prefix = "api"
@@ -231,7 +231,7 @@ resource "aws_ecs_task_definition" "worker" {
 
     logConfiguration = {
       logDriver = "awslogs"
-      options   = {
+      options = {
         awslogs-group         = aws_cloudwatch_log_group.worker.name
         awslogs-region        = var.region
         awslogs-stream-prefix = "worker"
@@ -271,7 +271,7 @@ resource "aws_ecs_task_definition" "migrate" {
 
     logConfiguration = {
       logDriver = "awslogs"
-      options   = {
+      options = {
         awslogs-group         = aws_cloudwatch_log_group.migrate.name
         awslogs-region        = var.region
         awslogs-stream-prefix = "migrate"

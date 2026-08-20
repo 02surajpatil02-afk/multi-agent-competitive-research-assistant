@@ -100,7 +100,7 @@ output "vpc_id" {
 
 output "log_groups" {
   description = "The three CloudWatch log groups, which keep charging for storage if left behind."
-  value       = [
+  value = [
     aws_cloudwatch_log_group.api.name,
     aws_cloudwatch_log_group.worker.name,
     aws_cloudwatch_log_group.migrate.name,

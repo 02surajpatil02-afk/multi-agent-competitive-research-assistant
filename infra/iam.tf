@@ -69,8 +69,8 @@ data "aws_iam_policy_document" "api" {
   # Delete**: the API does not consume its own queue, and this is where that is enforced rather
   # than assumed.
   statement {
-    sid     = "SendJobPointerMessages"
-    effect  = "Allow"
+    sid    = "SendJobPointerMessages"
+    effect = "Allow"
     actions = [
       "sqs:SendMessage",
       "sqs:GetQueueUrl",
@@ -111,8 +111,8 @@ data "aws_iam_policy_document" "worker" {
   # makes at startup to refuse a queue that is not FIFO. `ChangeMessageVisibility` is ADR 0015's
   # heartbeat and is as load-bearing as the receive itself.
   statement {
-    sid     = "ConsumeAndOwnJobMessages"
-    effect  = "Allow"
+    sid    = "ConsumeAndOwnJobMessages"
+    effect = "Allow"
     actions = [
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
