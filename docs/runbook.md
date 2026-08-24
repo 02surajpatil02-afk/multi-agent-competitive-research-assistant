@@ -11,7 +11,9 @@ and this page is what a *person* does about it.
 **Three rules run through the whole page.**
 
 1. **Read before you write.** All three block C tools default to a dry run and print their evidence.
-   `--apply` is a word you type after reading it.
+   `--apply` is a word you type after reading it. (`reexport_job.py` is the exception and is not a
+   block C tool: it acts immediately, because re-writing a stored report body to its own key is
+   idempotent and there is nothing for a dry run to reveal.)
 2. **Nothing here is failed because it is old.** The reconciler uses age only to decide which rows
    are worth inspecting; every change needs the per-job PostgreSQL execution fence, a fresh read of
    durable state, and evidence specific to the outcome
@@ -19,13 +21,15 @@ and this page is what a *person* does about it.
 3. **A busy execution fence means stop.** If a tool reports `owned`, a worker is running that job.
    That is the healthy answer, not an obstacle.
 
-**The three tools, and what each may change.**
+**The tools, and what each may change.** The first three are block C's; the fourth is ADR 0009's
+and predates them, and it runs from the same place for the same reason.
 
 | Tool | Changes | Default |
 |---|---|---|
 | `scripts/inspect_dlq.py` | **Nothing.** Reads the dead-letter queue and releases every message | read-only |
 | `scripts/reconcile_jobs.py` | One `jobs` row per candidate, and one audit row | dry run |
 | `scripts/replay_dlq.py` | Sends one named message back and deletes it from the DLQ | dry run |
+| `scripts/reexport_job.py` | Writes one `reports/{job_id}.json` and stamps `exported_at` | **acts immediately** — there is no dry run, and `--actor` is required |
 
 **Setting up.** Every command below assumes the deployment's outputs are to hand:
 
@@ -38,7 +42,10 @@ export API=$(terraform -chdir=infra output -raw api_url) QUEUE=$(terraform -chdi
 ```
 
 The Python tools read `DATABASE_URL` and `SQS_QUEUE_URL` from the environment, exactly as the
-worker does. **They need no LLM key, no Tavily key and no Redis** — none of them can reach a model.
+worker does; `reexport_job.py` additionally reads `S3_BUCKET`. **They need no LLM key, no Tavily
+key and no Redis** — none of them can reach a model. The `ops` task definition supplies all
+three, and the `ops` task role may send to the jobs queue, read and release the dead-letter
+queue, and `s3:PutObject` under `reports/*` — nothing wider.
 
 **In the AWS deployment they do not run on your laptop, and they cannot.** RDS is
 `publicly_accessible = false` in subnets with no route off the VPC, so the only place any of them
@@ -365,11 +372,22 @@ storage failure — that would re-bill the whole pipeline. Do not edit the job's
 `failed` forever *and* gains a downloadable artifact, which reads like a contradiction and is not
 (`GET /jobs/{id}/report` keys on `exported_at`, never on the status).
 
-**Recovery.**
+**Recovery.** In AWS this runs as an `ops` task override like the other three — the `ops` task
+definition carries `S3_BUCKET` and its task role may `s3:PutObject` under `reports/*` for exactly
+this command:
+
+```bash
+ops '["python","scripts/reexport_job.py","<job_id>","--actor","you@example.com"]'
+```
+
+Locally, or wherever the database is directly reachable:
 
 ```bash
 python scripts/reexport_job.py <job_id> --actor you@example.com
 ```
+
+**It has no dry run and `--actor` is not optional.** Running it twice is harmless — the key is
+derived from the job id, so a re-export overwrites rather than accumulating a second copy.
 
 ---
 

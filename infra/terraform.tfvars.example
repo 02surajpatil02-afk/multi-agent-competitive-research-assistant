@@ -59,6 +59,20 @@ tavily_api_key = "REPLACE-ME"
 
 # llm_fast_model = ""      # empty falls back to llm_model, exactly as config.py does
 
+# --- The worker's four runtime bounds --------------------------------------------------------
+#
+# **The defaults below are what this deployment runs, and they are not config.py's.** config.py
+# keeps 60 / 2 / 24 / 1200 for local work; the deployed worker gets the values both published
+# n=20 baselines were measured at. Uncomment one to move it - most usefully
+# `llm_main_timeout_s`, which is the number to lower for a fast endpoint and the number a slow
+# one fails on. Nothing else in the deployment reads them: the API, the migration and the ops
+# task run no graph node.
+#
+# llm_main_timeout_s  = 180    # request timeout for every main-tier agent call, seconds
+# max_revisions       = 3      # automatic reflection cycles after the first report
+# max_supervisor_hops = 30     # routing loop guard; must rise with max_revisions
+# max_job_runtime     = 1800   # no-new-node deadline for ONE worker invocation, seconds
+
 # api_desired_count    = 1
 # worker_desired_count = 1
 

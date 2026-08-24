@@ -938,19 +938,134 @@ def test_no_localstack_endpoint_reaches_the_deployment() -> None:
 
 def test_the_application_tunables_are_not_duplicated_here() -> None:
     """They have defaults in config.py and keep them. A second copy in Terraform is a second
-    source of truth, and the two drift silently."""
+    source of truth, and the two drift silently.
+
+    **Four exceptions, and they are named in `WORKER_RUNTIME_BOUNDS` below rather than here.**
+    Those four describe the deployed endpoint rather than a preference, and the tests that
+    follow pin what makes them safe: they are variables, they carry the measured defaults, and
+    they reach the worker and nothing else.
+    """
     duplicated = (
-        "MAX_REVISIONS",
         "MAX_LLM_CALLS_PER_JOB",
-        "MAX_JOB_RUNTIME",
-        "MAX_SUPERVISOR_HOPS",
+        "MAX_REVIEWER_EDITS",
         "LLM_RPM_LIMIT",
         "REFLECTION_PASS_THRESHOLD",
         "RESEARCHER_CONCURRENCY",
+        "MAX_FETCH_BYTES",
+        "MAX_PAGE_CHARS",
+        "STALE_JOB_MIN_AGE_SECONDS",
     )
     joined = "\n".join(_tf_code().values())
     for name in duplicated:
         assert name not in joined, f"{name} belongs to config.py, not to Terraform"
+
+
+# --- W1: the four runtime bounds the deployed worker states explicitly ----------------------
+#
+# The audit finding this closes: the worker ran on `config.py`'s defaults (60 / 2 / 24 / 1200),
+# which are not the values either published n=20 baseline was measured at, and there was no
+# `-var` that could change the request timeout without editing ecs.tf mid-deployment.
+
+WORKER_RUNTIME_BOUNDS: tuple[tuple[str, str, str], ...] = (
+    ("LLM_MAIN_TIMEOUT_S", "llm_main_timeout_s", "180"),
+    ("MAX_REVISIONS", "max_revisions", "3"),
+    ("MAX_SUPERVISOR_HOPS", "max_supervisor_hops", "30"),
+    ("MAX_JOB_RUNTIME", "max_job_runtime", "1800"),
+)
+"""Each row is (environment variable, Terraform variable, the default this deployment runs)."""
+
+
+@pytest.mark.parametrize(("env_name", "var_name", "default"), WORKER_RUNTIME_BOUNDS)
+def test_each_worker_runtime_bound_is_a_variable_with_the_measured_default(
+    env_name: str, var_name: str, default: str
+) -> None:
+    """**A number, a type, and no secret.** These are configuration an operator may want to move
+    on the day, so each is a `variable` with a default rather than a literal in a task
+    definition - `TF_VAR_llm_main_timeout_s=90` has to be enough to change one.
+
+    The defaults are 180 / 3 / 30 / 1800 because that is what both published baselines ran at
+    (`docs/engineering-guidelines.md` section 14's measurement context), not because they are
+    tuned. `config.py` keeps 60 / 2 / 24 / 1200 and this file does not touch it.
+    """
+    declared = _variables()
+    assert var_name in declared, f"{env_name} is set from no Terraform variable"
+    body = declared[var_name].body
+    assert _attribute(body, "type") == "number", f"{var_name} must be a number"
+    assert _attribute(body, "default") == default, (
+        f"{var_name} must default to {default}, the value the measured runs used"
+    )
+    assert _attribute(body, "sensitive") is None, f"{var_name} is configuration, not a secret"
+
+
+def test_the_worker_receives_all_four_runtime_bounds_from_those_variables() -> None:
+    """The whole path in one assertion: Terraform variable -> worker task environment -> the
+    `config.py` parsing that already existed. No application module was changed to carry them.
+
+    `tostring` because a container environment value is a string and the variables are numbers;
+    without it Terraform refuses the task definition rather than deploying a wrong one.
+    """
+    worker = _resources("aws_ecs_task_definition")["worker"]
+    for env_name, var_name, _default in WORKER_RUNTIME_BOUNDS:
+        entry = f'{{ name = "{env_name}", value = tostring(var.{var_name}) }}'
+        assert entry in worker.body, f"the worker task definition does not set {env_name}"
+
+
+@pytest.mark.parametrize("family", ["api", "migrate", "ops"])
+def test_no_other_task_receives_a_worker_only_runtime_bound(family: str) -> None:
+    """**The worker is the only process that runs a graph node**, so it is the only one any of
+    these four describes. An API told `MAX_JOB_RUNTIME` would be documenting behaviour it does
+    not have, and a reader would reasonably believe it."""
+    definition = _resources("aws_ecs_task_definition")[family]
+    for env_name, _var_name, _default in WORKER_RUNTIME_BOUNDS:
+        assert env_name not in definition.body, (
+            f"the {family} task definition names {env_name}, which only the worker acts on"
+        )
+
+
+def test_the_runtime_bounds_changed_no_application_default() -> None:
+    """**Terraform states the deployment's values; it does not edit the application's.** If a
+    number here ever became a `config.py` default too, the local suite and the deployment would
+    have two sources of truth for the same bound - which is the thing
+    `test_the_application_tunables_are_not_duplicated_here` exists to prevent."""
+    config_source = (_ROOT / "config.py").read_text(encoding="utf-8")
+    for env_name, expected in (
+        ("LLM_MAIN_TIMEOUT_S", "60.0"),
+        ("MAX_REVISIONS", "2"),
+        ("MAX_SUPERVISOR_HOPS", "24"),
+        ("MAX_JOB_RUNTIME", "1200"),
+    ):
+        found = re.search(
+            rf'_(?:int|float)\(source, "{env_name}", default=(?P<value>[^)]+)\)', config_source
+        )
+        assert found is not None, f"config.py no longer parses {env_name}"
+        assert found.group("value") == expected, (
+            f"config.py's {env_name} default moved to {found.group('value')}; the local default "
+            "is deliberately not the deployed one"
+        )
+
+
+def test_the_job_runtime_bound_is_not_coupled_to_the_visibility_window() -> None:
+    """**They share the value 1800 and nothing else, and this is the test that says so.**
+
+    `MAX_JOB_RUNTIME` is a `time.monotonic()` deadline checked after a node's checkpoint is
+    durable; ownership of the delivery is kept by ADR 0015's background heartbeat, which renews
+    every `V/3` derived from the queue's own attribute. `worker.check_queue` compares the
+    visibility timeout with the renewal cadence and the bounded SQS call, and never with this.
+
+    So the queue's window must still be declared by the queue, and this variable must not be
+    what sets it - which is what would silently turn a runtime change into a lease change.
+    """
+    queue = _resources("aws_sqs_queue")["jobs"]
+    assert _attribute(queue.body, "visibility_timeout_seconds") == "1800", (
+        "the visibility window is ADR 0015's and is unchanged by the W1 runtime bounds"
+    )
+    assert "var.max_job_runtime" not in queue.body, (
+        "the queue's lease must not be derived from a worker runtime bound"
+    )
+    assert (
+        "MAX_JOB_RUNTIME"
+        not in _resources("aws_cloudwatch_metric_alarm")["jobs_queue_backlog_age"].body
+    ), "the queue-age alarm reads the queue, not the worker's deadline"
 
 
 # --- Nothing in here is a credential, and nothing names one account -------------------------------
@@ -1268,11 +1383,12 @@ def test_block_c_changed_no_running_services_permissions() -> None:
 def test_the_one_new_role_is_a_task_nobody_starts_and_it_touches_two_queues() -> None:
     """**Why a role exists at all when the operator already has AWS credentials.** RDS is
     `publicly_accessible = false` in subnets with no route off the VPC, so a laptop cannot reach
-    the database every one of the three scripts reads. The only place they can run is inside
+    the database every one of the four scripts reads. The only place they can run is inside
     this VPC, as a one-off task from the same image - and a task needs a role.
 
     What it may do is the union of what those scripts call: send a replacement message to the
-    jobs queue, and read, release or delete one on the dead-letter queue. Nothing else."""
+    jobs queue, read, release or delete one on the dead-letter queue, and - since the W2 fix -
+    write one report object during ADR 0009's re-export. Nothing else."""
     assert set(_resources("aws_iam_role")) == {"execution", "api", "worker", "ops"}
 
     assert "ops" in _resources("aws_ecs_task_definition")
@@ -1285,7 +1401,7 @@ def test_the_one_new_role_is_a_task_nobody_starts_and_it_touches_two_queues() ->
     )
     assert "aws_sqs_queue.jobs.arn" in document.body
     assert "aws_sqs_queue.jobs_dlq.arn" in document.body
-    for absent in ("s3:", "secretsmanager", "cloudwatch", "sns", "ecs:"):
+    for absent in ("secretsmanager", "cloudwatch", "sns", "ecs:"):
         assert absent not in document.body.lower(), f"the ops task role grants {absent}"
 
     # It never consumes the jobs queue. That is the worker's, and only the worker's.
@@ -1294,16 +1410,94 @@ def test_the_one_new_role_is_a_task_nobody_starts_and_it_touches_two_queues() ->
     assert "sqs:DeleteMessage" not in send_only
 
 
-def test_the_operator_task_carries_no_provider_credential_and_no_bucket() -> None:
-    """It re-projects durable state and moves messages. It can reach nothing that could re-bill
-    a model, and nothing that could hand out a report."""
+# --- W2: the documented S3 re-export can actually run as the one-off ops task ------------------
+#
+# The audit finding this closes: docs/runbook.md sends an operator to
+# `python scripts/reexport_job.py` for a job whose artifact write was exhausted, and told them
+# to run every `python scripts/...` command as an ops task override - but the ops task had no
+# `S3_BUCKET` and its role had no `s3:PutObject`, so ADR 0009's recovery path exited on a
+# missing variable and could not have been fixed from anywhere else. RDS has no public address,
+# so there is no second place to run it from.
+
+
+def test_the_operator_role_may_write_a_report_artifact_and_nothing_wider() -> None:
+    """**One action, one prefix, and it is read off the code rather than guessed.**
+
+    `scripts/reexport_job.py` calls exactly one store method - `ArtifactStore.put_report`, which
+    is one `put_object`. `object_key` is string arithmetic and `presign` signs locally without
+    reaching S3, so `GetObject`, `ListBucket` and `HeadObject` are not required and are not
+    granted: this identity can recover an artifact and still cannot read one back.
+    """
+    document = next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", "ops")
+    )
+    actions = re.findall(r'"(s3:[A-Za-z*]+)"', document.body)
+    assert actions == ["s3:PutObject"], f"the ops role's S3 actions are {actions}"
+    assert '"${aws_s3_bucket.reports.arn}/reports/*"' in document.body, (
+        "the S3 statement must name the reports prefix rather than the bucket or a wildcard"
+    )
+    assert "s3:*" not in document.body
+
+
+def test_the_operator_task_is_given_the_bucket_and_still_no_provider_credential() -> None:
+    """It re-projects durable state, moves messages, and can rewrite one report object. It can
+    still reach nothing that could re-bill a model, and it still holds no auth material.
+
+    `S3_BUCKET` is the same Terraform-created bucket the worker writes and the API presigns -
+    there is one, and a second name would be a second bucket nobody watches.
+    """
     definition = _resources("aws_ecs_task_definition")["ops"]
 
-    for variable in (*PROVIDER_VARIABLES, "S3_BUCKET", "AUTH_KEYS", "COGNITO", "REDIS_URL"):
+    for variable in (*PROVIDER_VARIABLES, "AUTH_KEYS", "COGNITO", "REDIS_URL"):
         assert variable not in definition.body, f"the ops task definition names {variable}"
-    assert _attribute(definition.body, "secrets") == "local.database_secrets"
+    assert '{ name = "S3_BUCKET", value = aws_s3_bucket.reports.id }' in definition.body, (
+        "scripts/reexport_job.py requires S3_BUCKET and this is the only place it can run"
+    )
+    assert _attribute(definition.body, "secrets") == "local.database_secrets", (
+        "the bucket is configuration; the ops execution role still fetches only the database"
+    )
     assert _attribute(definition.body, "command") == '["python", "scripts/reconcile_jobs.py"]', (
         "the default command must be the dry run, for a task somebody starts by accident"
+    )
+
+
+def test_the_recovery_scripts_the_ops_task_runs_are_all_in_the_image() -> None:
+    """The path the runbook documents, end to end: every tool it tells an operator to run as an
+    ops override has to be a file the Dockerfile copies. `check_model.py` and `measure_jobs.py`
+    deliberately are not - both reach a real provider."""
+    dockerfile = (_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    for script in (
+        "scripts/reexport_job.py",
+        "scripts/reconcile_jobs.py",
+        "scripts/inspect_dlq.py",
+        "scripts/replay_dlq.py",
+    ):
+        assert script in dockerfile, f"{script} is not in the image the ops task runs"
+    for excluded in ("scripts/check_model.py", "scripts/measure_jobs.py"):
+        assert excluded not in dockerfile, f"{excluded} reaches a provider and must stay out"
+
+
+def test_only_the_ops_task_gained_the_report_write_the_recovery_needs() -> None:
+    """**An operator needing a permission is never a reason to give it to a running service.**
+    The API still may not write an object, and the worker still may not read one back - W2
+    widened one role by one action and left both services exactly as they were."""
+    api = next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", "api")
+    )
+    worker = next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", "worker")
+    )
+    assert re.findall(r'"(s3:[A-Za-z*]+)"', api.body) == ["s3:GetObject"], (
+        "the API presigns downloads and must not have gained a write"
+    )
+    assert re.findall(r'"(s3:[A-Za-z*]+)"', worker.body) == ["s3:PutObject"], (
+        "the worker writes artifacts and must not have gained a read"
     )
 
 

@@ -184,7 +184,7 @@ resource "aws_cloudwatch_log_group" "ops" {
   tags = { Name = "${local.name}-ops" }
 }
 
-# --- The three task definitions ------------------------------------------------------------------
+# --- The four task definitions -------------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "api" {
   family                   = "${local.name}-api"
@@ -271,10 +271,21 @@ resource "aws_ecs_task_definition" "worker" {
 
     # An endpoint and two model ids are configuration, not credentials, so they stay here where
     # they can be read and changed. The two keys are below.
+    #
+    # **The four runtime bounds are stated rather than defaulted**, and only here. `config.py`
+    # keeps 60/2/24/1200 for local work; this deployment runs 180/3/30/1800, which is what both
+    # published n=20 baselines measured against. They are `var.*` so an operator can move one
+    # with `TF_VAR_*` instead of editing this file (variables.tf carries the derivation, and
+    # why `max_job_runtime` sharing a value with the queue's visibility window couples nothing).
+    # None of the four reaches the API, the migration or the ops task: none of those runs a node.
     environment = concat(local.common_environment, [
       { name = "LLM_BASE_URL", value = var.llm_base_url },
       { name = "LLM_MODEL", value = var.llm_model },
       { name = "LLM_FAST_MODEL", value = var.llm_fast_model },
+      { name = "LLM_MAIN_TIMEOUT_S", value = tostring(var.llm_main_timeout_s) },
+      { name = "MAX_REVISIONS", value = tostring(var.max_revisions) },
+      { name = "MAX_SUPERVISOR_HOPS", value = tostring(var.max_supervisor_hops) },
+      { name = "MAX_JOB_RUNTIME", value = tostring(var.max_job_runtime) },
     ])
 
     secrets = concat(local.database_secrets, [
@@ -343,9 +354,17 @@ resource "aws_ecs_task_definition" "migrate" {
 #       --overrides '{"containerOverrides":[{"name":"ops","command":["python","scripts/reconcile_jobs.py"]}]}'
 #
 # It exists because RDS has no public address and sits in subnets with no route off the VPC, so
-# a laptop cannot reach the database the three scripts read. Its environment is the database and
-# the queue; it has **no bucket, no Redis, no provider credential and no auth setting**, and its
-# task role may touch two queues and nothing else (docs/adr/0021-*.md decision 7).
+# a laptop cannot reach the database the four scripts read. Its environment is the database, the
+# queue and the reports bucket; it has **no Redis, no provider credential and no auth setting**,
+# and its task role may touch two queues and one object prefix and nothing else
+# (docs/adr/0021-*.md decision 7).
+#
+# **`S3_BUCKET` is here for exactly one script.** `scripts/reexport_job.py` is ADR 0009's
+# recovery path for an approved report whose `PutObject` was exhausted, and docs/runbook.md
+# sends an operator to it - but the only place it can run is here, for the same private-RDS
+# reason the other three are here. Without the bucket it exited on `S3_BUCKET is required`, so
+# the documented recovery was unreachable in a deployment. The three block C tools do not read
+# it and are unaffected.
 #
 # The default command is the dry run, which is the safe thing for a task somebody starts by
 # accident: it writes nothing and prints what it would do.
@@ -372,6 +391,7 @@ resource "aws_ecs_task_definition" "ops" {
 
     environment = concat(local.database_environment, [
       { name = "SQS_QUEUE_URL", value = aws_sqs_queue.jobs.url },
+      { name = "S3_BUCKET", value = aws_s3_bucket.reports.id },
       { name = "AWS_REGION", value = var.region },
       { name = "APP_ENV", value = "prod" },
       { name = "LOG_LEVEL", value = var.log_level },

@@ -30,7 +30,7 @@ output "alb_dns_name" {
 }
 
 output "ecr_repository_url" {
-  description = "Where `docker push` sends the one image all three task definitions run."
+  description = "Where `docker push` sends the one image all four task definitions run."
   value       = aws_ecr_repository.app.repository_url
 }
 

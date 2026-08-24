@@ -61,6 +61,30 @@ never plans or applies. Every command below is run by a person who has decided t
 timeout, the health endpoint, the migration ownership and the checkpointer ownership are the
 ones already built in Phase 3.
 
+**One thing the deployed worker does not take from `config.py`: four runtime bounds.**
+
+| Bound | `config.py` (local) | Deployed | Terraform variable |
+|---|---|---|---|
+| `LLM_MAIN_TIMEOUT_S` | 60 | **180** | `llm_main_timeout_s` |
+| `MAX_REVISIONS` | 2 | **3** | `max_revisions` |
+| `MAX_SUPERVISOR_HOPS` | 24 | **30** | `max_supervisor_hops` |
+| `MAX_JOB_RUNTIME` | 1200 | **1800** | `max_job_runtime` |
+
+These are the values **both published n=20 baselines were measured at**, and the code defaults
+were never them — a 60-second request timeout against the endpoint those runs used is the most
+likely way a deployed job fails for a reason that is not a defect. They are set on the **worker
+task only**, as ordinary non-secret environment values read by the `config.py` parsing that
+already existed, so no application module changed. Override any of them with `TF_VAR_*`
+([§4.1](#41-set-the-variables)).
+
+**`max_job_runtime` equals the queue's 1800-second visibility window, and the two are not
+coupled.** `MAX_JOB_RUNTIME` is a no-new-node deadline compared against a monotonic clock after
+each node's checkpoint is durable; ownership of the delivery is kept by ADR 0015's background
+heartbeat, which renews every `V/3` derived from the queue's own attribute for as long as the
+invocation legitimately owns the message. `worker.check_queue` compares the visibility timeout
+with the renewal cadence and the bounded SQS call and never with this number, so raising either
+one changes nothing about the other.
+
 ---
 
 ## 2. The network
@@ -238,6 +262,14 @@ never be used here:
 
 ```bash
 python -c "import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())"
+```
+
+**Optional: the worker's four runtime bounds.** The defaults are already the deployed values
+([§1](#1-the-runtime-mapped)) — `180 / 3 / 30 / 1800` — so a normal deployment sets none of
+these. Export one only to move it, most usefully the timeout against a fast endpoint:
+
+```bash
+export TF_VAR_llm_main_timeout_s=180 TF_VAR_max_revisions=3 TF_VAR_max_supervisor_hops=30 TF_VAR_max_job_runtime=1800
 ```
 
 **Optional: HTTPS.** Only if you already own a validated ACM certificate in this region. Nothing
@@ -603,6 +635,14 @@ message was never genuinely dead-lettered, which proves nothing and risks a dupl
 (`s3_force_destroy = true`) and skips the RDS final snapshot (`rds_skip_final_snapshot = true`).
 Nothing else keeps the evidence.
 
+**Destroy needs the same variables apply did, so tear down from the same shell.** `image_tag`,
+`llm_base_url`, `llm_model`, `llm_api_key` and `tavily_api_key` have no defaults, and Terraform
+requires a value for every declared variable on *any* operation — destroy included. In a fresh
+terminal it will stop and prompt for four of them, and under `-input=false` it fails outright. If
+you have already closed the shell, re-export them ([§4.1](#41-set-the-variables)) before running
+this — any placeholder is accepted for the two keys, because destroy reads them and creates
+nothing. The `unset` at the end of this section is deliberately the *last* step.
+
 ```bash
 terraform -chdir=infra destroy -var image_tag="$IMAGE_TAG"
 ```
@@ -611,7 +651,7 @@ terraform -chdir=infra destroy -var image_tag="$IMAGE_TAG"
 
 | Category | Resource | Notes |
 |---|---|---|
-| Compute | ECS services (api, worker), the cluster, three task definitions | Task definitions are deregistered, not deleted — deregistered revisions are free |
+| Compute | ECS services (api, worker), the cluster, **four** task definitions (api, worker, migrate, ops) | Task definitions are deregistered, not deleted — deregistered revisions are free |
 | Load balancing | ALB, target group, listener | The ALB is a per-hour charge; it is the second most expensive thing here |
 | Images | ECR repository **and its images** | `force_delete = true`; without it destroy fails on a non-empty repository |
 | Database | RDS instance, subnet group | `skip_final_snapshot` decides whether a snapshot remains |

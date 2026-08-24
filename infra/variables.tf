@@ -12,11 +12,19 @@
 #     there is no value for an operator to invent, type, or leave in `terraform.tfstate`
 #     (docs/adr/0020-*.md decision 1).
 #
-#     **An application tunable is not repeated here.** MAX_REVISIONS, MAX_JOB_RUNTIME,
-#     LLM_RPM_LIMIT and the rest have defaults in `config.py` and keep them; a second copy in
-#     Terraform is a second source of truth that drifts. The only variables below that reach the
-#     application are the ones AWS decides - an endpoint, a queue URL, a bucket name - plus the
-#     provider credentials, which no default could supply.
+#     **An application tunable is not repeated here.** MAX_LLM_CALLS_PER_JOB, LLM_RPM_LIMIT,
+#     REFLECTION_PASS_THRESHOLD, RESEARCHER_CONCURRENCY and the rest have defaults in `config.py`
+#     and keep them; a second copy in Terraform is a second source of truth that drifts. Most of
+#     the variables below reach the application only as the things AWS decides - an endpoint, a
+#     queue URL, a bucket name - plus the provider credentials, which no default could supply.
+#
+#     **Four exceptions, and they are stated rather than snuck in:** `llm_main_timeout_s`,
+#     `max_revisions`, `max_supervisor_hops` and `max_job_runtime`. Those four describe the
+#     deployed endpoint rather than a preference - both published n=20 baselines ran at
+#     180/3/30/1800 and `config.py`'s defaults were never those numbers - and a request timeout
+#     that could only be changed by editing `ecs.tf` is one nobody can change on the day.
+#     `config.py` keeps its own defaults untouched, so the local suite is unaffected, and all
+#     four reach the **worker only**: no other process runs a graph node.
 #
 # WHO USES IT
 #     `terraform apply -var ...`, `TF_VAR_*` in the environment, and terraform.tfvars.example.
@@ -61,7 +69,7 @@ variable "vpc_cidr" {
 
 variable "image_tag" {
   description = <<-EOT
-    The tag of the image in ECR that all three task definitions run. **No default, on
+    The tag of the image in ECR that all four task definitions run. **No default, on
     purpose**: guidelines section 19 requires images tagged with a commit SHA and never only
     `latest`, because rollback is redeploying the previous task definition and `latest` cannot
     name one.
@@ -314,6 +322,84 @@ variable "tavily_api_key" {
   description = "Web-search credential. **No default.** Worker-only."
   type        = string
   sensitive   = true
+}
+
+# --- The four worker runtime bounds the deployment sets explicitly --------------------------
+#
+# **The one place this file departs from "an application tunable is not repeated here", and the
+# reason is that these four are not tunables - they are the deployed endpoint's shape.**
+# `config.py`'s defaults (60s, 2, 24, 1200s) are right for a fast endpoint and were never the
+# values either published baseline ran at: both n=20 runs used 180/3/30/1800 against NVIDIA NIM,
+# and a 60-second request timeout against that endpoint is the most likely way a deployed job
+# fails for a reason that is not a defect.
+#
+# **They are variables rather than a second set of hard-coded numbers** so an operator can move
+# one with `TF_VAR_*` without editing ecs.tf mid-demo, which is exactly the situation the
+# pre-deployment audit found: a value that could not be changed without a code edit.
+#
+# **Worker-only, all four.** The API runs no node, calls no model and has no job runtime, so
+# giving it any of them would describe behaviour it does not have. `config.py` keeps its
+# defaults untouched, so every local command and the whole offline suite are unchanged.
+
+variable "llm_main_timeout_s" {
+  description = <<-EOT
+    `LLM_MAIN_TIMEOUT_S` for the worker: the request timeout for every main-tier caller -
+    Planner, Researcher extraction, Synthesizer, Fact-Checker. There is no per-agent timeout.
+
+    180 rather than config.py's 60, because that is what both published baselines measured
+    against, and because a request timeout shorter than the endpoint's real latency turns a
+    working deployment into a job that fails after paying for its own retries. Lower it for a
+    fast endpoint.
+  EOT
+  type        = number
+  default     = 180
+}
+
+variable "max_revisions" {
+  description = <<-EOT
+    `MAX_REVISIONS`: how many automatic improvement cycles reflection may run after the first
+    report. 3 means at most 4 report-producing passes.
+
+    3 rather than config.py's 2 for the same reason as the timeout - it is what the measured
+    runs used. Hitting the cap stays a visible outcome carried to the reviewer (invariant 2),
+    which this number moves but does not change.
+  EOT
+  type        = number
+  default     = 3
+}
+
+variable "max_supervisor_hops" {
+  description = <<-EOT
+    `MAX_SUPERVISOR_HOPS`: the routing loop guard.
+
+    30 rather than config.py's 24. It has to rise with `max_revisions`: each extra revision
+    cycle legitimately costs hops, so raising the revision cap while leaving the hop guard at
+    the ceiling derived for 2 revisions would fail jobs on the guard rather than on the cap.
+    It remains a guard against a routing loop, not a budget - `MAX_LLM_CALLS_PER_JOB` is still
+    the binding ceiling and is deliberately not a variable here.
+  EOT
+  type        = number
+  default     = 30
+}
+
+variable "max_job_runtime" {
+  description = <<-EOT
+    `MAX_JOB_RUNTIME`: the no-new-node deadline for **one worker invocation**, in seconds. Not
+    a hard wall and not a job's lifetime - a job waiting three days at the human gate does not
+    fail on resume ([ADR 0010](../docs/adr/0010-*.md) decision 7, clarified by ADR 0015).
+
+    1800 rather than config.py's 1200, matching the measured runs.
+
+    **It equals `visibility_timeout_seconds` on the jobs queue, and that is a coincidence of
+    value rather than a coupling.** The two never interact: the deadline is a `time.monotonic()`
+    comparison made after a node's checkpoint is durable, while ownership of the delivery is
+    kept by ADR 0015's background heartbeat, which renews every `V/3` derived from the queue's
+    own attribute and keeps renewing for as long as the invocation legitimately owns the
+    message. Nothing in `worker.check_queue` compares the two. Raising this above 1800 would
+    still be safe for the same reason - it is bounded by the lease, not by this number.
+  EOT
+  type        = number
+  default     = 1800
 }
 
 variable "auth_keys" {

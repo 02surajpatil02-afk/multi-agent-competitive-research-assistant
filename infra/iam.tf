@@ -43,7 +43,7 @@
 #     events on who assumed what. Each needs setup outside this configuration.
 #
 # WHO USES IT
-#     ecs.tf, which names these roles on its three task definitions.
+#     ecs.tf, which names these roles on its four task definitions.
 
 data "aws_caller_identity" "current" {}
 
@@ -106,8 +106,10 @@ locals {
     migrate = [
       local.db_secret_arn,
     ]
-    # Block C's operator tooling. The database credential and nothing else - the three scripts
-    # read rows, checkpoints and queues, and none of them can reach a model or a bucket.
+    # Block C's operator tooling. The database credential and nothing else - the four scripts
+    # read rows, checkpoints, queues and one object prefix, and none of them can reach a model.
+    # The bucket is reached with the *task* role, not this one: nothing in the container calls
+    # Secrets Manager, so widening the recovery path widened no secret access.
     ops = [
       local.db_secret_arn,
     ]
@@ -202,10 +204,18 @@ resource "aws_iam_role_policy" "api" {
 # **It is a task and never a service.** Nothing starts it; an operator runs `aws ecs run-task`
 # with a command override, exactly as they do for the migration.
 #
-# What it may do is the union of what the three scripts actually call, and no more: read and
-# release messages on the dead-letter queue, delete one from it during a deliberate replay, and
-# send one back to the jobs queue. **No S3, no Secrets Manager, no CloudWatch, and no permission
-# on any other queue.** The API and the worker gained nothing from this file.
+# What it may do is the union of what the four scripts actually call, and no more: read and
+# release messages on the dead-letter queue, delete one from it during a deliberate replay, send
+# one back to the jobs queue, and write one report object during ADR 0009's re-export. **No
+# Secrets Manager, no CloudWatch, and no permission on any other queue.** The API and the worker
+# gained nothing from this file.
+#
+# **The S3 statement is `s3:PutObject` and nothing else, and that is read off the code rather
+# than guessed.** `scripts/reexport_job.py` calls exactly one store method, `put_report`, which
+# is one `put_object`; `object_key` is string arithmetic and `presign` signs locally without
+# reaching S3, so no `GetObject`, `ListBucket` or `HeadObject` is required and none is granted.
+# The prefix is the same `reports/*` the worker writes, because a re-export overwrites the key
+# the exhausted attempt was going to write.
 
 resource "aws_iam_role" "ops" {
   name               = "${local.name}-ops-task"
@@ -244,6 +254,17 @@ data "aws_iam_policy_document" "ops" {
       "sqs:GetQueueAttributes",
     ]
     resources = [aws_sqs_queue.jobs_dlq.arn]
+  }
+
+  # ADR 0009's recovery: re-project an approved `jobs.report_json` that has no artifact. One
+  # action, one prefix. **No `GetObject`**, so this identity can write a report and still cannot
+  # read one back out - which keeps `GET /jobs/{id}/report`'s presigned download the API's job,
+  # exactly as `PutObject` without `GetObject` keeps it out of the worker's.
+  statement {
+    sid       = "RecoverAnExhaustedReportArtifact"
+    effect    = "Allow"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.reports.arn}/reports/*"]
   }
 }
 
