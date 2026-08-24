@@ -112,8 +112,8 @@ WORKDIR /app
 # import and nothing that happens to be next to it. Ownership stays with root: the
 # application only reads its own source, so files it cannot rewrite are one fewer thing an
 # injected page could aim at.
-COPY app.py worker.py config.py schemas.py llm_client.py jobqueue.py redisstore.py \
-     artifacts.py operations.py alembic.ini ./
+COPY app.py worker.py config.py schemas.py llm_client.py bedrock.py jobqueue.py \
+     redisstore.py artifacts.py operations.py alembic.ini ./
 COPY agents/ ./agents/
 COPY database/ ./database/
 COPY graph/ ./graph/

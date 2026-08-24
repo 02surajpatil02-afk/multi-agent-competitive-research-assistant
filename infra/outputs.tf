@@ -179,14 +179,19 @@ output "secret_arns" {
     Every Secrets Manager secret this deployment reads, by name. **ARNs, never values.** They
     are what `aws secretsmanager put-secret-value` and the teardown checklist take. The database
     entry is the secret RDS generated and owns; deleting the instance deletes it.
+
+    **Which keys appear depends on the deployment, and an absent key is the answer rather than
+    an omission.** `auth_keys` exists only in `api_key` mode, and `llm_api_key` only in `openai`
+    mode - the default Bedrock deployment holds no model-provider credential at all
+    (docs/adr/0022-*.md), so the teardown checklist has one fewer secret to check for.
   EOT
   value = merge(
     {
       database       = local.db_secret_arn
-      llm_api_key    = aws_secretsmanager_secret.llm_api_key.arn
       tavily_api_key = aws_secretsmanager_secret.tavily_api_key.arn
     },
     local.cognito_enabled ? {} : { auth_keys = aws_secretsmanager_secret.auth_keys[0].arn },
+    local.bedrock_enabled ? {} : { llm_api_key = aws_secretsmanager_secret.llm_api_key[0].arn },
   )
 }
 

@@ -26,8 +26,9 @@ from typing import Any
 
 import pytest
 
+import config
 from eval.report import CaseResult
-from eval.run import DEFAULT_BENCHMARK, main, parse_args
+from eval.run import DEFAULT_BENCHMARK, _build_judge, main, parse_args
 
 _CASE: dict[str, Any] = {
     "case_id": "cmp-example",
@@ -334,6 +335,110 @@ def test_a_deterministic_run_never_fails_on_the_judge_health_switch(tmp_path: Pa
     out = tmp_path / "out"
 
     assert _run(_bench(tmp_path, _CASE), out, "--require-judge-scores") == 0
+
+
+# --- 8. The judge follows LLM_PROVIDER, and the default run still touches neither -------------
+
+
+def _judge_env(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
+    """A clean, offline environment for `_build_judge`.
+
+    Three things are neutralised, and each of them would otherwise make these tests depend on the
+    machine they run on:
+
+      * **the developer's `.env`**, because `_build_judge` calls `load_config()` with no mapping
+        and that reads the file - a checkout with a real `LLM_API_KEY` in it would make the
+        "this is required" assertion pass for the wrong reason, or fail;
+      * **the LLM variables already in the environment**, for the same reason;
+      * **`boto3.client`**, because constructing a real Bedrock client resolves the AWS
+        credential chain, and no test here may read an AWS profile or reach a metadata service.
+    """
+    monkeypatch.setattr(config, "_DOTENV_PATH", Path("no-such-file.env"))
+    monkeypatch.setattr("bedrock.boto3.client", lambda *args, **kwargs: object())
+    for name in (
+        "LLM_PROVIDER",
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+        "LLM_FAST_MODEL",
+        "LLM_API_KEY",
+        "BEDROCK_MODEL_ID",
+        "BEDROCK_REGION",
+        "EVAL_JUDGE_MODEL",
+        "EVAL_JUDGE_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_the_judge_needs_no_llm_key_when_the_provider_is_bedrock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0022: there is no endpoint to choose and no key to require. The judge goes through
+    the same `LLMClient` every agent uses, so it inherits the provider rather than having one."""
+    _judge_env(monkeypatch, LLM_PROVIDER="bedrock", BEDROCK_MODEL_ID="apac.amazon.nova-pro-v1:0")
+
+    judge = _build_judge(parse_args(["--judge"]))
+
+    assert judge._model == "apac.amazon.nova-pro-v1:0"
+
+
+def test_a_judge_model_override_still_wins_in_bedrock_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case worth supporting: a model grading its own output is the obvious way to get a
+    flattering number, so choosing a different one must keep working under either provider."""
+    _judge_env(monkeypatch, LLM_PROVIDER="bedrock", BEDROCK_MODEL_ID="nova-pro")
+
+    judge = _build_judge(parse_args(["--judge", "--judge-model", "some-other-model"]))
+
+    assert judge._model == "some-other-model"
+
+
+def test_an_openai_endpoint_is_refused_rather_than_ignored_in_bedrock_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silently dropping an endpoint somebody asked for is how a judge ends up scoring with the
+    wrong model, and a judge that scored with the wrong model would not say so anywhere."""
+    _judge_env(monkeypatch, LLM_PROVIDER="bedrock", BEDROCK_MODEL_ID="nova-pro")
+
+    with pytest.raises(ValueError, match="bedrock"):
+        _build_judge(parse_args(["--judge", "--judge-base-url", "https://judge.invalid/v1"]))
+
+
+def test_bedrock_mode_with_no_model_id_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    _judge_env(monkeypatch, LLM_PROVIDER="bedrock")
+
+    with pytest.raises(ValueError, match="bedrock"):
+        _build_judge(parse_args(["--judge"]))
+
+
+def test_the_openai_judge_path_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The alternative has to keep working, key requirement included."""
+    _judge_env(
+        monkeypatch,
+        LLM_BASE_URL="https://judge.invalid/v1",
+        LLM_MODEL="a-model",
+        LLM_API_KEY="key",
+    )
+
+    assert _build_judge(parse_args(["--judge"]))._model == "a-model"
+
+    _judge_env(monkeypatch, LLM_BASE_URL="https://judge.invalid/v1", LLM_MODEL="a-model")
+    with pytest.raises(ValueError, match="LLM_API_KEY"):
+        _build_judge(parse_args(["--judge"]))
+
+
+def test_a_default_run_builds_no_judge_and_reads_no_provider_variable(tmp_path: Path) -> None:
+    """**The property the `eval` CI job depends on** (ADR 0018 decision 6). The twelve
+    deterministic metrics are pure functions, so the default run needs no credential, no
+    endpoint and no provider - which is still true with a second provider in the codebase."""
+    out = tmp_path / "out"
+
+    assert _run(_bench(tmp_path, _CASE), out) == 0
+
+    report = json.loads(next(out.glob("*.json")).read_text(encoding="utf-8"))
+    assert report["judge"]["enabled"] is False
 
 
 def test_a_case_result_names_its_failing_metrics() -> None:

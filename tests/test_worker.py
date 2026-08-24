@@ -2048,6 +2048,8 @@ def test_a_queue_with_no_redrive_policy_starts_with_a_warning(
         # Step 22a. Discovering a missing bucket at export time would fail a job that had
         # already paid for its whole pipeline.
         "S3_BUCKET",
+        # The three that are required under `LLM_PROVIDER=openai`, which is the default and what
+        # `_ENV` sets. Bedrock's own requirement is asserted separately below.
         "LLM_BASE_URL",
         "LLM_API_KEY",
         "LLM_MODEL",
@@ -2063,12 +2065,65 @@ def test_the_worker_refuses_to_start_without_each_variable_it_uses(name: str) ->
         required_credentials(load_config(without))
 
 
-def test_a_complete_environment_narrows_to_the_seven_values(config: Config) -> None:
+def test_a_complete_openai_environment_narrows_to_its_values(config: Config) -> None:
     credentials = required_credentials(config)
 
+    assert credentials.llm_provider == "openai"
     assert credentials.queue_url == _ENV["SQS_QUEUE_URL"]
     assert credentials.s3_bucket == "research-reports"
     assert credentials.llm_model == "main-model"
+
+
+# --- ADR 0022: what the worker requires depends on which provider it was told to use ---------
+
+
+_BEDROCK_ENV = {
+    key: value
+    for key, value in _ENV.items()
+    if key not in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_FAST_MODEL")
+} | {"LLM_PROVIDER": "bedrock", "BEDROCK_MODEL_ID": "apac.amazon.nova-pro-v1:0"}
+
+
+def test_the_worker_starts_in_bedrock_mode_with_no_llm_credential_at_all() -> None:
+    """The claim the AWS deployment rests on: there is no endpoint and no key to supply, because
+    boto3 signs with the ECS task role. Requiring `LLM_API_KEY` here would demand a value with
+    nothing to authenticate against (ADR 0022 decision 6)."""
+    credentials = required_credentials(load_config(_BEDROCK_ENV))
+
+    assert credentials.llm_provider == "bedrock"
+    assert credentials.bedrock_model_id == "apac.amazon.nova-pro-v1:0"
+    assert credentials.llm_api_key is None
+    assert credentials.llm_base_url is None
+    assert credentials.llm_model is None
+
+
+def test_bedrock_mode_still_refuses_to_start_without_a_model_id() -> None:
+    """Relaxed for the credential, not for the configuration. A worker with no model id would
+    take a message and fail its first node."""
+    without = {key: value for key, value in _BEDROCK_ENV.items() if key != "BEDROCK_MODEL_ID"}
+
+    with pytest.raises(ValueError, match="BEDROCK_MODEL_ID"):
+        required_credentials(load_config(without))
+
+
+@pytest.mark.parametrize("name", ["DATABASE_URL", "SQS_QUEUE_URL", "S3_BUCKET", "TAVILY_API_KEY"])
+def test_the_four_variables_neither_provider_can_do_without(name: str) -> None:
+    """The search key is in this list rather than the provider-conditional one on purpose:
+    Tavily is a real third-party API with a real key whichever model answers."""
+    without = {key: value for key, value in _BEDROCK_ENV.items() if key != name}
+
+    with pytest.raises(ValueError, match=name):
+        required_credentials(load_config(without))
+
+
+def test_the_worker_does_not_build_a_provider_of_its_own() -> None:
+    """It used to construct an `OpenAI` client and hand it over, which was the same narrowing
+    `LLMClient` already does one line later - and which would now need a second branch for
+    Bedrock in the one file that should not know there are two (ADR 0022)."""
+    source = (Path(__file__).resolve().parent.parent / "worker.py").read_text(encoding="utf-8")
+
+    assert "from openai import OpenAI" not in source
+    assert "import bedrock" not in source
 
 
 # --- 7. The process boundary ------------------------------------------------------------

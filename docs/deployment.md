@@ -56,6 +56,7 @@ never plans or applies. Every command below is run by a person who has decided t
 | LocalStack SQS | SQS FIFO queue + FIFO DLQ | ADR 0010 decision 4: `MessageGroupId = job_id` is what keeps one job to one writer |
 | LocalStack S3 | S3 bucket, all public access blocked | `reports/{job_id}.json`, written by the worker, presigned by the API |
 | `competitive-research:local` | ECR, one repository, one image | ARCHITECTURE.md §19: one image, two entrypoints — three commands over identical bytes |
+| OpenAI-compatible endpoint + `LLM_API_KEY` | **Amazon Bedrock, Converse, Amazon Nova Pro** | [ADR 0022](adr/0022-amazon-bedrock-as-the-deployments-llm-provider.md): the worker task role's `bedrock:InvokeModel` is the whole of the authentication, so the deployment holds **no model-provider credential at all** |
 
 **Nothing was redesigned to fit AWS.** The queue attributes, the visibility window, the stop
 timeout, the health endpoint, the migration ownership and the checkpointer ownership are the
@@ -84,6 +85,53 @@ heartbeat, which renews every `V/3` derived from the queue's own attribute for a
 invocation legitimately owns the message. `worker.check_queue` compares the visibility timeout
 with the renewal cadence and the bounded SQS call and never with this number, so raising either
 one changes nothing about the other.
+
+### The model provider: Bedrock by default, and no GPT key is required
+
+**The AWS deployment calls Amazon Bedrock's Converse API against Amazon Nova Pro, and there is
+no OpenAI or NVIDIA key anywhere in it** ([ADR 0022](adr/0022-amazon-bedrock-as-the-deployments-llm-provider.md)).
+The worker's ECS **task role** carries `bedrock:InvokeModel` on the configured model, boto3
+signs with it through the ordinary credential chain, and that is the entire credential story:
+
+- no Bedrock API key, and none exists to create;
+- no long-lived AWS access key in the container;
+- **no Secrets Manager entry for the model provider** — under `llm_provider = "bedrock"` the
+  `llm-api-key` secret is not created at all, and the worker's execution role is granted nothing
+  to fetch for it;
+- no OpenAI-compatible shim in front of Bedrock.
+
+`TAVILY_API_KEY` is untouched by any of this. Web search is a real third-party API with a real
+key whichever model answers, and it stays in Secrets Manager exactly where it was.
+
+**The two providers are alternatives, never simultaneous requirements**, and there is
+deliberately **no automatic fallback** from one to the other: a worker that failed over would
+spend on two providers under two sets of semantics for a failure the retry schedules in
+guidelines §17 already bound.
+
+| | Bedrock (the default) | OpenAI-compatible |
+|---|---|---|
+| Terraform | `TF_VAR_llm_provider=bedrock` | `TF_VAR_llm_provider=openai` |
+| Model | `TF_VAR_bedrock_model_id=...` | `TF_VAR_llm_model=...`, optionally `TF_VAR_llm_fast_model` |
+| Endpoint | — (a Region, `TF_VAR_bedrock_region`, defaulting to `var.region`) | `TF_VAR_llm_base_url=...` |
+| Credential | **none** — IAM on the worker task role | `TF_VAR_llm_api_key=...`, into Secrets Manager |
+| Worker environment | `LLM_PROVIDER`, `BEDROCK_MODEL_ID`, `BEDROCK_REGION` | `LLM_PROVIDER`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_FAST_MODEL`, `LLM_API_KEY` |
+| Worker task role | `bedrock:InvokeModel` on the configured model | no Bedrock permission at all |
+
+**The agents did not change, and neither did the structured-output contract.** Every agent still
+calls `LLMClient.call_structured(schema=...)` and still receives a validated Pydantic instance or
+`LLMCallFailed`. What changed is one adapter behind that contract. Nova has no JSON mode to
+switch on, so the JSON Schema the client already puts in the system prompt is the whole of the
+request-side enforcement there, and the same single validation retry is what makes that safe.
+
+**`LLM_FAST_MODEL` has no Bedrock equivalent, and that is a stated cost difference.** Under
+Bedrock both tiers use `BEDROCK_MODEL_ID`, so Supervisor routing and reflection scoring run on
+Nova Pro rather than on a cheaper model. The tier still selects the request timeout and the
+backoff schedule; it no longer selects a cheaper model. Adding a second model id is a decision
+for a deployment that has measured the first one.
+
+**Local development is untouched.** `config.py`'s own default is `openai`, `docker-compose.yml`
+sets `LLM_PROVIDER=openai` explicitly, and the whole offline suite needs no AWS credential, no
+profile and no network.
 
 ---
 
@@ -231,18 +279,90 @@ end-to-end verification can begin
 **Prerequisites:** Terraform ≥ 1.5, the AWS CLI, Docker, and credentials for an AWS account you
 are willing to create and destroy resources in. Nothing below is run automatically.
 
+### 4.0 Verify Bedrock before the first apply
+
+**Two things have to be true before an apply, and no Terraform configuration can assert
+either**: that this account has access to Nova Pro, and that the identifier `bedrock_model_id`
+names is one this Region can serve. Model availability is an account-and-Region fact. A wrong
+value here is a `ValidationException` or an `AccessDeniedException` on the first job, not a
+failed apply — which is much later and much more confusing.
+
+Run these with your own credentials, in the Region you are deploying to:
+
+```bash
+aws bedrock list-inference-profiles --region "$AWS_REGION" --query "inferenceProfileSummaries[?contains(inferenceProfileId, 'nova-pro')].[inferenceProfileId,status]" --output table
+```
+
+If that lists an `apac.amazon.nova-pro-v1:0` (or the equivalent for your Region's geography),
+that id is what `bedrock_model_id` should be. If it lists nothing, check whether the plain
+foundation model is available in-Region instead:
+
+```bash
+aws bedrock list-foundation-models --region "$AWS_REGION" --query "modelSummaries[?contains(modelId, 'nova-pro')].modelId" --output text
+```
+
+**Then read the profile's destination Regions**, because they decide the IAM policy. Invoking
+through a cross-region profile is authorized against the profile *and* against the foundation
+model in whichever Region the request lands in:
+
+```bash
+aws bedrock get-inference-profile --region "$AWS_REGION" --inference-profile-identifier 'apac.amazon.nova-pro-v1:0' --query "models[].modelArn" --output text
+```
+
+Every Region that appears in those ARNs goes into `bedrock_inference_profile_regions`:
+
+```bash
+export TF_VAR_bedrock_inference_profile_regions='["ap-south-1","ap-northeast-1","ap-southeast-1"]'
+```
+
+**Leaving that empty grants the model in the deployment Region only.** That is correct for a
+plain foundation model id and wrong for a cross-region profile — the symptom is an
+`AccessDeniedException` on some jobs and not others, which is the least pleasant kind. Widening
+the policy to `Resource = "*"` is the shortcut [ADR 0022](adr/0022-amazon-bedrock-as-the-deployments-llm-provider.md)
+decision 9 refuses, and a test fails if it appears.
+
+Model access itself is granted once per account in the Bedrock console under **Model access**;
+if the calls above return an empty list for a model you expect, that is usually why.
+
+**None of this is a smoke test and none of it needs the deployment.** These are read-only
+account queries run before anything exists.
+
 ### 4.1 Set the variables
 
-Every secret is passed through the environment, never a file in the repository. `terraform apply`
-refuses to run without them, because none of them has a default.
+Every secret is passed through the environment, never a file in the repository.
+
+**The default deployment needs exactly one credential**, because Bedrock needs none:
 
 ```bash
 export AWS_REGION=ap-south-1
+export TF_VAR_tavily_api_key='...'
+```
+
+That is the whole required set. `llm_provider` defaults to `bedrock` and `bedrock_model_id`
+defaults to the APAC cross-region Nova Pro profile, so a deployment that accepts both defaults
+sets neither — **but verify the model id against your account first**, which is
+[§4.0](#40-verify-bedrock-before-the-first-apply) and takes two commands.
+
+To be explicit, or to change either:
+
+```bash
+export TF_VAR_llm_provider=bedrock
+export TF_VAR_bedrock_model_id='apac.amazon.nova-pro-v1:0'
+```
+
+**Switching to the OpenAI-compatible provider instead** — the alternative, not an addition.
+All three are then required, and Terraform refuses an apply that sets the provider and forgets
+one:
+
+```bash
+export TF_VAR_llm_provider=openai
 export TF_VAR_llm_base_url='https://.../v1'
 export TF_VAR_llm_model='...'
 export TF_VAR_llm_api_key='...'
-export TF_VAR_tavily_api_key='...'
 ```
+
+**Setting the `llm_*` variables while `llm_provider` is `bedrock` does nothing at all** — no LLM
+variable reaches the worker and no LLM secret is created. Nothing here reads both sets.
 
 **There is no `TF_VAR_db_password`, and that is block B.** RDS generates the master password into
 a Secrets Manager secret it owns, so there is nothing to invent and nothing that could land in
@@ -284,11 +404,13 @@ export TF_VAR_certificate_arn='arn:aws:acm:ap-south-1:...:certificate/...'
 | Value | Where it lives | Who may fetch it | In Terraform state? |
 |---|---|---|---|
 | Database password | Secrets Manager, **generated and owned by RDS** | the `api`, `worker` and `migrate` execution roles | **No** — Terraform never sees it |
-| `LLM_API_KEY` | Secrets Manager, written by Terraform | the `worker` execution role only | Yes — see the warning in [§6](#6-teardown) |
+| **Bedrock model access** (the default) | **Nowhere — there is no credential** | the `worker` **task** role, via `bedrock:InvokeModel` | **No** — there is no value to store |
+| `LLM_API_KEY` (`openai` mode only) | Secrets Manager, written by Terraform | the `worker` execution role only | Yes — see the warning in [§6](#6-teardown) |
 | `TAVILY_API_KEY` | Secrets Manager, written by Terraform | the `worker` execution role only | Yes |
 | `AUTH_KEYS` (`api_key` mode only) | Secrets Manager, written by Terraform | the `api` execution role only | Yes |
 | Cognito pool id, client id, issuer | Plain task-definition environment | — | Yes, and none of the three is a secret |
-| LLM endpoint and model ids | Plain task-definition environment | — | Yes, and none is a secret |
+| Bedrock model id and Region | Plain task-definition environment | — | Yes, and neither is a secret |
+| LLM endpoint and model ids (`openai` mode only) | Plain task-definition environment | — | Yes, and none is a secret |
 
 **Nothing inside either container can read a secret.** The application reads environment
 variables, exactly as it does locally; the fetch is done by the ECS agent using the *execution*
@@ -635,13 +757,17 @@ message was never genuinely dead-lettered, which proves nothing and risks a dupl
 (`s3_force_destroy = true`) and skips the RDS final snapshot (`rds_skip_final_snapshot = true`).
 Nothing else keeps the evidence.
 
-**Destroy needs the same variables apply did, so tear down from the same shell.** `image_tag`,
-`llm_base_url`, `llm_model`, `llm_api_key` and `tavily_api_key` have no defaults, and Terraform
-requires a value for every declared variable on *any* operation — destroy included. In a fresh
-terminal it will stop and prompt for four of them, and under `-input=false` it fails outright. If
-you have already closed the shell, re-export them ([§4.1](#41-set-the-variables)) before running
-this — any placeholder is accepted for the two keys, because destroy reads them and creates
-nothing. The `unset` at the end of this section is deliberately the *last* step.
+**Destroy needs the same variables apply did, so tear down from the same shell.** Terraform
+requires a value for every declared variable without a default on *any* operation — destroy
+included. In the default Bedrock deployment that is two: `image_tag` and `tavily_api_key`. Under
+`llm_provider = "openai"` the three `llm_*` variables join them, not because they have no
+defaults but because their validations refuse an apply or a destroy that leaves them empty.
+
+In a fresh terminal Terraform stops and prompts for whichever are missing, and under
+`-input=false` it fails outright. If you have already closed the shell, re-export them
+([§4.1](#41-set-the-variables)) before running this — any placeholder is accepted for the keys,
+because destroy reads them and creates nothing. The `unset` at the end of this section is
+deliberately the *last* step.
 
 ```bash
 terraform -chdir=infra destroy -var image_tag="$IMAGE_TAG"
@@ -661,7 +787,7 @@ terraform -chdir=infra destroy -var image_tag="$IMAGE_TAG"
 | Logs | **Four** CloudWatch log groups | Terraform-managed on purpose — groups ECS creates itself survive destroy |
 | Monitoring | **Six CloudWatch alarms and the SNS topic** | Terraform owns all seven; a subscription you added by hand goes with the topic |
 | IAM | **Four execution roles**, **three** task roles, and their inline policies | Block B split the execution role per task definition; block C added the `ops` pair |
-| Secrets | The LLM key, the search key, and the auth-keys secret in `api_key` mode | `recovery_window_in_days = 0`, so they are **deleted immediately, not scheduled** |
+| Secrets | The search key, plus the LLM key in `openai` mode and the auth-keys secret in `api_key` mode | `recovery_window_in_days = 0`, so they are **deleted immediately, not scheduled**. In the default Bedrock deployment there is no LLM secret to delete |
 | Cognito | The user pool, its app client, and both groups — **and every user in it** | Deleting the pool deletes the demo account with it |
 | Network | VPC, 4 subnets, 2 route tables, internet gateway, 5 security groups | |
 
@@ -799,7 +925,8 @@ risk.
 
 | Resource | Charging model | ~1-hour deployment | If forgotten for a week |
 |---|---|---|---|
-| **Secrets Manager** | Per secret-month, prorated, plus per 10k API calls | Fractions of a cent for 3 secrets read a handful of times | Cents |
+| **Secrets Manager** | Per secret-month, prorated, plus per 10k API calls | Fractions of a cent — 1 secret in the default Bedrock + Cognito deployment, up to 3 with the alternatives | Cents |
+| **Amazon Bedrock (Nova Pro)** | Per 1k input and output tokens, on demand | **Not an AWS infrastructure line — it is model spend**, and it is now on the same bill as everything else | Nothing while no job runs |
 | **Cognito user pool** | Per monthly active user, with a large free tier | **$0** at one demo user | $0 |
 | **ACM certificate** | Free for public certificates | $0, and none is created here | $0 |
 | **RDS `db.t4g.micro`, Single-AZ** | Per hour + 20 GiB gp3 | Cents | The largest single line |
@@ -831,8 +958,18 @@ alarm-months, which is the one line worth checking after teardown.
 ElastiCache and the ALB in roughly equal parts. **Rough expectation if left running for a month:
 tens of dollars**, for exactly the same reason.
 
-**Cost not on this table:** the LLM and Tavily calls the demo job makes. Those are provider
-spend, not AWS.
+**Cost not on this table:** the model and Tavily calls the demo job makes. Tavily is provider
+spend and is not AWS. **Bedrock is different since [ADR 0022](adr/0022-amazon-bedrock-as-the-deployments-llm-provider.md)**:
+Nova Pro is billed per token on the same AWS account as everything above, so a forgotten
+deployment that is not running jobs costs nothing extra for the model, and a demo that runs jobs
+does. Two things bound it and both already existed — `MAX_LLM_CALLS_PER_JOB` (60) caps one job's
+requests, and the shared Redis limiter caps the whole deployment's request rate.
+
+**No cost figure is derived here, and none should be.** `bedrock.py` records the input and output
+token counts Converse reports, next to the model id, and stops there: a price is not in the
+response, and a hard-coded rate is a number that is wrong the first time AWS changes one. The
+published n=20 baselines are NIM measurements and say nothing about Bedrock — they are **not** a
+Nova cost estimate.
 
 ---
 

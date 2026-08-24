@@ -233,22 +233,42 @@ def _bare(case: EvalCase, status: CaseStatus, error: str) -> CaseResult:
 def _build_judge(args: argparse.Namespace) -> Judge:
     """One `LLMClient` pointed at the configured judge endpoint, wrapped in a `Judge`.
 
-    **The provider is a base URL and a model id, exactly as it is for every other caller in
-    this repository** - there is no provider class here for the same reason `llm_client.py` has
-    none (ARCHITECTURE.md §20 row 4). The two values default to the `LLM_*` configuration the
-    system already has, so judging with the same model the system runs on needs no extra
-    variable; `--judge-model` / `EVAL_JUDGE_MODEL` and `--judge-base-url` / `EVAL_JUDGE_BASE_URL`
-    are how a *different* judge is chosen, which is the case worth supporting because a model
-    grading its own output is the obvious way to get a flattering number.
+    **It follows `LLM_PROVIDER`, and it is still the only thing in `eval/` that reaches a
+    network at all.** The default run scores fixtures with twelve pure functions and needs no
+    credential and no provider, which is what makes the `eval` CI job provider-free; this
+    branch is entered only for `--judge`.
 
-    `LLM_API_KEY` is the credential either way, and it is required loudly here rather than at
-    the first request.
+    On the OpenAI path the judge is a base URL and a model id, defaulting to the `LLM_*`
+    configuration the system already has - so judging with the same model the system runs on
+    needs no extra variable, while `--judge-model` / `EVAL_JUDGE_MODEL` and `--judge-base-url` /
+    `EVAL_JUDGE_BASE_URL` choose a *different* one, which is the case worth supporting because a
+    model grading its own output is the obvious way to get a flattering number.
+
+    On the Bedrock path there is no endpoint to choose and no key to require: `--judge-model` or
+    `EVAL_JUDGE_MODEL` overrides `BEDROCK_MODEL_ID`, and `--judge-base-url` is **refused** rather
+    than ignored, because silently dropping an endpoint somebody asked for is how a judge ends up
+    scoring with the wrong model.
     """
     config = load_config()
-    model = args.judge_model or config.llm_model
-    base_url = args.judge_base_url or config.llm_base_url
+    model = args.judge_model or (
+        config.bedrock_model_id if config.llm_provider == "bedrock" else config.llm_model
+    )
     if not model:
-        raise ValueError("--judge needs a model: set --judge-model, EVAL_JUDGE_MODEL or LLM_MODEL")
+        raise ValueError(
+            "--judge needs a model: set --judge-model, EVAL_JUDGE_MODEL, or the model id for "
+            f"LLM_PROVIDER={config.llm_provider}"
+        )
+
+    if config.llm_provider == "bedrock":
+        if args.judge_base_url:
+            raise ValueError(
+                "--judge-base-url / EVAL_JUDGE_BASE_URL names an OpenAI-compatible endpoint, "
+                "and LLM_PROVIDER is bedrock: set LLM_PROVIDER=openai to use it"
+            )
+        args.judge_model = model
+        return Judge(LLMClient(replace(config, bedrock_model_id=model)), model=model)
+
+    base_url = args.judge_base_url or config.llm_base_url
     if not base_url:
         raise ValueError(
             "--judge needs an endpoint: set --judge-base-url, EVAL_JUDGE_BASE_URL or LLM_BASE_URL"

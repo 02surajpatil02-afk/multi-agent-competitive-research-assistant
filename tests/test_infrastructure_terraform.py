@@ -122,6 +122,11 @@ PROVIDER_VARIABLES = (
     "LLM_FAST_MODEL",
     "LLM_API_KEY",
     "TAVILY_API_KEY",
+    # ADR 0022's two. They are configuration rather than credentials - a model id and a Region
+    # - but they belong to the same boundary: the API, the migration and the ops task must not
+    # be told about a model either, because none of them may call one.
+    "BEDROCK_MODEL_ID",
+    "BEDROCK_REGION",
 )
 
 
@@ -679,10 +684,18 @@ def test_the_api_task_carries_no_llm_or_search_credential() -> None:
         assert variable not in definition.body, f"the API task definition sets {variable}"
 
 
-def test_the_worker_is_the_process_that_holds_the_provider_credentials() -> None:
-    definition = _resources("aws_ecs_task_definition")["worker"]
-    for variable in PROVIDER_VARIABLES:
-        assert variable in definition.body
+def test_the_worker_is_the_only_process_that_is_told_about_a_model() -> None:
+    """The worker's provider configuration arrives as two locals rather than as inline entries
+    since ADR 0022, because which variables exist depends on `llm_provider`. What stays true is
+    that this is the only task definition that references either of them."""
+    definitions = _resources("aws_ecs_task_definition")
+
+    assert "local.worker_llm_environment" in definitions["worker"].body
+    assert "local.worker_llm_secrets" in definitions["worker"].body
+
+    for name in ("api", "migrate", "ops"):
+        for local_name in ("worker_llm_environment", "worker_llm_secrets"):
+            assert local_name not in definitions[name].body, f"{name} reads {local_name}"
 
 
 def test_neither_service_is_scaled_beyond_what_the_llm_tier_allows() -> None:
@@ -1092,17 +1105,44 @@ def test_the_provider_takes_no_credential_and_the_region_is_a_variable() -> None
         assert "ap-south-1" not in text, f"{name} hard-codes a region"
 
 
-def test_every_secret_variable_is_declared_without_a_default() -> None:
-    """`terraform apply` refuses to run without them, so no credential can arrive by being
-    forgotten - and none of them can be committed, because none of them is written down.
+def test_the_unconditional_secret_is_declared_without_a_default() -> None:
+    """`terraform apply` refuses to run without it, so no credential can arrive by being
+    forgotten - and it cannot be committed, because it is not written down.
 
-    `auth_keys` is the one exception and is checked separately below: under Cognito there is no
-    key table at all, so requiring a value would demand a credential the deployment never reads.
+    `tavily_api_key` is the only credential this deployment always needs. The other two are
+    conditional and are checked immediately below: `auth_keys` has no meaning under Cognito, and
+    `llm_api_key` has no meaning under Bedrock - requiring either would demand a credential the
+    deployment will never read.
     """
-    for name in ("llm_api_key", "tavily_api_key"):
-        variable = _variables()[name]
-        assert _attribute(variable.body, "sensitive") == "true", f"{name} is not marked sensitive"
-        assert _attribute(variable.body, "default") is None, f"{name} has a default"
+    variable = _variables()["tavily_api_key"]
+
+    assert _attribute(variable.body, "sensitive") == "true"
+    assert _attribute(variable.body, "default") is None
+
+
+def test_the_llm_key_is_required_only_in_the_provider_that_uses_one() -> None:
+    """The condition Block A got wrong (docs/adr/0022-*.md): `llm_api_key` had no default, so a
+    Bedrock deployment - which holds no model-provider credential at all - could not `apply` or
+    `destroy` without inventing a value for a variable nothing would read.
+
+    It is still sensitive, still absent from the state's plaintext by being empty, and still
+    refused in the mode that genuinely needs it."""
+    variable = _variables()["llm_api_key"]
+
+    assert _attribute(variable.body, "sensitive") == "true"
+    assert _attribute(variable.body, "default") == '""'
+    assert 'var.llm_provider != "openai" || trimspace(var.llm_api_key) != ""' in variable.body
+
+
+@pytest.mark.parametrize("name", ["llm_base_url", "llm_model"])
+def test_the_openai_endpoint_and_model_are_required_only_in_openai_mode(name: str) -> None:
+    """The same rule for the two that are configuration rather than credentials. All three were
+    unconditionally required before ADR 0022, and all three now refuse an apply exactly when
+    they are read."""
+    variable = _variables()[name]
+
+    assert _attribute(variable.body, "default") == '""'
+    assert f'var.llm_provider != "openai" || trimspace(var.{name}) != ""' in variable.body
 
 
 def test_the_key_table_is_still_required_in_the_mode_that_reads_it() -> None:
@@ -1565,6 +1605,182 @@ EXISTING_CI_JOBS = ("quality", "unit", "eval", "postgres", "redis", "integration
 def test_every_existing_ci_job_is_still_present(name: str) -> None:
     """The infra job is an addition. Nothing about Phase 3 or Phase 4 verification changes."""
     assert name in _workflow()["jobs"]
+
+
+# --- ADR 0022: Amazon Bedrock is the deployment's provider, and it holds no key ---------------
+#
+# Six of these would pass just as well against a configuration that had quietly widened the
+# Bedrock grant or left an empty LLM secret behind, so each one names the failure it is for.
+# None of them runs Terraform: they read the configuration and compare it to what ADR 0022 says
+# it should describe.
+
+
+def _bedrock_policy() -> Block:
+    return next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", "worker_bedrock")
+    )
+
+
+def test_the_aws_deployments_default_provider_is_bedrock() -> None:
+    """`config.py` keeps `openai` so every local command and the whole offline suite are
+    untouched; the deployment chooses the other one explicitly. The two defaults are allowed to
+    differ, and this is the pair of assertions that says so on purpose."""
+    variable = _variables()["llm_provider"]
+
+    assert _attribute(variable.body, "default") == '"bedrock"'
+    assert 'contains(["bedrock", "openai"], var.llm_provider)' in variable.body
+
+    config = (_ROOT / "config.py").read_text(encoding="utf-8")
+    assert 'env.get("LLM_PROVIDER", "").strip() or "openai"' in config
+
+
+def test_the_worker_is_told_which_provider_which_model_and_which_region() -> None:
+    """The three values that are the whole of Bedrock configuration - and the absence of a
+    fourth is the point: there is no key entry in either branch."""
+    locals_body = _container_locals()
+    bedrock_branch = locals_body.split("worker_llm_environment")[1].split("] : [")[0]
+
+    for entry in ("LLM_PROVIDER", "BEDROCK_MODEL_ID", "BEDROCK_REGION"):
+        assert entry in bedrock_branch, f"the bedrock branch does not set {entry}"
+    assert "var.bedrock_model_id" in bedrock_branch
+    assert "local.bedrock_region" in bedrock_branch
+    assert "LLM_API_KEY" not in bedrock_branch
+
+
+def test_the_openai_branch_still_carries_the_endpoint_the_models_and_the_key() -> None:
+    """The alternative has to keep working, or "switch the provider back" is not a real
+    option."""
+    locals_body = _container_locals()
+    openai_branch = locals_body.split("worker_llm_environment")[1].split("] : [")[1]
+
+    for entry in ("LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_FAST_MODEL"):
+        assert entry in openai_branch, f"the openai branch does not set {entry}"
+
+    secrets_local = locals_body.split("worker_llm_secrets")[1]
+    assert "aws_secretsmanager_secret.llm_api_key[0].arn" in secrets_local
+
+
+def test_no_llm_api_key_secret_exists_in_bedrock_mode() -> None:
+    """An empty placeholder secret would make `terraform apply` succeed and the worker
+    crash-loop on a credential it never needed. The secret is conditional on the provider, and
+    so is the version that would hold its value."""
+    for name in ("aws_secretsmanager_secret", "aws_secretsmanager_secret_version"):
+        block = _resources(name)["llm_api_key"]
+        assert _attribute(block.body, "count") == "local.bedrock_enabled ? 0 : 1"
+
+
+def test_the_worker_execution_role_fetches_no_llm_secret_in_bedrock_mode() -> None:
+    """The stale-permission failure: the secret goes away and the grant does not, leaving a
+    task-start identity permitted to read something that is not there. iam.tf and secrets.tf
+    are driven by the same `local.bedrock_enabled`, and this is what holds them together."""
+    locals_body = next(
+        block.body for block in _blocks(_tf_text()["iam.tf"]) if block.type == "locals"
+    )
+    worker_entry = locals_body.split("worker = concat(")[1].split("migrate =")[0]
+
+    assert "local.bedrock_enabled ? [] : [aws_secretsmanager_secret.llm_api_key[0].arn]" in (
+        worker_entry
+    )
+    assert "tavily_api_key" in worker_entry, "the search key is not provider-conditional"
+
+
+def test_the_worker_task_role_gets_exactly_one_bedrock_action() -> None:
+    """`bedrock:InvokeModel` is what `converse` needs.
+    `bedrock:InvokeModelWithResponseStream` is deliberately absent because nothing calls
+    `ConverseStream`, and a permission granted "for completeness" is how a least-privilege
+    policy stops being one."""
+    document = _bedrock_policy()
+
+    assert _attribute(document.body, "actions") == '["bedrock:InvokeModel"]'
+    assert "InvokeModelWithResponseStream" not in document.body
+    assert "ListFoundationModels" not in document.body
+
+
+def test_the_bedrock_grant_exists_only_when_bedrock_does() -> None:
+    """In `openai` mode the policy resource does not exist, so the worker task role carries no
+    Bedrock permission at all - which is what makes one variable the whole switch."""
+    for block in (_bedrock_policy(), _resources("aws_iam_role_policy")["worker_bedrock"]):
+        assert _attribute(block.body, "count") == "local.bedrock_enabled ? 1 : 0"
+
+    assert (
+        _attribute(_resources("aws_iam_role_policy")["worker_bedrock"].body, "role")
+        == "aws_iam_role.worker.id"
+    )
+
+
+def test_the_bedrock_grant_names_its_resources_and_never_uses_a_wildcard() -> None:
+    """The shortcut this exists to refuse. Cross-region inference is authorized against the
+    profile *and* the foundation model in each destination Region, and `Resource = "*"` is the
+    one-line way to make that work while granting every model in every Region."""
+    document = _bedrock_policy()
+
+    assert _attribute(document.body, "resources") == "local.bedrock_invoke_arns"
+    assert '"*"' not in document.body
+    assert "bedrock:*" not in document.body
+
+    derivation = _tf_code()["versions.tf"]
+    assert "inference-profile/${local.bedrock_model_ref}" in derivation
+    assert "foundation-model/${local.bedrock_base_model_id}" in derivation
+    assert "var.bedrock_inference_profile_regions" in derivation
+
+
+def test_no_application_policy_grants_a_bedrock_wildcard() -> None:
+    """Read across every policy this repository writes, not just the one above - the failure is
+    a `bedrock:*` that arrives somewhere else entirely."""
+    written = "\n".join(
+        block.body
+        for block in _all_blocks()
+        if (block.type == "data" and block.labels[:1] == ("aws_iam_policy_document",))
+        or (block.type == "resource" and block.labels[:1] == ("aws_iam_role_policy",))
+    )
+
+    assert "bedrock:*" not in written
+
+
+@pytest.mark.parametrize("role", ["api", "ops"])
+def test_no_other_task_role_may_call_a_model(role: str) -> None:
+    """The API constructs no LLM client (ADR 0012) and the recovery scripts re-project rows and
+    move messages - `tests/test_reexport_job.py` and `tests/test_operations.py` prove neither
+    can reach a model in code, and this is the same claim in IAM."""
+    document = next(
+        block
+        for block in _all_blocks()
+        if block.type == "data" and block.labels == ("aws_iam_policy_document", role)
+    )
+
+    assert "bedrock" not in document.body
+
+
+def test_the_migration_task_has_no_role_to_grant_bedrock_on() -> None:
+    """The strongest available form of "the migration cannot call a model": it has no task role
+    at all, so there is nothing to attach a policy to."""
+    assert _attribute(_resources("aws_ecs_task_definition")["migrate"].body, "task_role_arn") is (
+        None
+    )
+    assert "bedrock" not in _resources("aws_ecs_task_definition")["migrate"].body.lower()
+
+
+def test_the_search_credential_is_untouched_by_the_provider_choice() -> None:
+    """Tavily has nothing to do with which model answers. Its secret is unconditional, its
+    `valueFrom` still reaches the worker, and switching to Bedrock removed one secret and left
+    this one exactly where it was."""
+    secret = _resources("aws_secretsmanager_secret")["tavily_api_key"]
+
+    assert _attribute(secret.body, "count") is None
+    assert "TAVILY_API_KEY" in _resources("aws_ecs_task_definition")["worker"].body
+    assert "aws_secretsmanager_secret.tavily_api_key.arn" in _tf_code()["ecs.tf"]
+
+
+def test_the_deployment_runbook_documents_the_bedrock_verification() -> None:
+    """In-Region model availability is an account fact no configuration can assert, so the one
+    thing that has to exist before an apply is the command that answers it."""
+    runbook = (_ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+
+    assert "bedrock list-inference-profiles" in runbook
+    assert "get-inference-profile" in runbook
+    assert "TF_VAR_llm_provider" in runbook
 
 
 def test_the_deployment_runbook_exists() -> None:

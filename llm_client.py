@@ -1,10 +1,24 @@
 """
 WHY THIS FILE EXISTS
-    One OpenAI-compatible client that every agent and the reflection node call through.
-    There is no provider class and no provider abstraction: NIM in development and the
-    production endpoint both speak the same protocol, so swapping a model is a config
-    change plus a preflight plus an eval run, never a code change (ARCHITECTURE.md §20
-    row 4).
+    One client that every agent and the reflection node call through. `call_structured` is
+    the whole contract: a Pydantic schema in, a validated instance of it out, or
+    `LLMCallFailed` with a reason. No agent knows which endpoint answered.
+
+    **Since ADR 0022 there are two endpoints behind that contract, and exactly one line of
+    configuration picks between them.** `LLM_PROVIDER=openai` is an OpenAI-compatible base
+    URL - NIM in development, any compatible API in production - and `LLM_PROVIDER=bedrock`
+    is Amazon Bedrock's Converse API against Amazon Nova, authenticated by the ECS task role
+    rather than by a key. There is **no fallback between them**: a client that tried one and
+    then the other would spend on two providers, under two sets of semantics, for a failure
+    the schedules below already bound.
+
+    The abstraction that made that possible is deliberately one method wide. `ChatProvider`
+    takes messages, a model id, a timeout and a temperature, and answers text or raises
+    `ProviderError` with one of three kinds - `rate_limited`, `transport`, `fatal`. Everything
+    that decides *policy* stayed here: the budget, the shared limiter, both retry schedules,
+    the JSON contract, and the validation retry. A provider maps its SDK's failures onto those
+    three kinds and does nothing else, which is why adding Bedrock changed no agent, no node,
+    and none of the numbers.
 
     Putting all of it here means five agents do not each re-implement the same four
     concerns, and the numbers live in one place next to the guidelines section that
@@ -23,6 +37,9 @@ WHY THIS FILE EXISTS
         request, carrying the model, the latency, the provider's own token usage, and the
         exception when there was one. It is a wrapper on the client rather than code in
         `_send`, so the retry logic below reads exactly as it did before tracing existed.
+        **It wraps the OpenAI SDK and nothing else**, so Bedrock mode emits LangGraph's run
+        tree without a per-request LLM span; `bedrock.py` logs the provider's own token
+        counts instead, and nothing here invents one.
 
     What it deliberately does not do:
 
@@ -67,6 +84,7 @@ import json
 import logging
 import math
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from time import sleep
 from typing import Literal, Protocol, TypeVar
@@ -77,7 +95,6 @@ from openai import (
     APIStatusError,
     APITimeoutError,
     InternalServerError,
-    Omit,
     OpenAI,
     RateLimitError,
     omit,
@@ -230,6 +247,136 @@ class RateLimiter(Protocol):
     def acquire(self) -> bool: ...
 
 
+@dataclass(frozen=True)
+class ChatMessage:
+    """One turn, in the only shape both providers can build from.
+
+    A plain role and a plain string rather than either SDK's message type, because the two
+    disagree about everything except that: OpenAI wants a flat list with a `system` role in
+    it, and Converse wants the system instructions in their own top-level field and content
+    as a list of typed blocks. Each adapter does that translation; `call_structured` builds
+    one list and knows about neither.
+    """
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+ProviderFailureKind = Literal["rate_limited", "transport", "fatal"]
+"""The three things a provider may report, chosen because `_send` responds differently to each.
+
+`rate_limited` is the endpoint saying "you already did" - retried on `_RATE_LIMIT_BACKOFF_S`,
+and a job failure when that runs out. `transport` is a timeout, a dropped connection or a 5xx -
+retried on the tier's schedule, and a node failure when that runs out. `fatal` is a bad
+credential, an unknown model, a malformed request or a denied action: **not retried at all**,
+because no schedule fixes a configuration mistake and three attempts only make the log harder
+to read.
+"""
+
+
+class ProviderError(RuntimeError):
+    """A request the provider could not complete, classified for the retry loop.
+
+    One exception with a `kind` field rather than a hierarchy per provider, for the same reason
+    `LLMCallFailed` has a `reason` field: the caller branches on the value, and a hierarchy would
+    put the branch in `isinstance` chains that each provider would have to keep in step.
+
+    `retry_after` is the endpoint's own directive in seconds when it sent one and the adapter
+    could read it, already bounded by `MAX_RETRY_AFTER_S`. None means "use our schedule".
+    """
+
+    def __init__(
+        self,
+        kind: ProviderFailureKind,
+        message: str,
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind: ProviderFailureKind = kind
+        self.retry_after = retry_after
+
+
+class ChatProvider(Protocol):
+    """One request to one endpoint, as `LLMClient` uses it.
+
+    Declared here rather than imported, the same way `RateLimiter` below is: the consumer owns
+    the contract, so this module needs no dependency on boto3 and a test can hand in a scripted
+    one.
+
+    **It is one method wide on purpose.** Everything a provider could plausibly want to own -
+    the budget, the token, the two backoff schedules, the JSON contract, the validation retry -
+    is policy that has to be identical whichever endpoint answers, so all of it stayed in
+    `LLMClient`. An adapter sends one request, returns the text, and translates its SDK's
+    failures into `ProviderError`. Nothing else.
+
+    `temperature` is None for "do not send one", so the endpoint's own default stays in force.
+    """
+
+    def complete(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        model: str,
+        timeout: float,
+        temperature: float | None,
+    ) -> str: ...
+
+
+class OpenAIChatProvider:
+    """The OpenAI-compatible endpoint - NIM in development, any compatible API in production.
+
+    This is the code that used to be the body of `_send`, moved behind the protocol and
+    otherwise unchanged: the same `chat.completions.create` call with the same five arguments,
+    the same JSON mode, and the same reading of `Retry-After`. `temperature=None` becomes the
+    SDK's `omit`, so the default path produces byte-for-byte the request it produced before
+    there were two providers.
+    """
+
+    def __init__(self, client: OpenAI) -> None:
+        self._client = client
+
+    def complete(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        model: str,
+        timeout: float,
+        temperature: float | None,
+    ) -> str:
+        wire: list[ChatCompletionMessageParam] = [
+            {"role": message.role, "content": message.content}  # type: ignore[misc]
+            for message in messages
+        ]
+        try:
+            response = self._client.chat.completions.create(
+                model=model,
+                messages=wire,
+                response_format={"type": "json_object"},
+                timeout=timeout,
+                # `omit` is the SDK's "do not send this field", so the default path
+                # produces exactly the request it produced before this parameter existed.
+                temperature=omit if temperature is None else temperature,
+            )
+        except RateLimitError as error:
+            raise ProviderError(
+                "rate_limited", f"{model} rate limited", retry_after=_retry_after(error)
+            ) from error
+        except (InternalServerError, APITimeoutError, APIConnectionError) as error:
+            raise ProviderError("transport", f"{model} unreachable: {error}") from error
+        except APIStatusError as error:
+            # 4xx that is not a 429: a bad request, a bad key, an unknown model.
+            # Retrying cannot fix any of them, so fail now and say the status.
+            raise ProviderError(
+                "fatal", f"{model} rejected the request with status {error.status_code}"
+            ) from error
+
+        content = response.choices[0].message.content if response.choices else None
+        # An empty completion is invalid output, not a transport problem: it goes to the
+        # validation retry, which is the layer that can ask again better.
+        return content or ""
+
+
 class LLMClient:
     """The single client. One instance per process is enough; it holds no job state."""
 
@@ -238,6 +385,7 @@ class LLMClient:
         config: Config,
         client: OpenAI | None = None,
         limiter: RateLimiter | None = None,
+        provider: ChatProvider | None = None,
     ) -> None:
         self._config = config
         # None means no limiting at all, which is Phase 1's behaviour and what the offline
@@ -245,17 +393,52 @@ class LLMClient:
         # calls; nothing falls back to a per-process limiter, because a per-process limiter
         # would satisfy the type and not the requirement (guidelines §11).
         self._limiter = limiter
+        if client is not None and provider is not None:
+            raise ValueError("pass client= or provider=, not both: they name the same seam")
         # The two model names are narrowed here, once. `Config` carries them as optional so the
         # API process can start with no LLM credential at all (ADR 0012 decision 4) - and this
         # is the constructor of the thing that assumes one, so this is where the loud failure
         # belongs rather than at the first request.
-        self._main_model = required(config.llm_model, "LLM_MODEL")
-        self._fast_model = required(config.llm_fast_model, "LLM_FAST_MODEL")
+        #
+        # **Bedrock resolves both tiers to one model id**, because Converse takes one `modelId`
+        # and this deployment configures one. The tier still picks the timeout and the backoff
+        # schedule; what it no longer picks is a cheaper model (ADR 0022 decision 5).
+        if config.llm_provider == "bedrock":
+            model_id = required(config.bedrock_model_id, "BEDROCK_MODEL_ID")
+            self._main_model = self._fast_model = model_id
+        else:
+            self._main_model = required(config.llm_model, "LLM_MODEL")
+            self._fast_model = required(config.llm_fast_model, "LLM_FAST_MODEL")
+        self._provider: ChatProvider = provider or self._build_provider(config, client)
+
+    def _build_provider(self, config: Config, client: OpenAI | None) -> ChatProvider:
+        """The adapter this process asks for by configuration, built once.
+
+        `client=` stays the OpenAI-specific injection point every existing test uses; it is
+        shorthand for "wrap this SDK client", which is why passing it in Bedrock mode is a
+        configuration mistake rather than a silent provider switch.
+        """
+        if config.llm_provider == "bedrock":
+            if client is not None:
+                raise ValueError("client= is an OpenAI SDK client; LLM_PROVIDER is bedrock")
+            # Imported here rather than at module scope so that a process on the OpenAI path
+            # never constructs a botocore session, and so `import llm_client` stays free of
+            # boto3 - which is what keeps the offline suite from ever looking for an AWS
+            # credential, a profile, or an instance metadata service.
+            from bedrock import build_bedrock_provider
+
+            return build_bedrock_provider(
+                region=config.bedrock_region,
+                # The transport bound has to outlast the longest request the policy above will
+                # wait for, or botocore ends a call this client still considers live.
+                app_timeout_s=max(config.llm_main_timeout_s, _FAST_TIMEOUT_S),
+            )
+
         # The endpoint and the credential are narrowed on the same line as the models, and
         # only when this builds its own client: an injected one brought its own. Without it
         # the SDK raises `OpenAIError: Missing credentials`, which names `OPENAI_API_KEY` -
         # a variable this project does not have - instead of the one that is actually unset.
-        self._client = client or OpenAI(
+        sdk = client or OpenAI(
             base_url=required(config.llm_base_url, "LLM_BASE_URL"),
             api_key=required(config.llm_api_key, "LLM_API_KEY"),
             # The SDK retries by default. Left on, it would multiply every schedule in
@@ -266,7 +449,8 @@ class LLMClient:
             # One span per request, with the model, the latency, the provider's usage block,
             # and the exception if it raised. Gated on the config flag so the test suite's
             # injected fakes are never wrapped, and so tracing off costs nothing.
-            self._client = wrap_openai(self._client)
+            sdk = wrap_openai(sdk)
+        return OpenAIChatProvider(sdk)
 
     def call_structured(
         self,
@@ -276,24 +460,32 @@ class LLMClient:
         user: str,
         budget: CallBudget,
         tier: ModelTier = "main",
-        temperature: float | Omit = omit,
+        temperature: float | None = None,
     ) -> ModelT:
         """Ask for one JSON object, validate it against `schema`, and return it.
 
-        `temperature` defaults to the SDK's `omit`, so every agent's request is byte-for-byte the
-        one it has always sent and whatever the endpoint's own default is stays in force. It
-        exists for the offline evaluation judge (`eval/judge.py`), which asks for 0.0 because a
-        judge that scores the same report differently on two runs cannot be used to compare two
-        runs. No agent passes it, and nothing in the graph should: sampling is a property of the
-        endpoint and belongs in configuration, not in a node.
+        `temperature` defaults to None, meaning "send no temperature at all", so every agent's
+        request is byte-for-byte the one it has always sent and whatever the endpoint's own
+        default is stays in force. It exists for the offline evaluation judge (`eval/judge.py`),
+        which asks for 0.0 because a judge that scores the same report differently on two runs
+        cannot be used to compare two runs. No agent passes it, and nothing in the graph should:
+        sampling is a property of the endpoint and belongs in configuration, not in a node.
+
+        **The JSON contract is built here and not in an adapter**, which is what makes the
+        structured-output guarantee provider-independent: the same schema goes into the same
+        system prompt, the same single validation retry carries the same pydantic error back,
+        and the caller gets a validated instance of `schema` or `LLMCallFailed`. Bedrock's Nova
+        has no JSON mode to switch on, so there the prompt is the whole request-side
+        enforcement - and this validation is what makes that safe rather than hopeful
+        (ADR 0022 decision 4).
 
         Raises LLMCallFailed on every failure path. Never returns a partially valid
         object and never substitutes a default for a field the model did not produce: a
         wrong value survives into the report and looks deliberate (guidelines §3).
         """
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": _system_prompt(system, schema)},
-            {"role": "user", "content": user},
+        messages: list[ChatMessage] = [
+            ChatMessage("system", _system_prompt(system, schema)),
+            ChatMessage("user", user),
         ]
         last_error: ValidationError | None = None
 
@@ -313,11 +505,8 @@ class LLMClient:
                 if attempt < _VALIDATION_ATTEMPTS:
                     messages = [
                         *messages,
-                        {"role": "assistant", "content": raw},
-                        {
-                            "role": "user",
-                            "content": _VALIDATION_RETRY_PROMPT.format(errors=error),
-                        },
+                        ChatMessage("assistant", raw),
+                        ChatMessage("user", _VALIDATION_RETRY_PROMPT.format(errors=error)),
                     ]
                 continue
             return value
@@ -381,16 +570,21 @@ class LLMClient:
 
     def _send(
         self,
-        messages: list[ChatCompletionMessageParam],
+        messages: list[ChatMessage],
         *,
         budget: CallBudget,
         tier: ModelTier,
-        temperature: float | Omit = omit,
+        temperature: float | None = None,
     ) -> str:
         """One logical request, with the transport and 429 retries around it.
 
         The two retry counters are independent because their exhaustion behaviour differs:
         a rate-limited job fails, a flaky connection fails only the node.
+
+        **This loop is the only retry layer in the system, whichever provider answers.** The
+        OpenAI SDK's own retries are switched off in the adapter's client, and so are
+        botocore's in `bedrock.py`, for the same reason: two schedules multiply into an
+        attempt count nobody wrote down, spending budget nothing counted (ADR 0022 decision 7).
         """
         model = self._main_model if tier == "main" else self._fast_model
         transport_backoff = _TRANSPORT_BACKOFF_S[tier]
@@ -401,51 +595,42 @@ class LLMClient:
             budget.spend()
             self._take_a_token(model)
             try:
-                response = self._client.chat.completions.create(
-                    model=model,
+                return self._provider.complete(
                     messages=messages,
-                    response_format={"type": "json_object"},
+                    model=model,
                     timeout=self._timeout_for(tier),
-                    # `omit` is the SDK's "do not send this field", so the default path
-                    # produces exactly the request it produced before this parameter existed.
                     temperature=temperature,
                 )
-            except RateLimitError as error:
-                if rate_limit_retries == len(_RATE_LIMIT_BACKOFF_S):
-                    # A rate-limited job fails visibly. It does not silently produce a
-                    # shorter report (guidelines §13).
-                    raise LLMCallFailed(
-                        "rate_limited",
-                        f"{model} rate limited after {rate_limit_retries} retries",
-                    ) from error
-                delay = _retry_after(error)
-                if delay is None:
-                    delay = _RATE_LIMIT_BACKOFF_S[rate_limit_retries]
-                rate_limit_retries += 1
-                logger.warning("%s rate limited, retrying in %.1fs", model, delay)
-                sleep(delay)
-            except (InternalServerError, APITimeoutError, APIConnectionError) as error:
-                if transport_retries == len(transport_backoff):
-                    raise LLMCallFailed(
-                        "llm_call_failed",
-                        f"{model} unreachable after {transport_retries} retries: {error}",
-                    ) from error
-                delay = transport_backoff[transport_retries]
-                transport_retries += 1
-                logger.warning("%s call failed (%s), retrying in %.1fs", model, error, delay)
-                sleep(delay)
-            except APIStatusError as error:
-                # 4xx that is not a 429: a bad request, a bad key, an unknown model.
-                # Retrying cannot fix any of them, so fail now and say the status.
-                raise LLMCallFailed(
-                    "llm_call_failed",
-                    f"{model} rejected the request with status {error.status_code}",
-                ) from error
-            else:
-                content = response.choices[0].message.content if response.choices else None
-                # An empty completion is invalid output, not a transport problem: it goes
-                # to the validation retry, which is the layer that can ask again better.
-                return content or ""
+            except ProviderError as error:
+                if error.kind == "rate_limited":
+                    if rate_limit_retries == len(_RATE_LIMIT_BACKOFF_S):
+                        # A rate-limited job fails visibly. It does not silently produce a
+                        # shorter report (guidelines §13).
+                        raise LLMCallFailed(
+                            "rate_limited",
+                            f"{model} rate limited after {rate_limit_retries} retries",
+                        ) from error
+                    delay = error.retry_after
+                    if delay is None:
+                        delay = _RATE_LIMIT_BACKOFF_S[rate_limit_retries]
+                    rate_limit_retries += 1
+                    logger.warning("%s rate limited, retrying in %.1fs", model, delay)
+                    sleep(delay)
+                elif error.kind == "transport":
+                    if transport_retries == len(transport_backoff):
+                        raise LLMCallFailed(
+                            "llm_call_failed",
+                            f"{model} unreachable after {transport_retries} retries: {error}",
+                        ) from error
+                    delay = transport_backoff[transport_retries]
+                    transport_retries += 1
+                    logger.warning("%s call failed (%s), retrying in %.1fs", model, error, delay)
+                    sleep(delay)
+                else:
+                    # A bad credential, an unknown model, a malformed request, a denied
+                    # action. No schedule fixes any of them, so fail now and say what the
+                    # provider said.
+                    raise LLMCallFailed("llm_call_failed", str(error)) from error
 
 
 def _system_prompt(system: str, schema: type[BaseModel]) -> str:

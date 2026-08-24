@@ -2,10 +2,17 @@
 #     Everything an operator must decide, in one place, with the temporary-deployment default
 #     already chosen. Two rules run through it:
 #
-#     **A secret has no default.** `llm_api_key` and `tavily_api_key` are declared and never
-#     valued here, so `terraform apply` refuses to run without them and no credential can arrive
-#     by being forgotten. They are passed as `TF_VAR_*` environment variables
-#     (docs/deployment.md), which is also why `terraform.tfvars` is gitignored.
+#     **A secret has no default.** `tavily_api_key` is declared and never valued here, so
+#     `terraform apply` refuses to run without it and no credential can arrive by being
+#     forgotten. It is passed as a `TF_VAR_*` environment variable (docs/deployment.md), which
+#     is also why `terraform.tfvars` is gitignored.
+#
+#     **`llm_api_key` is the one exception and it is provider-conditional rather than lax**
+#     (docs/adr/0022-*.md). Under the default `llm_provider = "bedrock"` there is no LLM
+#     credential in this deployment at all - the worker task role carries `bedrock:InvokeModel`
+#     and boto3 signs with it - so an unconditional requirement would refuse an apply over a
+#     value nothing would ever read. It has a `validation` block that fires in `openai` mode,
+#     which is the same refusal placed where it is actually true.
 #
 #     **`db_password` is gone entirely**, and that is Block B's largest single improvement to
 #     state exposure: RDS generates the master password and holds it in a secret it owns, so
@@ -294,28 +301,146 @@ variable "redis_memory_alarm_percent" {
   default     = 80
 }
 
-# --- What the worker needs to call a model -------------------------------------------------
+# --- Which model provider the worker calls, and what that provider needs ---------------------
+#
+# **This is the one variable that decides whether an LLM credential exists in this deployment
+# at all** (docs/adr/0022-*.md). Under `bedrock` there is no endpoint, no key, and no Secrets
+# Manager entry for a model provider: the worker's task role carries `bedrock:InvokeModel` and
+# boto3 signs with it. Under `openai` the four `llm_*` variables below are what they always
+# were.
+#
+# The two sets are alternatives and never requirements at the same time. Every `llm_*` variable
+# is therefore optional with a validation that fires **only** in `openai` mode, which is what
+# makes `terraform apply` and `terraform destroy` work in Bedrock mode with none of them set -
+# the condition Block A got wrong by declaring `llm_base_url`, `llm_model` and `llm_api_key`
+# required unconditionally.
+
+variable "llm_provider" {
+  description = <<-EOT
+    Which model endpoint the worker talks to, and **only one is live at a time**
+    (docs/adr/0022-*.md decision 2). `bedrock` is the default for this deployment: Amazon
+    Bedrock's Converse API against Amazon Nova, authorized by the worker task role, with no key
+    anywhere. `openai` keeps the OpenAI-compatible path, which is what every local command and
+    the whole offline suite still use - config.py's own default is `openai` and is untouched.
+
+    There is deliberately no fallback from one to the other. A worker that failed over would
+    spend on two providers under two sets of semantics for a failure the retry schedules in
+    guidelines section 17 already bound.
+  EOT
+  type        = string
+  default     = "bedrock"
+
+  validation {
+    condition     = contains(["bedrock", "openai"], var.llm_provider)
+    error_message = "llm_provider must be bedrock or openai."
+  }
+}
+
+variable "bedrock_model_id" {
+  description = <<-EOT
+    What `bedrock-runtime.converse` is asked for: `modelId`. Either kind of identifier works -
+    a foundation model id such as `amazon.nova-pro-v1:0`, or a cross-region inference profile
+    id such as `apac.amazon.nova-pro-v1:0`.
+
+    **The default is the APAC cross-region Nova Pro profile, and it must be verified before the
+    first apply**, because in-region availability of a foundation model is an account-and-region
+    fact that no Terraform configuration can assert. docs/deployment.md carries the one AWS CLI
+    command that answers it. A wrong value here is a `ValidationException` or an
+    `AccessDeniedException` on the first job, not a failed apply.
+
+    Read only when llm_provider is `bedrock`.
+  EOT
+  type        = string
+  default     = "apac.amazon.nova-pro-v1:0"
+}
+
+variable "bedrock_region" {
+  description = <<-EOT
+    Where the Bedrock runtime endpoint lives. Empty means `var.region`, which is what this
+    deployment uses; it exists because model availability differs by region, so a deployment may
+    have to call Bedrock somewhere its queue and bucket are not.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "bedrock_inference_profile_regions" {
+  description = <<-EOT
+    The Regions a cross-region inference profile may route a request to, so the worker's IAM
+    policy can name the foundation model in each of them.
+
+    **This exists because of how Bedrock authorizes cross-region inference**: invoking through a
+    profile is checked against the profile *and* against the foundation model in whichever
+    Region the request lands in, and the destination list is a property of the profile that no
+    Terraform data source here reads. The alternative to naming them is `Resource = "*"`, which
+    is exactly what docs/adr/0022-*.md decision 9 refuses.
+
+    Empty means in-Region only, which is correct for a plain foundation model id. Find a
+    profile's destinations with the `get-inference-profile` command in docs/deployment.md and
+    paste the Regions here.
+  EOT
+  type        = list(string)
+  default     = []
+}
 
 variable "llm_base_url" {
-  description = "OpenAI-compatible endpoint. Worker-only (ADR 0012); the API never sees it."
+  description = <<-EOT
+    OpenAI-compatible endpoint. Worker-only (ADR 0012); the API never sees it.
+
+    **Required only when llm_provider is `openai`**, and empty otherwise: under Bedrock there is
+    no endpoint to name.
+  EOT
   type        = string
+  default     = ""
+
+  validation {
+    condition     = var.llm_provider != "openai" || trimspace(var.llm_base_url) != ""
+    error_message = "llm_base_url is required when llm_provider is openai."
+  }
 }
 
 variable "llm_model" {
-  description = "Main model id - planning, extraction, writing, fact-checking."
+  description = <<-EOT
+    Main model id - planning, extraction, writing, fact-checking. Required only when
+    llm_provider is `openai`; under Bedrock the model is `bedrock_model_id`.
+  EOT
   type        = string
+  default     = ""
+
+  validation {
+    condition     = var.llm_provider != "openai" || trimspace(var.llm_model) != ""
+    error_message = "llm_model is required when llm_provider is openai."
+  }
 }
 
 variable "llm_fast_model" {
-  description = "Routing and scoring model id. Empty falls back to llm_model, as config.py does."
+  description = <<-EOT
+    Routing and scoring model id. Empty falls back to llm_model, as config.py does. Read only
+    when llm_provider is `openai`: Bedrock mode sends both tiers to `bedrock_model_id`.
+  EOT
   type        = string
   default     = ""
 }
 
 variable "llm_api_key" {
-  description = "LLM credential. **No default.** Worker-only."
+  description = <<-EOT
+    LLM credential. Worker-only, and **required only when llm_provider is `openai`**.
+
+    In Bedrock mode it must stay empty and no secret is created for it: authorization is
+    `bedrock:InvokeModel` on the worker task role, so there is nothing here for a key to
+    authenticate (docs/adr/0022-*.md decision 3). That is why this variable has a default at
+    all - the rule elsewhere in this file is that a secret has none, and the exception is
+    stated rather than snuck in, because the alternative is an apply that refuses to run
+    without a credential the deployment will never use.
+  EOT
   type        = string
   sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.llm_provider != "openai" || trimspace(var.llm_api_key) != ""
+    error_message = "llm_api_key is required when llm_provider is openai."
+  }
 }
 
 variable "tavily_api_key" {

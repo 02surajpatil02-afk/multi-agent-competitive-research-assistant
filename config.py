@@ -32,6 +32,20 @@ from dotenv import load_dotenv
 
 AppEnv = Literal["local", "dev", "prod"]
 
+LLMProvider = Literal["openai", "bedrock"]
+"""Which endpoint the worker's `LLMClient` talks to, and deliberately not both at once.
+
+`openai` is the Phase 1 path and stays the default, so every local command, the whole offline
+suite and `scripts/measure_jobs.py` behave exactly as before: an OpenAI-compatible base URL, a
+model id and an API key. `bedrock` is the AWS deployment's mode - Amazon Bedrock's Converse API
+against Amazon Nova, authenticated by the ECS task role rather than by a key.
+
+**One provider is live per process, and there is no fallback between them.** A client that tried
+Bedrock and then OpenAI would spend money on two providers for one call, on two sets of semantics,
+for a failure the retry schedules in guidelines section 17 already bound. Which provider runs is
+configuration (ADR 0022 decision 2).
+"""
+
 AuthMode = Literal["api_key", "cognito"]
 """Which credential the API accepts, and deliberately not both at once (ADR 0020 decision 2).
 
@@ -68,8 +82,17 @@ class Config:
     normal thing to do at startup - cannot leak a credential (guidelines §16).
     """
 
-    # LLM. One OpenAI-compatible client covers development and production, so there is no
-    # provider class and no provider abstraction (ARCHITECTURE.md §20 row 4).
+    # LLM. Two providers behind one client contract since ADR 0022: an OpenAI-compatible
+    # endpoint, and Amazon Bedrock's Converse API. The agents see neither - they call
+    # `LLMClient.call_structured` and get a validated Pydantic object either way.
+    llm_provider: LLMProvider
+    """Which of the two endpoints this process's `LLMClient` will use. See `LLMProvider` above.
+
+    It decides which of the fields below are read at all: `openai` reads the four `llm_*` ones,
+    `bedrock` reads `bedrock_model_id` and `bedrock_region` and **needs no credential of its own**
+    - boto3's ordinary provider chain finds the ECS task role. Nothing reads both sets.
+    """
+
     llm_base_url: str | None
     llm_model: str | None
     llm_fast_model: str | None  # routing and reflection scoring only; falls back to llm_model
@@ -101,6 +124,31 @@ class Config:
     number stays where every reader of guidelines §17 expects to find it. The fast tier is
     deliberately not configurable: the Supervisor and the reflection node send counters and
     receive a handful of tokens, so no plausible generation speed makes 30s tight.
+    """
+
+    bedrock_model_id: str | None
+    """What `bedrock-runtime.converse` is asked for: `modelId`.
+
+    **One value, and it may be either kind of identifier** - a foundation model id such as
+    `amazon.nova-pro-v1:0`, or a cross-region inference profile id such as
+    `apac.amazon.nova-pro-v1:0`. Converse takes both in the same field, so nothing here has to
+    know which it was given, and model routing stays AWS's business rather than this
+    application's (ADR 0022 decision 5).
+
+    **It is one id for both tiers.** The OpenAI path has a cheap `LLM_FAST_MODEL` for Supervisor
+    routing and reflection scoring; Bedrock mode sends every call to this model. That is a cost
+    difference rather than a behaviour difference - the tier still picks the timeout and the
+    backoff schedule - and adding a second variable is a decision for a deployment that has
+    measured the first one.
+    """
+
+    bedrock_region: str
+    """Where the Bedrock runtime endpoint lives. Falls back to `aws_region`.
+
+    Separate from `aws_region` only because it can be: model availability differs by region, so a
+    deployment may have to call Bedrock somewhere its queue and bucket are not. It is not a
+    credential and never has been - `boto3` signs with the task role's credentials, and the region
+    only picks the endpoint.
     """
 
     # External research tool. Optional for the same reason the four above are: the API never
@@ -279,6 +327,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         raise ValueError("LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true")
 
     return Config(
+        llm_provider=_llm_provider(source),
         llm_base_url=_optional(source, "LLM_BASE_URL"),
         llm_model=llm_model,
         # CLAUDE.md: falls back to LLM_MODEL. The two-tier split is an optimisation, so a
@@ -288,6 +337,9 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         llm_rpm_limit=_int(source, "LLM_RPM_LIMIT", default=40),
         # guidelines §17's main-tier row. Overridden only where the endpoint is slow.
         llm_main_timeout_s=_float(source, "LLM_MAIN_TIMEOUT_S", default=60.0),
+        bedrock_model_id=_optional(source, "BEDROCK_MODEL_ID"),
+        # The Bedrock runtime endpoint's region, which is normally the deployment's.
+        bedrock_region=_optional(source, "BEDROCK_REGION") or aws_region,
         tavily_api_key=_optional(source, "TAVILY_API_KEY"),
         database_url=resolve_database_url(source),
         redis_url=_optional(source, "REDIS_URL") or "redis://localhost:6379/0",
@@ -438,6 +490,20 @@ def _researcher_concurrency(env: Mapping[str, str]) -> int:
             f"{MAX_RESEARCHER_CONCURRENCY}, got {value}"
         )
     return value
+
+
+def _llm_provider(env: Mapping[str, str]) -> LLMProvider:
+    """Which LLM endpoint this process talks to. Refused loudly rather than defaulted quietly.
+
+    The same rule `_auth_mode` follows, for the same reason: a typo would silently select the
+    other provider, and "the worker spent an hour calling the endpoint nobody configured" is not
+    a failure worth discovering from a bill. `openai` is the default, so a checkout with no
+    `LLM_PROVIDER` set behaves exactly as it did before this existed.
+    """
+    value = env.get("LLM_PROVIDER", "").strip() or "openai"
+    if value not in ("openai", "bedrock"):
+        raise ValueError(f"LLM_PROVIDER must be openai or bedrock, got {value!r}")
+    return cast(LLMProvider, value)
 
 
 def _auth_mode(env: Mapping[str, str]) -> AuthMode:

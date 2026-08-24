@@ -23,11 +23,15 @@
 #     | Role | May fetch |
 #     |---|---|
 #     | `api` execution | the RDS-managed database credential; the auth-keys secret **only in api_key mode** |
-#     | `worker` execution | the database credential, the LLM key, the search key |
+#     | `worker` execution | the database credential, the search key, and the LLM key **only in openai mode** |
 #     | `migrate` execution | the database credential, and nothing else |
 #     | `api` task | send a message to this queue; sign for objects under `reports/` |
-#     | `worker` task | receive, delete and extend a message on this queue; write objects under `reports/` |
+#     | `worker` task | receive, delete and extend a message on this queue; write objects under `reports/`; invoke the configured Bedrock model **only in bedrock mode** |
 #     | `migrate` task | **there is none** - a migration talks to PostgreSQL and to nothing AWS |
+#
+#     **The worker task role is the only identity in this deployment that may call a model**, and
+#     under `llm_provider = "bedrock"` that permission is the whole of the model credential - there
+#     is no key, in the task definition or in Secrets Manager (docs/adr/0022-*.md decision 3).
 #
 #     **No wildcard resource appears anywhere below**, and no `s3:*`, `sqs:*` or
 #     `secretsmanager:*`. Every statement names its actions one at a time and scopes them to a
@@ -98,11 +102,17 @@ locals {
       local.db_secret_arn,
       aws_secretsmanager_secret.auth_keys[0].arn,
     ]
-    worker = [
-      local.db_secret_arn,
-      aws_secretsmanager_secret.llm_api_key.arn,
-      aws_secretsmanager_secret.tavily_api_key.arn,
-    ]
+    # **The LLM key is in this list only when it exists.** Under the default
+    # `llm_provider = "bedrock"` no such secret is created, so the worker's task-start identity
+    # is granted the database credential and the search key and nothing else - and there is no
+    # stale permission left pointing at a secret that is not there (docs/adr/0022-*.md).
+    worker = concat(
+      [
+        local.db_secret_arn,
+        aws_secretsmanager_secret.tavily_api_key.arn,
+      ],
+      local.bedrock_enabled ? [] : [aws_secretsmanager_secret.llm_api_key[0].arn],
+    )
     migrate = [
       local.db_secret_arn,
     ]
@@ -315,4 +325,46 @@ resource "aws_iam_role_policy" "worker" {
   name   = "${local.name}-worker-task"
   role   = aws_iam_role.worker.id
   policy = data.aws_iam_policy_document.worker.json
+}
+
+# --- The worker's Bedrock permission, and only the worker's (ADR 0022) --------------------------
+#
+# **A separate policy with a `count` rather than a statement inside the document above**, because
+# the grant is conditional and the condition is the provider. In `openai` mode this resource does
+# not exist at all, so the worker task role carries no Bedrock permission - which is what makes
+# "which provider is live" a single variable rather than a variable plus a policy nobody
+# remembered to remove.
+#
+# **`bedrock:InvokeModel` and nothing else.** `bedrock.py` calls `converse`, which is authorized
+# by `InvokeModel`. `bedrock:InvokeModelWithResponseStream` is deliberately absent: nothing here
+# calls `ConverseStream`, and granting a permission "for completeness" is how a least-privilege
+# policy stops being one. Neither is `bedrock:ListFoundationModels` - discovering a model is an
+# operator's job with their own credentials, not the worker's, and `BEDROCK_MODEL_ID` is how the
+# answer reaches the task.
+#
+# **The API, the migration and the ops task get none of this.** The API constructs no LLM client
+# (ADR 0012), a migration talks only to PostgreSQL, and the four recovery scripts re-project rows
+# and move messages - `tests/test_infrastructure_terraform.py` fails if any of the three gains a
+# Bedrock action.
+#
+# The resource list is `local.bedrock_invoke_arns` (versions.tf), which names the inference
+# profile in this account and the foundation model in each destination Region. It is never `*`.
+
+data "aws_iam_policy_document" "worker_bedrock" {
+  count = local.bedrock_enabled ? 1 : 0
+
+  statement {
+    sid       = "InvokeTheConfiguredNovaModel"
+    effect    = "Allow"
+    actions   = ["bedrock:InvokeModel"]
+    resources = local.bedrock_invoke_arns
+  }
+}
+
+resource "aws_iam_role_policy" "worker_bedrock" {
+  count = local.bedrock_enabled ? 1 : 0
+
+  name   = "${local.name}-worker-bedrock"
+  role   = aws_iam_role.worker.id
+  policy = data.aws_iam_policy_document.worker_bedrock[0].json
 }

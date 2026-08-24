@@ -136,7 +136,8 @@ application image, no CI and no AWS.
 ### Eventual AWS production shape (Phase 5)
 
 API Gateway → FastAPI on ECS Fargate → SQS → worker on ECS Fargate → RDS PostgreSQL, ElastiCache
-Redis, S3, an OpenAI-compatible LLM endpoint, Tavily behind the tool boundary, LangSmith for agent
+Redis, S3, an LLM endpoint — Amazon Bedrock in the deployment, OpenAI-compatible locally — Tavily behind
+the tool boundary, LangSmith for agent
 traces, CloudWatch for infrastructure health. Detail in §18. No service appears there that is not in
 the CLAUDE.md stack table. **None of it is deployed.**
 
@@ -189,7 +190,7 @@ flowchart TD
     WORKER -->|"checkpoint per node, persist facts"| PG
     WORKER -->|"cache, URL dedupe, shared rate limiter"| REDIS[("Redis")]
     WORKER -->|"validated tool calls"| MCP["MCP tool layer<br/>search - Tavily, fetch"]
-    WORKER -->|"one OpenAI-compatible client"| LLM["LLM endpoint<br/>LLM_MODEL and LLM_FAST_MODEL"]
+    WORKER -->|"one client, one provider"| LLM["LLM endpoint<br/>Bedrock Converse + Nova, or OpenAI-compatible"]
     WORKER -->|"write artifact after export gate"| S3
     WORKER -->|"graph, agent, tool, token traces"| LS["LangSmith<br/>what did the agents do"]
 
@@ -2586,7 +2587,7 @@ saturate the development tier.** That is a development constraint to plan around
 | **Batching** | Fact-Checker: all claims in **one** call per pass | A contract in gl §2.5, tested as a contract |
 | **Model tiers** | `LLM_FAST_MODEL` for the Supervisor and the reflection node; `LLM_MODEL` for everything else | Config, not code |
 | **Caching** | Redis `cache:search:*`, `cache:fetch:*`, 24h TTL | In the MCP tool layer, so both agents get it for free. Hits and misses logged |
-| **429 backoff** | The single OpenAI-compatible LLM client | Initial request + 3 retries; numeric `Retry-After` capped at 30s, otherwise 2s/8s/30s, then fail the job |
+| **429 backoff** | The single LLM client, whichever provider answers | Initial request + 3 retries; numeric `Retry-After` capped at 30s, otherwise 2s/8s/30s, then fail the job. Bedrock's `ThrottlingException` is classified into the same path (ADR 0022 decision 7) |
 | **Input size cap** | `MAX_PAGE_CHARS` = 24,000, applied at fetch | Caps the token cost of a Researcher call before the call is made |
 | **In-job concurrency** | `RESEARCHER_CONCURRENCY` = 3, checked at startup (ADR 0002) | The Researcher's extraction pool. **The only bound on how many requests one job holds open until the shared limiter arrives in Phase 3** |
 
@@ -2857,7 +2858,7 @@ flowchart TD
     WSVC --> EC[("ElastiCache Redis<br/>cache, URL dedupe,<br/>shared rate limiter")]
     WSVC --> S3B
     WSVC --> SM
-    WSVC --> NIM["LLM endpoint<br/>OpenAI-compatible"]
+    WSVC --> NIM["Amazon Bedrock<br/>Converse + Nova Pro<br/>(task role, no key)"]
     WSVC --> TAV["Tavily, via the tool boundary"]
     WSVC --> LSMITH["LangSmith<br/>agent and LLM traces"]
 
@@ -3015,7 +3016,7 @@ are choices this document had to make; they are listed again in §22 for confirm
 | 2 | **Supervisor routes on structured state only** | It is the structural defense against prompt injection reaching control flow | Routing cannot use nuance that only appears in the text |
 | 2a | **[ADR 0001]** The Supervisor's LLM call is **advisory**; `allowed_target(state)` is authoritative | The route returned was always `allowed_target(state)`, so the model could only agree or kill the job — and it killed the first two real jobs, with two different fast models. Strengthens row 2: the one component an injected page could influence now has no authority | 6–12 fast-tier calls per job that cannot change behaviour, kept deliberately so the disagreement rate can be measured before deciding to remove them |
 | 3 | **Reflection routes by failed dimension, not a blind rerun** | Rerunning the whole pipeline wastes correct work and burns the call budget | A scoring bug sends work to the wrong specialist; capped by `MAX_REVISIONS` |
-| 4 | **One OpenAI-compatible client, no provider classes** | NIM and the production API are both OpenAI-compatible. Swapping a model is a config change plus a preflight plus an eval run | If a non-compatible provider is ever needed, that is a real change — accepted |
+| 4 | **One client contract, two providers behind it** | Originally *"one OpenAI-compatible client, no provider classes"*, because NIM and the production API speak the same protocol. **Narrowed by [ADR 0022](adr/0022-amazon-bedrock-as-the-deployments-llm-provider.md) on 2026-08-24**, when the non-compatible provider this row anticipated actually arrived: Amazon Bedrock's Converse API. `call_structured` is unchanged and no agent knows which endpoint answered; what exists now is a `ChatProvider` Protocol **one method wide**, with the budget, the shared limiter, both backoff schedules and the single validation retry still in `LLMClient`. Swapping a model is still a config change plus a preflight plus an eval run | The trade this row accepted in advance, taken. Two implementations of one Protocol, selected by `LLM_PROVIDER`, with **no fallback between them** — accepted |
 | 5 | **Two model tiers** | Routing and scoring do not need the main model | Trims the edges, not the bulk. Stated openly rather than oversold |
 | 6 | **LangGraph with a Postgres checkpointer** | The human gate can hold a job for days; in-memory state dies with the worker and re-bills every LLM call | A database dependency for a graph that would otherwise be in-process |
 | 7 | **SQS between the API and the worker** | Research takes minutes; an HTTP request cannot hold that connection | At-least-once delivery, so idempotency is mandatory |
@@ -3097,7 +3098,7 @@ Phase 2 followed and is also complete (steps 13–19, closed 2026-08-16). **Phas
 | 3 | **Configuration** — env-var loading, defaults from CLAUDE.md's table, no config framework | 2 | **Done.** `config.py` |
 | 4 | **Pydantic schemas** — `SupervisorDecision`, `ResearchPlan`, `Finding`, `Report`, `Verdict`, `ReflectionScore`, `SearchResult` | 3 | **Done.** `schemas.py`, plus `FetchedPage` for the fetch path |
 | 5 | **`ResearchState`** + reducers + `thread_id = job_id` | 4 | **Done.** `graph/state.py` |
-| 6 | **LLM client** — one OpenAI-compatible client, structured output + one validation retry, timeouts, 429 backoff, per-job call counting | 3, 4 | **Done.** `llm_client.py`, with `scripts/check_model.py` as the preflight |
+| 6 | **LLM client** — one contract, structured output + one validation retry, timeouts, 429 backoff, per-job call counting | 3, 4 | **Done.** `llm_client.py`, with `scripts/check_model.py` as the preflight for the OpenAI-compatible path. Two providers behind it since ADR 0022: `OpenAIChatProvider` and `bedrock.BedrockConverseProvider` |
 | 7 | **Tavily tool boundary** — argument validation, SSRF checks, timeouts, retries, size limits, normalization. **Cache and dedupe interfaces defined, Redis wired in step 21** | 4, 6 | **Done.** `tools/`, in-process — no MCP protocol hop (§7) |
 | 8 | **The five agents**, one module each, in contract order: Planner → Researcher → Synthesizer → Fact-Checker → Supervisor | 5, 6, 7 | **Done.** `agents/` |
 | 9 | **Reflection node** — rubric prompt, code-side weighting, threshold, targeted route selection, **draft invalidation on a Researcher route**, and the `unscored` failure path | 5, 8 | **Done.** `graph/reflection.py` |

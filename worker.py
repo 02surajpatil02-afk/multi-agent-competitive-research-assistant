@@ -69,12 +69,11 @@ from types import FrameType
 from typing import Any, cast
 
 from langgraph.types import Command
-from openai import OpenAI
 from redis import Redis
 from sqlalchemy.engine import Engine
 
 from artifacts import build_artifact_store
-from config import Config, load_config, required
+from config import Config, LLMProvider, load_config, required
 from database import locks as database_locks
 from database import queries
 from database.queries import QUERY_TIMEOUT_MS, create_database_engine
@@ -1108,44 +1107,68 @@ def check_queue(queue: JobQueue) -> QueueSettings:
 
 @dataclass(frozen=True)
 class Credentials:
-    """The seven variables this process cannot start without, narrowed once (ADR 0012 dec 4).
+    """The variables this process cannot start without, narrowed once (ADR 0012 dec 4).
 
-    They are optional on `Config` so the **API** can start with none of the last four set -
+    They are optional on `Config` so the **API** can start with none of the LLM ones set -
     that is what makes guidelines §13's least-privilege table a property of the code. The
     consequence is that each process has to state what it needs, and this is the worker's
-    statement: it runs the graph, so it assumes an LLM, a web-search key, a database, a queue
+    statement: it runs the graph, so it assumes a model, a web-search key, a database, a queue
     and a bucket, and it says so at startup rather than at the first job.
 
     **`S3_BUCKET` joined the list in step 22a**, because the export node now writes an
     artifact. Discovering a missing bucket at export time would mean failing a job that had
     already paid for its whole pipeline, which is the failure this whole function exists to
     move to startup.
+
+    **Which model variables are required depends on `LLM_PROVIDER`** (ADR 0022 decision 6), and
+    that is the point of the split below rather than an exception to it. The first four are
+    required in either mode. Under `openai` the endpoint, the key and the model id join them,
+    exactly as before. Under `bedrock` **there is no LLM credential at all** - boto3 signs with
+    the ECS task role - so what is required is the model id, and asking for `LLM_API_KEY` would
+    be demanding a value that has nothing to authenticate against.
     """
 
     database_url: str
     queue_url: str
     s3_bucket: str
-    llm_base_url: str
-    llm_api_key: str
-    llm_model: str
     tavily_api_key: str
+
+    llm_provider: LLMProvider
+
+    # openai mode only; all three are None under bedrock.
+    llm_base_url: str | None = None
+    llm_api_key: str | None = field(default=None, repr=False)
+    llm_model: str | None = None
+
+    # bedrock mode only; None under openai.
+    bedrock_model_id: str | None = None
 
 
 def required_credentials(config: Config) -> Credentials:
-    """Narrow all seven loudly, naming the first one that is missing.
+    """Narrow every variable this provider needs, naming the first one that is missing.
 
     Separate from `main()` so the statement can be tested without opening a connection pool -
     "which variables does the worker refuse to start without?" is a question worth a test, and
     an entrypoint that has already built half a process is not where it can be asked.
     """
+    common = {
+        "database_url": required(config.database_url, "DATABASE_URL"),
+        "queue_url": required(config.sqs_queue_url, "SQS_QUEUE_URL"),
+        "s3_bucket": required(config.s3_bucket, "S3_BUCKET"),
+        "tavily_api_key": required(config.tavily_api_key, "TAVILY_API_KEY"),
+    }
+    if config.llm_provider == "bedrock":
+        return Credentials(
+            **common,
+            llm_provider="bedrock",
+            bedrock_model_id=required(config.bedrock_model_id, "BEDROCK_MODEL_ID"),
+        )
     return Credentials(
-        database_url=required(config.database_url, "DATABASE_URL"),
-        queue_url=required(config.sqs_queue_url, "SQS_QUEUE_URL"),
-        s3_bucket=required(config.s3_bucket, "S3_BUCKET"),
+        **common,
+        llm_provider="openai",
         llm_base_url=required(config.llm_base_url, "LLM_BASE_URL"),
         llm_api_key=required(config.llm_api_key, "LLM_API_KEY"),
         llm_model=required(config.llm_model, "LLM_MODEL"),
-        tavily_api_key=required(config.tavily_api_key, "TAVILY_API_KEY"),
     )
 
 
@@ -1199,9 +1222,13 @@ def main() -> int:  # pragma: no cover - the entrypoint itself; its parts are te
         stack.callback(redis.close)
         # The worker is the only process that calls a model, so it is the only one that holds
         # the limiter - and the limiter is the reason `redis` is not optional here (§11).
+        #
+        # **The client builds its own provider from the configuration** (ADR 0022). This used
+        # to construct an `OpenAI` here and hand it over, which was the same narrowing
+        # `LLMClient` already does one line later - and which would now have to grow a second
+        # branch for Bedrock in the one file that should not know there are two.
         llm = LLMClient(
             config,
-            client=OpenAI(base_url=credentials.llm_base_url, api_key=credentials.llm_api_key),
             limiter=RedisRateLimiter(redis, requests_per_minute=config.llm_rpm_limit),
         )
         deps = WorkerDeps(
@@ -1229,7 +1256,12 @@ def main() -> int:  # pragma: no cover - the entrypoint itself; its parts are te
             # is already recorded by the time the loop first looks.
             shutdown=shutdown,
         )
-        logger.info("worker ready on %s, redis at %s", credentials.queue_url, config.redis_url)
+        logger.info(
+            "worker ready on %s, redis at %s, llm provider %s",
+            credentials.queue_url,
+            config.redis_url,
+            credentials.llm_provider,
+        )
         run(deps)
 
     return 0

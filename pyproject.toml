@@ -70,7 +70,9 @@ dependencies = [
     # client for the FIFO attributes ADR 0010 depends on - MessageGroupId, the deduplication id
     # and the redrive policy - and by working unchanged against LocalStack, which is what makes
     # the local integration tests worth running. `jobqueue.py` is the only module that imports
-    # it; S3 joins the same client in a later stage.
+    # it; S3 joins the same client in a later stage, and Bedrock Runtime in `bedrock.py`
+    # since ADR 0022 - which is why adding Amazon Nova as a provider added no dependency
+    # at all, and why Bedrock mode needs no key: boto3 signs with the ECS task role.
     "boto3==1.43.72",
     # Cognito access-token verification (Phase 5 block B, ADR 0020). It earns its place by
     # being the one thing here that must not be hand-written: an RS256 JWT is an RSA
@@ -128,6 +130,7 @@ build-backend = "setuptools.build_meta"
 py-modules = [
     "app",
     "artifacts",
+    "bedrock",
     "config",
     "jobqueue",
     "llm_client",
@@ -183,9 +186,10 @@ strict = true
 module = "tavily.*"
 ignore_missing_imports = true
 
-# boto3 and botocore ship no py.typed marker either. jobqueue.py is the only module that
-# imports them, and it converts every response into a JobMessage or a plain dict immediately,
-# so the untyped surface stops at that one boundary - the same argument as tavily above.
+# boto3 and botocore ship no py.typed marker either. jobqueue.py, artifacts.py and bedrock.py
+# are the only modules that import them, and each converts every response into a typed value
+# immediately - a JobMessage, an object key, one string of model output - so the untyped surface
+# stops at those boundaries. The same argument as tavily above.
 [[tool.mypy.overrides]]
 module = ["boto3.*", "botocore.*"]
 ignore_missing_imports = true

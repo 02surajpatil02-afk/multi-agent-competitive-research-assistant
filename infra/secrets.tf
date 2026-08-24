@@ -7,10 +7,15 @@
 #     start and the application still reads a plain environment variable
 #     (docs/adr/0020-*.md decision 1).
 #
-#     **Three secrets, one per independent credential, and no blob.** A single JSON secret
-#     holding everything would mean the API's execution role could read the LLM key in order to
-#     read the auth table - the exact separation ADR 0012 exists to preserve. Each of these is
-#     granted to exactly the roles that need it in iam.tf.
+#     **One secret per independent credential, and no blob.** A single JSON secret holding
+#     everything would mean the API's execution role could read the LLM key in order to read the
+#     auth table - the exact separation ADR 0012 exists to preserve. Each of these is granted to
+#     exactly the roles that need it in iam.tf.
+#
+#     **How many there are depends on the deployment, and both counts are deliberate.** The
+#     search key is always here. The auth key table exists only in `api_key` mode. The LLM key
+#     exists only in `openai` mode - the default deployment calls Amazon Bedrock and holds **no
+#     model-provider credential at all** (docs/adr/0022-*.md).
 #
 #     **The database password is not here**, and its absence is the point. RDS generates and
 #     holds it itself (`manage_master_user_password` in data_stores.tf), so it never passes
@@ -42,8 +47,20 @@ locals {
 }
 
 # --- The worker's provider credentials ---------------------------------------------------------
+#
+# **The LLM key exists only when there is an LLM key**, which under the default
+# `llm_provider = "bedrock"` there is not (docs/adr/0022-*.md decision 3). Bedrock is authorized
+# by IAM: the worker's *task* role carries `bedrock:InvokeModel` and boto3 signs with it, so
+# there is no value to store, nothing for the execution role to fetch, and no empty placeholder
+# secret pretending otherwise. An empty secret would be worse than none - it would make
+# `terraform apply` succeed and the worker crash-loop on a credential that was never needed.
+#
+# The search key below is unconditional, because Tavily is a real third-party API with a real key
+# whichever model answers.
 
 resource "aws_secretsmanager_secret" "llm_api_key" {
+  count = local.bedrock_enabled ? 0 : 1
+
   name                    = "${local.name}/llm-api-key"
   description             = "LLM_API_KEY for the worker. The API never receives this (ADR 0012)."
   recovery_window_in_days = local.secret_recovery_window_days
@@ -52,7 +69,9 @@ resource "aws_secretsmanager_secret" "llm_api_key" {
 }
 
 resource "aws_secretsmanager_secret_version" "llm_api_key" {
-  secret_id     = aws_secretsmanager_secret.llm_api_key.id
+  count = local.bedrock_enabled ? 0 : 1
+
+  secret_id     = aws_secretsmanager_secret.llm_api_key[0].id
   secret_string = var.llm_api_key
 
   lifecycle {

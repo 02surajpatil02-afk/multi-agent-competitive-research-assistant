@@ -4,8 +4,8 @@
 # **Prefer the environment over this file.** Every variable below can be supplied as
 # `TF_VAR_<name>`, which keeps the credential out of the working tree entirely:
 #
-#     export TF_VAR_llm_api_key='...'          # PowerShell: $env:TF_VAR_llm_api_key = '...'
-#     export TF_VAR_tavily_api_key='...'
+#     export TF_VAR_tavily_api_key='...'       # PowerShell: $env:TF_VAR_tavily_api_key = '...'
+#     export TF_VAR_llm_api_key='...'          # only when llm_provider = "openai"
 #
 # Copy to terraform.tfvars only if you would rather keep them in a file, and delete it after the
 # teardown.
@@ -21,13 +21,46 @@
 # cannot name one.
 image_tag = "REPLACE-WITH-COMMIT-SHA"
 
-# The worker's model endpoint. The API never receives these (ADR 0012).
-llm_base_url = "https://REPLACE-ME/v1"
-llm_model    = "REPLACE-ME"
-llm_api_key  = "REPLACE-ME"
-
-# The worker's search credential.
+# The worker's search credential. Required whichever model provider answers.
 tavily_api_key = "REPLACE-ME"
+
+# --- The model provider: Bedrock by default, and the two sets are alternatives ----------------
+#
+# **Under the default there is nothing to fill in and no credential at all.** The worker calls
+# Amazon Bedrock's Converse API against Amazon Nova, and the worker task role's
+# `bedrock:InvokeModel` is the whole of the authentication - no key here, none in Secrets
+# Manager, and none in the task definition (docs/adr/0022-*.md).
+#
+# **Verify the model id against your account and Region before the first apply.** In-Region
+# availability of a foundation model is an account fact no Terraform configuration can assert;
+# docs/deployment.md carries the one `aws bedrock list-inference-profiles` command that answers
+# it, and a wrong value is an error on the first job rather than a failed apply.
+#
+# llm_provider     = "bedrock"
+# bedrock_model_id = "apac.amazon.nova-pro-v1:0"
+# bedrock_region   = ""            # empty means var.region
+
+# The Regions a cross-region inference profile may route to, so the worker's IAM policy can name
+# the foundation model in each of them. **Leaving this empty grants the model in this Region
+# only**, which is right for a plain foundation model id and wrong for a profile that routes
+# elsewhere - the symptom is an AccessDeniedException on some jobs and not others. Read the
+# profile's own destination list with the `get-inference-profile` command in
+# docs/deployment.md.
+#
+# bedrock_inference_profile_regions = ["ap-south-1", "ap-northeast-1", "ap-southeast-1"]
+
+# --- The OpenAI-compatible alternative --------------------------------------------------------
+#
+# **Only when `llm_provider = "openai"`, and then all three are required** - the validations in
+# variables.tf refuse an apply that sets the provider and forgets one. Setting them while the
+# provider is `bedrock` does nothing: the worker receives no LLM variable at all, and no LLM
+# secret is created. They are alternatives, never simultaneous requirements.
+#
+# llm_provider   = "openai"
+# llm_base_url   = "https://REPLACE-ME/v1"
+# llm_model      = "REPLACE-ME"
+# llm_api_key    = "REPLACE-ME"
+# llm_fast_model = ""      # empty falls back to llm_model, exactly as config.py does
 
 # --- Optional: shown with their defaults -----------------------------------------------------
 
@@ -56,8 +89,6 @@ tavily_api_key = "REPLACE-ME"
 
 # Narrow this to your own address whenever the demo link is not being shared.
 # allowed_ingress_cidrs = ["203.0.113.4/32"]
-
-# llm_fast_model = ""      # empty falls back to llm_model, exactly as config.py does
 
 # --- The worker's four runtime bounds --------------------------------------------------------
 #

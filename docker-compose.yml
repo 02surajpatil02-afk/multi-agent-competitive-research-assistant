@@ -255,6 +255,15 @@ services:
       AWS_ENDPOINT_URL: http://localstack:4566
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
+      # **The local stack stays on the OpenAI-compatible provider** (docs/adr/0022-*.md). It is
+      # stated rather than left to config.py's default so that the compose file says which of
+      # the two providers a local worker uses - and because the alternative, Bedrock, would
+      # make `docker compose up` need AWS credentials, which no local command here does.
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      # Read only when LLM_PROVIDER is bedrock, and then boto3 signs with whatever AWS
+      # credentials the host provides. Empty here, and no key exists for it in either mode.
+      BEDROCK_MODEL_ID:
+      BEDROCK_REGION:
       # **Passed through from the environment, never defaulted here.** These four are real
       # credentials for a real endpoint, and a compose file in a repository is not a place a
       # credential may have a value. Unset, `python -m worker` refuses to start and names the

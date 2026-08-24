@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Sequence
 from typing import cast
 
 import pytest
@@ -35,11 +36,56 @@ from llm_client import (
     JOB_FATAL_REASONS,
     MAX_RETRY_AFTER_S,
     CallBudget,
+    ChatMessage,
     LLMCallFailed,
     LLMClient,
     ModelTier,
+    OpenAIChatProvider,
+    ProviderError,
 )
 from schemas import SupervisorDecision
+
+
+class _ScriptedProvider:
+    """A `ChatProvider` that is not the OpenAI one, so the tests below cannot pass by accident.
+
+    Deliberately the smallest thing that satisfies the protocol: it answers from a script and
+    records what it was asked. Every policy the client owns - the budget, the token, both
+    schedules, the JSON contract, the validation retry - runs for real above it, which is the
+    same arrangement `FakeOpenAI` is used in and the reason neither fake implements any of it.
+    """
+
+    def __init__(self, *script: object) -> None:
+        self.script = list(script)
+        self.requests: list[dict[str, object]] = []
+
+    @property
+    def calls(self) -> int:
+        return len(self.requests)
+
+    def complete(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        model: str,
+        timeout: float,
+        temperature: float | None,
+    ) -> str:
+        self.requests.append(
+            {
+                "messages": list(messages),
+                "model": model,
+                "timeout": timeout,
+                "temperature": temperature,
+            }
+        )
+        if not self.script:
+            raise AssertionError(f"the client made {self.calls} requests; the test scripted fewer")
+        answer = self.script.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return str(answer)
+
 
 _ENV = {
     "LLM_BASE_URL": "https://example.invalid/v1",
@@ -530,8 +576,144 @@ def test_the_sdk_does_not_retry_underneath_us() -> None:
     # spend budget that nothing counted.
     client = LLMClient(_config())
 
-    assert client._client.max_retries == 0
-    assert str(client._client.base_url).startswith("https://example.invalid/v1")
+    provider = client._provider
+    assert isinstance(provider, OpenAIChatProvider)
+    assert provider._client.max_retries == 0
+    assert str(provider._client.base_url).startswith("https://example.invalid/v1")
+
+
+# --- Which provider a configuration selects (ADR 0022) ------------------------------
+#
+# The agents never see this choice, so the only place it can be asserted is here: which
+# adapter the constructor built, and what it refused to build without.
+
+
+def test_the_default_provider_is_the_openai_compatible_one() -> None:
+    """`LLM_PROVIDER` unset behaves exactly as the client did before there were two, which
+    is what keeps every local command and the whole offline suite unchanged."""
+    assert _config().llm_provider == "openai"
+    assert isinstance(LLMClient(_config())._provider, OpenAIChatProvider)
+
+
+def test_bedrock_is_selected_by_configuration_and_needs_no_llm_credential() -> None:
+    """The claim the AWS deployment rests on: in Bedrock mode there is no endpoint and no key
+    to supply, because boto3 signs with the ECS task role (ADR 0022 decision 3)."""
+    config = load_config(
+        {
+            "LLM_PROVIDER": "bedrock",
+            "BEDROCK_MODEL_ID": "apac.amazon.nova-pro-v1:0",
+            "TAVILY_API_KEY": "key",
+        }
+    )
+    assert config.llm_api_key is None
+    assert config.llm_base_url is None
+
+    client = LLMClient(config, provider=_ScriptedProvider())
+
+    assert client._main_model == "apac.amazon.nova-pro-v1:0"
+    assert client._fast_model == "apac.amazon.nova-pro-v1:0"
+
+
+def test_bedrock_mode_refuses_to_start_without_a_model_id() -> None:
+    config = load_config({"LLM_PROVIDER": "bedrock", "TAVILY_API_KEY": "key"})
+
+    with pytest.raises(ValueError, match="BEDROCK_MODEL_ID"):
+        LLMClient(config, provider=_ScriptedProvider())
+
+
+def test_openai_mode_still_requires_its_own_configuration() -> None:
+    """The other half of the same rule: switching the default provider did not relax it."""
+    with pytest.raises(ValueError, match="LLM_MODEL"):
+        LLMClient(load_config({"TAVILY_API_KEY": "key"}))
+
+
+def test_an_unknown_provider_is_refused_at_startup() -> None:
+    # Refused rather than defaulted, the same rule AUTH_MODE follows: a typo must not
+    # silently select the other endpoint.
+    with pytest.raises(ValueError, match="LLM_PROVIDER"):
+        _config(LLM_PROVIDER="nova")
+
+
+def test_an_openai_sdk_client_cannot_be_injected_into_bedrock_mode() -> None:
+    """`client=` names one SDK. Accepting it here would build an OpenAI provider for a
+    configuration that says Bedrock, which is the kind of mismatch that only shows up in a
+    bill."""
+    config = load_config(
+        {"LLM_PROVIDER": "bedrock", "BEDROCK_MODEL_ID": "m", "TAVILY_API_KEY": "key"}
+    )
+
+    with pytest.raises(ValueError, match="bedrock"):
+        LLMClient(config, client=cast(OpenAI, FakeOpenAI()))
+
+
+def test_the_two_injection_points_are_not_both_accepted() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        LLMClient(_config(), client=cast(OpenAI, FakeOpenAI()), provider=_ScriptedProvider())
+
+
+# --- The policy above the provider is provider-neutral -------------------------------
+#
+# Everything below drives the real `LLMClient` over a provider that is not the OpenAI one,
+# to prove the budget, the schedules and the validation retry belong to the client rather
+# than to the adapter. If any of these ever needed an OpenAI type to pass, the seam would
+# not be a seam.
+
+
+def test_every_retry_schedule_still_runs_over_a_non_openai_provider(slept: list[float]) -> None:
+    provider = _ScriptedProvider(
+        ProviderError("transport", "dropped"),
+        ProviderError("rate_limited", "not now"),
+        _VALID,
+    )
+    budget = CallBudget(limit=60)
+
+    decision = _ask(LLMClient(_config(), provider=provider), budget)
+
+    assert decision.next == "planner"
+    assert slept == [2.0, 2.0]  # one transport delay, one rate-limit delay
+    assert budget.used == 3
+
+
+def test_a_provider_directed_retry_after_is_served_as_given(slept: list[float]) -> None:
+    """**The bound is the adapter's, not this loop's**, and that is deliberate: reading the
+    directive means reading one provider's headers, so bounding it belongs in the same place.
+    Each adapter clips to `MAX_RETRY_AFTER_S` before the value ever reaches here - asserted for
+    the OpenAI one above and for Bedrock in tests/test_bedrock.py."""
+    provider = _ScriptedProvider(ProviderError("rate_limited", "not now", retry_after=12.0), _VALID)
+
+    _ask(LLMClient(_config(), provider=provider))
+
+    assert slept == [12.0]
+
+
+def test_a_fatal_provider_failure_is_not_retried(slept: list[float]) -> None:
+    """A denied action or an unknown model. No schedule fixes either, and three attempts
+    only spend three tokens of a shared limit to print the same message three times."""
+    provider = _ScriptedProvider(ProviderError("fatal", "AccessDeniedException"))
+
+    with pytest.raises(LLMCallFailed) as raised:
+        _ask(LLMClient(_config(), provider=provider))
+
+    assert raised.value.reason == "llm_call_failed"
+    assert "AccessDeniedException" in str(raised.value)
+    assert provider.calls == 1
+    assert slept == []
+
+
+def test_the_validation_retry_runs_over_any_provider() -> None:
+    provider = _ScriptedProvider(json.dumps({"next": "reflection", "reason": "nope"}), _VALID)
+
+    assert _ask(LLMClient(_config(), provider=provider)).next == "planner"
+    assert provider.calls == 2
+
+
+def test_a_provider_is_told_the_tier_timeout_and_no_temperature_by_default() -> None:
+    provider = _ScriptedProvider(_VALID)
+
+    _ask(LLMClient(_config(), provider=provider), tier="fast")
+
+    assert provider.requests[0]["timeout"] == 30.0
+    assert provider.requests[0]["temperature"] is None
 
 
 # --- The shared rate limiter (guidelines §11, §17) ----------------------------------

@@ -92,6 +92,31 @@ locals {
   api_auth_secrets = local.cognito_enabled ? [] : [
     { name = "AUTH_KEYS", valueFrom = aws_secretsmanager_secret.auth_keys[0].arn },
   ]
+
+  # **The worker's model provider, and the only place the two alternatives are written down**
+  # (docs/adr/0022-*.md). They are alternatives rather than layers: under Bedrock there is no
+  # endpoint, no model ids and no key, and under OpenAI there is no Bedrock configuration and no
+  # Bedrock permission. Nothing in either list is a credential except `LLM_API_KEY`, which is why
+  # it is the only entry that appears below in `worker_llm_secrets` rather than here.
+  worker_llm_environment = local.bedrock_enabled ? [
+    { name = "LLM_PROVIDER", value = "bedrock" },
+    { name = "BEDROCK_MODEL_ID", value = var.bedrock_model_id },
+    { name = "BEDROCK_REGION", value = local.bedrock_region },
+    ] : [
+    { name = "LLM_PROVIDER", value = "openai" },
+    { name = "LLM_BASE_URL", value = var.llm_base_url },
+    { name = "LLM_MODEL", value = var.llm_model },
+    { name = "LLM_FAST_MODEL", value = var.llm_fast_model },
+  ]
+
+  # **Empty under Bedrock, and that emptiness is the security property.** No LLM secret is
+  # created (secrets.tf), so the worker's execution role is granted nothing to fetch for the
+  # model provider, and a task definition revision - kept forever - names no provider
+  # credential. Authorization is `bedrock:InvokeModel` on the worker *task* role and nothing
+  # else.
+  worker_llm_secrets = local.bedrock_enabled ? [] : [
+    { name = "LLM_API_KEY", valueFrom = aws_secretsmanager_secret.llm_api_key[0].arn },
+  ]
 }
 
 # --- The image repository ---------------------------------------------------------------------
@@ -269,8 +294,10 @@ resource "aws_ecs_task_definition" "worker" {
     # the message is still never deleted, and redelivery is still the recovery path.
     stopTimeout = 120
 
-    # An endpoint and two model ids are configuration, not credentials, so they stay here where
-    # they can be read and changed. The two keys are below.
+    # A provider name, an endpoint or a model id, and a region are configuration rather than
+    # credentials, so they stay here where they can be read and changed. `local.worker_llm_
+    # environment` is the whole of the provider choice; the search key, and the model key when
+    # there is one, are below.
     #
     # **The four runtime bounds are stated rather than defaulted**, and only here. `config.py`
     # keeps 60/2/24/1200 for local work; this deployment runs 180/3/30/1800, which is what both
@@ -278,18 +305,17 @@ resource "aws_ecs_task_definition" "worker" {
     # with `TF_VAR_*` instead of editing this file (variables.tf carries the derivation, and
     # why `max_job_runtime` sharing a value with the queue's visibility window couples nothing).
     # None of the four reaches the API, the migration or the ops task: none of those runs a node.
-    environment = concat(local.common_environment, [
-      { name = "LLM_BASE_URL", value = var.llm_base_url },
-      { name = "LLM_MODEL", value = var.llm_model },
-      { name = "LLM_FAST_MODEL", value = var.llm_fast_model },
+    environment = concat(local.common_environment, local.worker_llm_environment, [
       { name = "LLM_MAIN_TIMEOUT_S", value = tostring(var.llm_main_timeout_s) },
       { name = "MAX_REVISIONS", value = tostring(var.max_revisions) },
       { name = "MAX_SUPERVISOR_HOPS", value = tostring(var.max_supervisor_hops) },
       { name = "MAX_JOB_RUNTIME", value = tostring(var.max_job_runtime) },
     ])
 
-    secrets = concat(local.database_secrets, [
-      { name = "LLM_API_KEY", valueFrom = aws_secretsmanager_secret.llm_api_key.arn },
+    # **`TAVILY_API_KEY` is unchanged by the provider choice, and that is the point of listing
+    # it separately.** The web-search credential has nothing to do with which model answers, so
+    # switching to Bedrock removed one secret and left this one exactly where it was.
+    secrets = concat(local.database_secrets, local.worker_llm_secrets, [
       { name = "TAVILY_API_KEY", valueFrom = aws_secretsmanager_secret.tavily_api_key.arn },
     ])
 
