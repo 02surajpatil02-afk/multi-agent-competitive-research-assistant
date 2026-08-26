@@ -314,7 +314,7 @@ resource "aws_vpc_security_group_egress_rule" "worker_dns_tcp" {
 
 resource "aws_vpc_security_group_egress_rule" "worker_to_postgres" {
   security_group_id            = aws_security_group.worker.id
-  description                  = "Rows, checkpoints, the job lock, and `alembic upgrade head`"
+  description                  = "Rows, checkpoints, the job lock, and alembic upgrade head"
   referenced_security_group_id = aws_security_group.postgres.id
   ip_protocol                  = "tcp"
   from_port                    = 5432
